@@ -15,7 +15,7 @@ The official browser build plugin for [Infernux](https://github.com/ChenlizheMe/
 
 | Package | Version | Compatible engine | Build hosts | Target |
 | --- | --- | --- | --- | --- |
-| `infernux/platform-web` | 0.2.1 | Infernux 0.4.2 | Windows/Linux x64 | WebAssembly + WebGPU |
+| `infernux/platform-web` | 0.2.15 | Infernux >=0.4.2; payload 0.4.2-v2 | Windows/Linux x64 | WebAssembly + WebGPU |
 
 ## Install and use
 
