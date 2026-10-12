@@ -57,7 +57,7 @@ class ReleaseTests(unittest.TestCase):
         player.mkdir()
         self.player = player
         (player / "Player.inxmanifest").write_text(json.dumps({
-            "$schema": "infernux.web_player", "engine": "0.4.1", "platform": "web",
+            "$schema": "infernux.web_player", "engine": self.metadata["engine"].removeprefix("=="), "platform": "web",
             "architecture": "wasm32", "python_abi": "cp313", "configuration": "Release",
             "python_runtime": _python_runtime_manifest(),
         }), encoding="utf-8")

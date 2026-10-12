@@ -19,7 +19,7 @@ def _require_native_payloads(
 ) -> None:
     directory = root / "package/editor/infernux_web"
     contract = run_path(str(directory / "native_payload.py"))
-    manifest = contract["inspect_player_payload"](player_payload, engine="0.4.1")
+    manifest = contract["inspect_player_payload"](player_payload, engine="0.4.2")
     if manifest["configuration"] != "Release":
         raise ValueError("Published Web Player must use the Release configuration")
     with (player_payload / "infernux-runtime.wasm").open("rb") as stream:

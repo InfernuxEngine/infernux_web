@@ -524,7 +524,7 @@ if(NOT IS_ABSOLUTE "${INFERNUX_WEB_PLAYER_OUTPUT_DIR}")
 endif()
 set(_web_player_destination "${INFERNUX_WEB_PLAYER_OUTPUT_DIR}")
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/Player.inxmanifest" CONTENT
-"{\"$schema\":\"infernux.web_player\",\"engine\":\"0.4.1\",\"platform\":\"web\",\"architecture\":\"wasm32\",\"python_abi\":\"cp313\",\"configuration\":\"$<CONFIG>\",\"python_runtime\":${_python_runtime_manifest}}\n")
+"{\"$schema\":\"infernux.web_player\",\"engine\":\"0.4.2\",\"platform\":\"web\",\"architecture\":\"wasm32\",\"python_abi\":\"cp313\",\"configuration\":\"$<CONFIG>\",\"python_runtime\":${_python_runtime_manifest}}\n")
 add_custom_target(prebuild_web_player
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${_web_player_destination}"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
