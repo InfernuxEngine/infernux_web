@@ -315,6 +315,8 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
     list(FILTER _web_portable_binding_sources EXCLUDE REGEX "BindingInfernux\\.cpp$")
     list(FILTER _web_portable_binding_sources EXCLUDE REGEX "BindingGUI\\.cpp$")
     list(FILTER _web_portable_binding_sources EXCLUDE REGEX "BindingRenderGraph\\.cpp$")
+    set(_web_scene_binding_sources ${_web_binding_sources})
+    list(FILTER _web_scene_binding_sources INCLUDE REGEX "/BindingScene[^/]*\\.cpp$")
     set(_web_runtime_binding_sources
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingModule.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingAssetRegistry.cpp"
@@ -323,7 +325,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingInput.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingPhysics.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingResources.cpp"
-        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingScene.cpp"
+        ${_web_scene_binding_sources}
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingSemanticCatalog.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingTagLayer.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingVector2f.cpp"
