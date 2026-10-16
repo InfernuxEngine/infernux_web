@@ -425,7 +425,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebUserActivation()
     if (g_runtimeActivated || g_activate == nullptr)
         return;
 
-    const bool audioReady = infernux::AudioEngine::Instance().Initialize();
+    auto &audio = infernux::AudioEngine::Instance();
+    const bool audioReady = audio.IsInitialized() || audio.Initialize();
     if (!audioReady) {
         std::fprintf(stderr, "INFERNUX_WEB_AUDIO_INITIALIZATION_FAILED\n");
         return;
@@ -1017,37 +1018,59 @@ void Frame()
             InfernuxWebAbortStartup("Particle GPU frame could not be recorded");
             return;
         }
-        const bool scenePrepared =
-            !g_splashActive && !g_webGpuValidationFailed && g_sceneRenderer.Prepare(encoder, g_width, g_height);
-        if (scenePrepared)
-            colorAttachment.clearValue = g_sceneRenderer.GetClearColor();
+        bool scenePrepared = false;
+        bool renderedScene = false;
         if (g_sceneRenderer.HasDepthTarget())
             passDescriptor.depthStencilAttachment = &depthAttachment;
-        wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDescriptor);
-        const bool renderedScene = scenePrepared && g_sceneRenderer.RenderPrepared(pass);
-        if (scenePrepared && g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics &&
-            !g_webGpuValidationFailed)
-            (void)g_particleRuntime.Render(pass, g_width, g_height);
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
-        if (!g_splashActive && !g_webGpuValidationFailed && g_sceneRenderer.HasDepthTarget()) {
-            auto *scene = infernux::SceneManager::Instance().GetActiveScene();
-            auto *camera = scene ? scene->FindGameCamera(nullptr) : nullptr;
-            if (camera) {
-                camera->SetAspectRatio(static_cast<float>(g_width) / static_cast<float>(std::max(1u, g_height)));
-                glm::mat4 webClip(1.0f);
-                webClip[1][1] = -1.0f;
-                try {
-                    (void)g_screenUIRenderer.RenderWorld(pass, webClip * camera->GetViewProjectionMatrix(),
-                                                         camera->GetViewMatrix(), camera->GetProjectionMatrix(),
-                                                         camera->GetCullingMask(), g_width, g_height);
-                } catch (const std::exception &error) {
-                    std::fprintf(stderr, "INFERNUX_WEB_WORLD_UI_RENDER_FAILED %s\n", error.what());
-                    g_webGpuValidationFailed = true;
-                }
+        auto *scene = infernux::SceneManager::Instance().GetActiveScene();
+        auto cameras = scene ? scene->GetActiveGameCameras(nullptr) : std::vector<infernux::Camera *>{};
+        cameras.erase(std::remove_if(cameras.begin(), cameras.end(),
+                                     [](const auto *camera) { return camera->HasTargetTexture(); }),
+                      cameras.end());
+        for (size_t index = 0; !g_splashActive && !g_webGpuValidationFailed && index < cameras.size(); ++index) {
+            auto *camera = cameras[index];
+            if (!g_sceneRenderer.Prepare(encoder, g_width, g_height, camera)) {
+                InfernuxWebAbortStartup("Camera frame could not be prepared");
+                return;
+            }
+            const auto clear = camera->GetClearFlags();
+            const bool clearColor = index == 0 || clear == infernux::CameraClearFlags::Skybox ||
+                                    clear == infernux::CameraClearFlags::SolidColor;
+            colorAttachment.loadOp = clearColor ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
+            colorAttachment.clearValue = g_sceneRenderer.GetClearColor();
+            colorAttachment.storeOp = wgpu::StoreOp::Store;
+            depthAttachment.depthLoadOp =
+                index == 0 || clear != infernux::CameraClearFlags::DontClear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
+            auto pass = encoder.BeginRenderPass(&passDescriptor);
+            renderedScene = g_sceneRenderer.RenderPrepared(pass) || renderedScene;
+            scenePrepared = true;
+            if (index == 0 && g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics)
+                (void)g_particleRuntime.Render(pass, g_width, g_height);
+            glm::mat4 webClip(1.0f);
+            webClip[1][1] = -1.0f;
+            try {
+                (void)g_screenUIRenderer.RenderWorld(pass, webClip * camera->GetViewProjectionMatrix(),
+                                                     camera->GetViewMatrix(), camera->GetProjectionMatrix(),
+                                                     camera->GetCullingMask(), g_width, g_height);
+            } catch (const std::exception &error) {
+                std::fprintf(stderr, "INFERNUX_WEB_WORLD_UI_RENDER_FAILED %s\n", error.what());
+                g_webGpuValidationFailed = true;
+            }
+            pass.End();
+            if (index + 1 < cameras.size()) {
+                // Submit before reusing scene/UI uniform and geometry buffers
+                // for the next camera. Queue writes then follow this draw.
+                auto commands = encoder.Finish();
+                g_queue.Submit(1, &commands);
+                encoder = g_device.CreateCommandEncoder();
             }
         }
 #endif
-        pass.End();
+        if (!scenePrepared) {
+            auto pass = encoder.BeginRenderPass(&passDescriptor);
+            pass.End();
+        }
         if (!g_splashActive && !g_webGpuValidationFailed && !g_postProcessRenderer.PrepareBloom(encoder)) {
             std::fprintf(stderr, "INFERNUX_WEB_BLOOM_RECORDING_FAILED\n");
             g_webGpuValidationFailed = true;
@@ -1187,6 +1210,9 @@ void StartSurface()
     SetDictString(details, "graphics_api", "webgpu");
     SetDictInteger(details, "width", g_width);
     SetDictInteger(details, "height", g_height);
+    // Scene callbacks can create voices before the first gesture. SDL keeps
+    // WebAudio suspended and resumes it on browser user activation.
+    infernux::AudioEngine::Instance().Initialize();
     PyObject *ready = PyObject_GetAttrString(mainModule, "infernux_web_ready");
     if (ready == nullptr) {
         Py_DECREF(details);

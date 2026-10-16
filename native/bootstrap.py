@@ -297,13 +297,6 @@ def _install_platform_runtime_api(native_module: Any) -> None:
     package = _package_namespace("infernux", package_root)
     _package_namespace("infernux.engine", os.path.join(package_root, "engine"))
     core = _package_namespace("infernux.core", os.path.join(package_root, "core"))
-    components = _package_namespace(
-        "infernux.components", os.path.join(package_root, "components")
-    )
-    builtin = _package_namespace(
-        "infernux.components.builtin",
-        os.path.join(package_root, "components", "builtin"),
-    )
     sys.modules["infernux.lib._Infernux"] = native_module
 
     import importlib
@@ -311,69 +304,7 @@ def _install_platform_runtime_api(native_module: Any) -> None:
     lib = importlib.import_module("infernux.lib")
     math_module = importlib.import_module("infernux.math")
     debug_module = importlib.import_module("infernux.debug")
-    component_module = importlib.import_module("infernux.components.component")
-    decorators_module = importlib.import_module("infernux.components.decorators")
-    fields_module = importlib.import_module("infernux.components.fields")
-    ref_wrappers_module = importlib.import_module("infernux.components.ref_wrappers")
-    transform_authoring_module = importlib.import_module(
-        "infernux.components.transform_authoring"
-    )
-    serializable_module = importlib.import_module(
-        "infernux.components.serializable_object"
-    )
-    lifecycle_module = importlib.import_module(
-        "infernux.components._component_lifecycle"
-    )
-    particle_module = importlib.import_module("infernux.components.particle_system")
-    builtin_modules = {
-        "AudioListener": "audio_listener",
-        "AudioSource": "audio_source",
-        "Light": "light",
-        "MeshRenderer": "mesh_renderer",
-        "LineRenderer": "line_renderer",
-        "SkinnedMeshRenderer": "skinned_mesh_renderer",
-        "Camera": "camera",
-        "Collider": "collider",
-        "BoxCollider": "box_collider",
-        "SphereCollider": "sphere_collider",
-        "CapsuleCollider": "capsule_collider",
-        "CylinderCollider": "cylinder_collider",
-        "MeshCollider": "mesh_collider",
-        "Rigidbody": "rigidbody",
-        "RigidbodyConstraints": "rigidbody",
-        "CollisionDetectionMode": "rigidbody",
-        "RigidbodyInterpolation": "rigidbody",
-    }
-    for export_name, module_name in builtin_modules.items():
-        source = importlib.import_module(
-            f"infernux.components.builtin.{module_name}"
-        )
-        value = getattr(source, export_name)
-        setattr(builtin, export_name, value)
-        setattr(components, export_name, value)
-    builtin.__all__ = tuple(builtin_modules)
-
-    component_exports = {
-        "InxComponent": component_module.InxComponent,
-        "SerializableObject": serializable_module.SerializableObject,
-        "serialized_field": fields_module.serialized_field,
-        "int_field": fields_module.int_field,
-        "list_field": fields_module.list_field,
-        "FieldType": fields_module.FieldType,
-        "GameObjectRef": ref_wrappers_module.GameObjectRef,
-        "disallow_multiple": decorators_module.disallow_multiple,
-        "add_component_menu": decorators_module.add_component_menu,
-        "DrivenTransformProperties": transform_authoring_module.DrivenTransformProperties,
-        "drives_transform": transform_authoring_module.drives_transform,
-        "DrivesTransform": transform_authoring_module.DrivesTransform,
-        "RuntimeExecutionScheduler": lifecycle_module.RuntimeExecutionScheduler,
-        "ParticleSystem": particle_module.ParticleSystem,
-        "ParticleBoundsMode": particle_module.ParticleBoundsMode,
-        "ParticleOffscreenPolicy": particle_module.ParticleOffscreenPolicy,
-    }
-    for name, value in component_exports.items():
-        setattr(components, name, value)
-    components.__all__ = tuple(component_exports) + tuple(builtin_modules)
+    components = importlib.import_module("infernux.components")
 
     runtime_services = importlib.import_module("infernux.runtime_services")
     web_host = importlib.import_module("_InfernuxWebHost")
@@ -393,6 +324,8 @@ def _install_platform_runtime_api(native_module: Any) -> None:
     render_texture_module = importlib.import_module("infernux.core.render_texture")
     mesh_module = importlib.import_module("infernux.core.mesh")
     shader_module = importlib.import_module("infernux.core.shader")
+    ui_module = importlib.import_module("infernux.ui")
+    acceptance_module = importlib.import_module("infernux.acceptance")
     audio_clip_module = importlib.import_module("infernux.core.audio_clip")
     physic_material_module = importlib.import_module("infernux.core.physic_material")
     animation_clip_module = importlib.import_module("infernux.core.animation_clip")
@@ -460,12 +393,16 @@ def _install_platform_runtime_api(native_module: Any) -> None:
             setattr(package, name, getattr(lib, name))
     for name in getattr(math_module, "__all__", ()):
         setattr(package, name, getattr(math_module, name))
-    for name in components.__all__:
-        setattr(package, name, getattr(components, name))
+    for source in (components, ui_module):
+        for name in source.__all__:
+            setattr(package, name, getattr(source, name))
     for name in screen_module.__all__:
         setattr(package, name, getattr(screen_module, name))
     gameplay_exports = {
         "Application": application_module.Application,
+        "RuntimeAcceptance": acceptance_module.RuntimeAcceptance,
+        "RuntimeAcceptanceManifest": acceptance_module.RuntimeAcceptanceManifest,
+        "RuntimeAcceptanceTest": acceptance_module.RuntimeAcceptanceTest,
         "InxPreload": lifecycle_public_module.InxPreload,
         "PreloadContext": lifecycle_public_module.PreloadContext,
         "Time": timing_module.Time,
@@ -509,6 +446,9 @@ def _install_platform_runtime_api(native_module: Any) -> None:
         raise AttributeError(f"module 'infernux' has no attribute {name!r}")
 
     package.__getattr__ = runtime_attribute
+    from infernux.components.registry import ensure_engine_component_catalog_loaded
+
+    ensure_engine_component_catalog_loaded()
     package.__all__ = tuple(
         sorted(
             {
@@ -517,6 +457,7 @@ def _install_platform_runtime_api(native_module: Any) -> None:
                 *screen_module.__all__,
                 *getattr(math_module, "__all__", ()),
                 *components.__all__,
+                *ui_module.__all__,
                 *gameplay_exports,
                 *(name for name in native_gameplay_exports if hasattr(lib, name)),
             }

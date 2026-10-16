@@ -17,6 +17,7 @@
 namespace infernux
 {
 class InxMaterial;
+class Camera;
 struct RendererParameterBlock;
 class TextureUploadStagingTicket;
 struct TextureCpuData;
@@ -45,7 +46,7 @@ class WebSceneRenderer final
 
     /// Extract, upload, and record the directional shadow map before the main
     /// render pass begins.
-    bool Prepare(wgpu::CommandEncoder encoder, uint32_t width, uint32_t height);
+    bool Prepare(wgpu::CommandEncoder encoder, uint32_t width, uint32_t height, Camera *camera);
 
     /// Draw the prepared procedural sky and shadowed scene geometry.
     bool RenderPrepared(wgpu::RenderPassEncoder pass);
@@ -168,7 +169,7 @@ class WebSceneRenderer final
                                                    const MaterialTextureSampler &sampler = {});
     bool EnsureBuffer(wgpu::Buffer &buffer, uint64_t &capacity, uint64_t required, wgpu::BufferUsage usage);
     [[nodiscard]] bool BindIndexStream(wgpu::RenderPassEncoder pass, MeshIndexFormat format) const;
-    bool BuildFrame(uint32_t width, uint32_t height);
+    bool BuildFrame(uint32_t width, uint32_t height, Camera *camera);
     void ReportFrameIssue(const char *issue);
 
     wgpu::Device m_device;

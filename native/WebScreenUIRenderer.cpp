@@ -1,4 +1,5 @@
 #include "WebScreenUIRenderer.h"
+#include "WebTextureUpload.h"
 
 #include "InfernuxWebHostModule.h"
 #include <function/renderer/gui/InxTextLayout.h>
@@ -198,22 +199,6 @@ uint64_t GrowCapacity(uint64_t required)
     while (capacity < required)
         capacity *= 2;
     return capacity;
-}
-
-wgpu::TextureFormat ToWebTextureFormat(TextureFormat format)
-{
-    switch (format) {
-    case TextureFormat::Rgba8UNorm:
-        return wgpu::TextureFormat::RGBA8Unorm;
-    case TextureFormat::Rgba8Srgb:
-        return wgpu::TextureFormat::RGBA8UnormSrgb;
-    case TextureFormat::Rgba16Float:
-        return wgpu::TextureFormat::RGBA16Float;
-    case TextureFormat::Rgba32Float:
-        return wgpu::TextureFormat::RGBA32Float;
-    default:
-        return wgpu::TextureFormat::Undefined;
-    }
 }
 
 void ResetDrawList(ImDrawList &drawList, uint32_t width, uint32_t height)
@@ -908,11 +893,18 @@ std::pair<float, float> WebScreenUIRenderer::MeasureText(const std::string &text
     return {layout.totalWidth, layout.totalHeight};
 }
 
-uint64_t WebScreenUIRenderer::UploadTexture(const TextureCpuData &texture, uint64_t replaceTextureId,
+uint64_t WebScreenUIRenderer::UploadTexture(const TextureCpuData &source, uint64_t replaceTextureId,
                                             const std::string &filterMode, const std::string &wrapMode, int anisoLevel)
 {
-    if (!m_device || !m_queue || texture.dimension != TextureDimension::Texture2D || !texture.IsValid())
+    if (!m_device || !m_queue || source.dimension != TextureDimension::Texture2D || !source.IsValid())
         return 0;
+    std::optional<TextureCpuData> decoded;
+    if (TextureFormatIsBlockCompressed(source.format)) {
+        decoded = DecodeBcTextureToRgba8(source);
+        if (!decoded)
+            return 0;
+    }
+    const TextureCpuData &texture = decoded ? *decoded : source;
     const wgpu::TextureFormat format = ToWebTextureFormat(texture.format);
     if (format == wgpu::TextureFormat::Undefined)
         return 0;
@@ -1115,10 +1107,11 @@ bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, const glm::m
     if (!pass || !m_world || m_worldElements.empty() || !m_worldDepthPipeline || !m_worldTopPipeline || width == 0 ||
         height == 0 || m_worldElementOpen) {
         if (!m_reportedWorldCommandState && m_world && (m_world->VtxBuffer.Size > 0 || !m_worldElements.empty())) {
-            std::printf("INFERNUX_WEB_WORLD_UI_COMMAND_STATE spans=%zu vertices=%d indices=%d open=%d depth=%d top=%d size=%ux%u\n",
+            std::printf("INFERNUX_WEB_WORLD_UI_COMMAND_STATE spans=%zu vertices=%d indices=%d open=%d depth=%d top=%d "
+                        "size=%ux%u\n",
                         m_worldElements.size(), m_world->VtxBuffer.Size, m_world->IdxBuffer.Size,
-                        m_worldElementOpen ? 1 : 0, m_worldDepthPipeline ? 1 : 0, m_worldTopPipeline ? 1 : 0,
-                        width, height);
+                        m_worldElementOpen ? 1 : 0, m_worldDepthPipeline ? 1 : 0, m_worldTopPipeline ? 1 : 0, width,
+                        height);
             m_reportedWorldCommandState = true;
         }
         return false;

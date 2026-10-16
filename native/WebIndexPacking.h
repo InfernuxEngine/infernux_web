@@ -18,6 +18,7 @@ struct WebPackedIndexRange
     uint32_t firstIndex = 0;
     uint32_t indexCount = 0;
     int32_t baseVertex = 0;
+    std::vector<uint32_t> sourceVertices;
 };
 
 struct WebPackedIndexStreams
@@ -28,9 +29,9 @@ struct WebPackedIndexStreams
 
 /// Validate and append one draw to the format-specific GPU stream.
 ///
-/// Source indices remain authoritative uint32_t values.  The global vertex
-/// rebase is carried by DrawIndexed(baseVertex), so a UInt16 mesh stays UInt16
-/// even when preceding draws make its global vertex offset exceed 65535.
+/// Referenced vertices are compacted in first-use order. sourceVertices maps
+/// the packed vertices to the original mesh; unused submeshes are not uploaded.
+/// DrawIndexed(baseVertex) preserves the mesh's index format at any global offset.
 /// Validation and capacity reservation complete before either stream changes;
 /// malformed ranges and overflows therefore reject the draw atomically.
 WebPackedIndexRange PackWebIndexRange(WebPackedIndexStreams &streams, MeshIndexFormat requestedFormat,

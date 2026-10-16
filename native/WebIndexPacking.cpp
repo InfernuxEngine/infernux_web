@@ -1,7 +1,9 @@
 #include "WebIndexPacking.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace infernux::web
 {
@@ -29,15 +31,26 @@ WebPackedIndexRange PackWebIndexRange(WebPackedIndexStreams &streams, MeshIndexF
         throw std::overflow_error("Web draw index count exceeds the DrawIndexed uint32 range");
 
     const MeshIndexFormat format = ResolveMeshIndexFormat(requestedFormat, vertexCount, authoritativeIndices);
-    for (size_t offset = 0; offset < indexCount; ++offset) {
-        const uint32_t sourceIndex = authoritativeIndices[indexStart + offset];
-        if (vertexBase > static_cast<size_t>(std::numeric_limits<uint32_t>::max() - sourceIndex))
-            throw std::overflow_error("Web rebased vertex index exceeds the uint32 GPU range");
-    }
     WebPackedIndexRange range;
     range.format = format;
     range.indexCount = static_cast<uint32_t>(indexCount);
     range.baseVertex = static_cast<int32_t>(vertexBase);
+    std::unordered_map<uint32_t, uint32_t> remap;
+    remap.reserve(std::min(vertexCount, indexCount));
+    std::vector<uint32_t> packedIndices;
+    packedIndices.reserve(indexCount);
+    range.sourceVertices.reserve(std::min(vertexCount, indexCount));
+    for (size_t offset = 0; offset < indexCount; ++offset) {
+        const uint32_t sourceIndex = authoritativeIndices[indexStart + offset];
+        const auto [entry, inserted] =
+            remap.try_emplace(sourceIndex, static_cast<uint32_t>(range.sourceVertices.size()));
+        if (inserted)
+            range.sourceVertices.push_back(sourceIndex);
+        packedIndices.push_back(entry->second);
+    }
+    if (!range.sourceVertices.empty() &&
+        range.sourceVertices.size() - 1 > std::numeric_limits<uint32_t>::max() - vertexBase)
+        throw std::overflow_error("Web rebased vertex index exceeds the uint32 GPU range");
 
     // ResolveMeshIndexFormat validates every authoritative index before this
     // point, including the UInt16 narrowing contract.  Reserve before append
@@ -52,15 +65,14 @@ WebPackedIndexRange PackWebIndexRange(WebPackedIndexStreams &streams, MeshIndexF
         range.firstIndex = static_cast<uint32_t>(streams.uint16Indices.size());
         streams.uint16Indices.reserve(streams.uint16Indices.size() + indexCount + padding);
         for (size_t offset = 0; offset < indexCount; ++offset)
-            streams.uint16Indices.push_back(static_cast<uint16_t>(authoritativeIndices[indexStart + offset]));
+            streams.uint16Indices.push_back(static_cast<uint16_t>(packedIndices[offset]));
         if (padding != 0)
             streams.uint16Indices.push_back(0);
     } else if (format == MeshIndexFormat::UInt32) {
         RequireAppendCapacity(streams.uint32Indices, indexCount);
         range.firstIndex = static_cast<uint32_t>(streams.uint32Indices.size());
         streams.uint32Indices.reserve(streams.uint32Indices.size() + indexCount);
-        streams.uint32Indices.insert(streams.uint32Indices.end(), authoritativeIndices.begin() + indexStart,
-                                     authoritativeIndices.begin() + indexStart + indexCount);
+        streams.uint32Indices.insert(streams.uint32Indices.end(), packedIndices.begin(), packedIndices.end());
     } else {
         throw std::invalid_argument("Web draw resolved to an unsupported index format");
     }
