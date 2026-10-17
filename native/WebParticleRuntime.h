@@ -9,6 +9,11 @@
 #include <memory>
 #include <string>
 
+namespace infernux
+{
+class Camera;
+}
+
 namespace infernux::web
 {
 
@@ -40,7 +45,7 @@ class WebParticleRuntime final
 
     [[nodiscard]] bool RecordCompute(wgpu::CommandEncoder encoder);
     void NotifySubmission() noexcept;
-    [[nodiscard]] bool Render(wgpu::RenderPassEncoder pass, uint32_t width, uint32_t height);
+    [[nodiscard]] bool Render(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height);
 
     [[nodiscard]] const std::string &LastError() const noexcept;
 

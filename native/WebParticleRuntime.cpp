@@ -6,8 +6,6 @@
 #include <core/types/ColorSpace.h>
 #include <function/renderer/particle/ParticleGpuRuntime.h>
 #include <function/scene/Camera.h>
-#include <function/scene/Scene.h>
-#include <function/scene/SceneManager.h>
 
 #include <glm/glm.hpp>
 
@@ -362,6 +360,7 @@ struct WebParticleRuntime::State
         uint64_t artifactRevision = 0;
         bool stateWasPreserved = false;
         uint32_t slot = 0;
+        uint32_t ownerLayerMask = 0;
         bool playing = true;
         bool resetPending = false;
         bool drawReady = false;
@@ -743,6 +742,7 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
         uint32_t slot = 0;
         if (!ReadUnsigned(Field(program, "id"), emitter->id) ||
             !ReadUnsigned(Field(program, "graph_emitter_index"), slot) ||
+            !ReadUnsigned(Field(program, "owner_layer_mask"), emitter->ownerLayerMask) ||
             !ReadUnsigned(Field(program, "artifact_revision"), emitter->artifactRevision) ||
             !ReadUnsigned(Field(program, "capacity"), capacity) || capacity == 0 || capacity > (1u << 24u) ||
             !ReadUnsigned(Field(program, "state_stride"), stateStride) || stateStride == 0 || stateStride % 16 != 0 ||
@@ -879,6 +879,7 @@ bool WebParticleRuntime::BeginBatch(uint64_t graphInstanceId, PyObject *items)
         accepted = ReadUnsigned(Field(item, "emitter_id"), emitterId);
         auto found = m_state->emitters.find(emitterId);
         accepted = accepted && found != m_state->emitters.end() && found->second->graphId == graphInstanceId &&
+                   ReadUnsigned(Field(item, "owner_layer_mask"), found->second->ownerLayerMask) &&
                    ReadTransforms(Field(item, "transforms"), found->second->transforms);
         if (!accepted)
             break;
@@ -1060,23 +1061,19 @@ void WebParticleRuntime::NotifySubmission() noexcept
         emitter->runtime->NotifySubmission(true);
 }
 
-bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, uint32_t width, uint32_t height)
+bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height)
 {
     if (!m_state->emissionSupported || !m_state->renderPipeline || !pass)
         return false;
-    Scene *scene = SceneManager::Instance().GetActiveScene();
-    Camera *camera = scene ? scene->FindGameCamera(nullptr) : nullptr;
-    if (!camera)
-        return false;
-    camera->SetAspectRatio(static_cast<float>(width) / static_cast<float>(std::max(1u, height)));
+    camera.SetAspectRatio(static_cast<float>(width) / static_cast<float>(std::max(1u, height)));
     struct CameraData
     {
         glm::mat4 viewProjection{1.0f};
         glm::vec4 right{1.0f, 0.0f, 0.0f, 0.0f};
         glm::vec4 up{0.0f, 1.0f, 0.0f, 0.0f};
     } data;
-    data.viewProjection = ToWebClipSpace(camera->GetViewProjectionMatrix());
-    const glm::mat4 cameraToWorld = glm::inverse(camera->GetViewMatrix());
+    data.viewProjection = ToWebClipSpace(camera.GetViewProjectionMatrix());
+    const glm::mat4 cameraToWorld = glm::inverse(camera.GetViewMatrix());
     data.right = glm::vec4(glm::normalize(glm::vec3(cameraToWorld[0])), 0.0f);
     data.up = glm::vec4(glm::normalize(glm::vec3(cameraToWorld[1])), 0.0f);
     m_state->queue.WriteBuffer(m_state->cameraBuffer, 0, &data, sizeof(data));
@@ -1084,7 +1081,8 @@ bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, uint32_t width, ui
     pass.SetBindGroup(0, m_state->cameraGroup);
     bool drew = false;
     for (const auto &[_, emitter] : m_state->emitters) {
-        if (!emitter->drawReady || !emitter->playing || !emitter->renderGroup)
+        if (!emitter->drawReady || !emitter->playing || !emitter->renderGroup ||
+            (emitter->ownerLayerMask & camera.GetCullingMask()) == 0)
             continue;
         const auto indirect = m_state->rhi->GetNativeBuffer(emitter->runtime->IndirectBuffer());
         if (!indirect)

@@ -1045,8 +1045,8 @@ void Frame()
             auto pass = encoder.BeginRenderPass(&passDescriptor);
             renderedScene = g_sceneRenderer.RenderPrepared(pass) || renderedScene;
             scenePrepared = true;
-            if (index == 0 && g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics)
-                (void)g_particleRuntime.Render(pass, g_width, g_height);
+            if (g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics)
+                (void)g_particleRuntime.Render(pass, *camera, g_width, g_height);
             glm::mat4 webClip(1.0f);
             webClip[1][1] = -1.0f;
             try {

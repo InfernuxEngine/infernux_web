@@ -1421,7 +1421,7 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
     const glm::vec4 background = inx::color::SrgbToLinear(camera->GetBackgroundColor());
     m_clearColor = {background.r, background.g, background.b, background.a};
     camera->SetAspectRatio(static_cast<float>(width) / static_cast<float>(std::max(1u, height)));
-    const size_t visibleCount = m_extractor.ExtractCameraFrame(m_world, camera);
+    m_extractor.ExtractCameraFrame(m_world, camera);
     const auto frame = m_world.Acquire();
     if (!frame || !frame->PrimaryView().valid) {
         ReportFrameIssue("invalid-render-snapshot");
@@ -1674,10 +1674,6 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
     for (const WebDrawRange &range : drawRanges)
         totalIndexCount += range.indices.indexCount;
     if (vertices.empty() || totalIndexCount == 0) {
-        if (visibleCount != 0) {
-            ReportFrameIssue("empty-draw-stream");
-            return false;
-        }
         ReportFrameIssue("no-visible-renderers");
         m_shadowEnabled = false;
         m_vertices.clear();
