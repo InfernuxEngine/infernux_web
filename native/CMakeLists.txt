@@ -20,6 +20,7 @@ set(INFERNUX_WEB_PLAYER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/publish/player" 
     "Build-tree destination for the precompiled Web Player payload")
 set(INFERNUX_ENGINE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." CACHE PATH
     "Infernux source directory providing the backend-neutral RHI contract")
+set(INFERNUX_EXTERNAL_ROOT "${INFERNUX_ENGINE_SOURCE_ROOT}/external")
 option(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE
     "Compile the existing Infernux Python binding surface for wasm without linking it"
     OFF
@@ -136,8 +137,6 @@ foreach(_archive _python_expat _python_mpdecimal _python_hacl)
     endif()
 endforeach()
 
-include(FetchContent)
-
 # The Web Player owns an audio-only SDL runtime. Browser graphics and input
 # remain on the explicit WebGPU/DOM adapters above this layer.
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
@@ -168,34 +167,11 @@ set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE)
 set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
-set(INFERNUX_WEB_ZSTD_SOURCE_DIR "" CACHE PATH
-    "Optional pinned Zstandard source tree for offline Web Player builds")
-if(INFERNUX_WEB_ZSTD_SOURCE_DIR)
-    if(NOT EXISTS "${INFERNUX_WEB_ZSTD_SOURCE_DIR}/build/cmake/CMakeLists.txt")
-        message(FATAL_ERROR
-            "INFERNUX_WEB_ZSTD_SOURCE_DIR must contain build/cmake/CMakeLists.txt")
-    endif()
-    add_subdirectory(
-        "${INFERNUX_WEB_ZSTD_SOURCE_DIR}/build/cmake"
-        "${CMAKE_BINARY_DIR}/_deps/infernux-web-zstd-local"
-        EXCLUDE_FROM_ALL
-    )
-else()
-    FetchContent_Declare(
-        infernux_web_zstd
-        GIT_REPOSITORY https://github.com/facebook/zstd.git
-        GIT_TAG 794ea1b0afca0f020f4e57b6732332231fb23c70
-        SOURCE_SUBDIR build/cmake
-    )
-    FetchContent_MakeAvailable(infernux_web_zstd)
+set(_web_zstd_source "${INFERNUX_ENGINE_SOURCE_ROOT}/external/zstd_for_infernux/build/cmake")
+if(NOT EXISTS "${_web_zstd_source}/CMakeLists.txt")
+    message(FATAL_ERROR "Initialize the engine's external/zstd_for_infernux submodule before building Web Players")
 endif()
-if(TARGET libzstd_static)
-    set(_web_zstd_target libzstd_static)
-elseif(TARGET zstd::libzstd_static)
-    set(_web_zstd_target zstd::libzstd_static)
-else()
-    message(FATAL_ERROR "The pinned Web Player Zstandard source did not provide a static library")
-endif()
+add_subdirectory("${_web_zstd_source}" "${CMAKE_BINARY_DIR}/_deps/infernux-web-zstd" EXCLUDE_FROM_ALL)
 
 add_executable(InfernuxWebPlayerHost
     main.cpp
@@ -279,7 +255,7 @@ target_link_libraries(InfernuxWebPlayerHost PRIVATE
     "${_python_expat}"
     "${_python_mpdecimal}"
     "${_python_hacl}"
-    ${_web_zstd_target}
+    libzstd_static
     SDL3::SDL3-static
     dl
     pthread
