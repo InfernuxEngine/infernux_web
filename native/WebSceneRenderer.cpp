@@ -1674,7 +1674,6 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
     for (const WebDrawRange &range : drawRanges)
         totalIndexCount += range.indices.indexCount;
     if (vertices.empty() || totalIndexCount == 0) {
-        ReportFrameIssue("no-visible-renderers");
         m_shadowEnabled = false;
         m_vertices.clear();
         m_indexStreams.uint16Indices.clear();
@@ -1784,13 +1783,7 @@ void WebSceneRenderer::ReportFrameIssue(const char *issue)
     if (m_lastFrameIssue == issue)
         return;
     m_lastFrameIssue = issue;
-    // A scene containing only UI is a valid Player scene. Keep that expected
-    // empty world render on the normal diagnostic stream; malformed scene
-    // state remains an actual browser error.
-    if (std::strcmp(issue, "no-visible-renderers") == 0)
-        std::printf("INFERNUX_WEB_SCENE_RENDER_EMPTY reason=%s\n", issue);
-    else
-        std::fprintf(stderr, "INFERNUX_WEB_SCENE_RENDER_EMPTY reason=%s\n", issue);
+    std::fprintf(stderr, "INFERNUX_WEB_SCENE_RENDER_EMPTY reason=%s\n", issue);
 }
 
 bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uint32_t height, Camera *camera)
