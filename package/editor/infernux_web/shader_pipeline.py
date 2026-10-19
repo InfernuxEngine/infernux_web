@@ -240,6 +240,8 @@ def compile_glsl_to_wgsl(
             "--output-name",
             str(wgsl_path),
         ]
+        if prepared.sampler_bindings:
+            tint_command.extend(("--sampler-mapping", prepared.tint_sampler_mapping))
         tint_command.append(str(spirv_path))
         _run(tint_command, "Tint")
         wgsl = _remap_tint_sampler_bindings(
