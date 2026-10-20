@@ -1345,7 +1345,7 @@ void WebSceneRenderer::Resize(uint32_t width, uint32_t height)
     descriptor.format = wgpu::TextureFormat::Depth24Plus;
     descriptor.mipLevelCount = 1;
     descriptor.sampleCount = m_sceneSampleCount;
-    descriptor.usage = wgpu::TextureUsage::RenderAttachment;
+    descriptor.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
     m_depthTexture = m_device.CreateTexture(&descriptor);
     m_depthView = m_depthTexture ? m_depthTexture.CreateView() : wgpu::TextureView{};
     m_depthWidth = width;

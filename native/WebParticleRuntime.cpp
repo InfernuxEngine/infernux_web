@@ -32,11 +32,30 @@ constexpr std::array<const char *, static_cast<size_t>(particle::GpuKernelStage:
     "contact_dispatch", "render_reset", "rendering",
 };
 
+constexpr char kDepthShader[] = R"wgsl(
+@group(2) @binding(0) var scene_depth: texture_depth_2d;
+fn scene_depth_at(pixel: vec2<i32>) -> f32 {
+    return textureLoad(scene_depth, pixel, 0);
+}
+)wgsl";
+
+constexpr char kMultisampleDepthShader[] = R"wgsl(
+@group(2) @binding(0) var scene_depth: texture_depth_multisampled_2d;
+fn scene_depth_at(pixel: vec2<i32>) -> f32 {
+    var depth = textureLoad(scene_depth, pixel, 0);
+    for (var sample = 1u; sample < textureNumSamples(scene_depth); sample++) {
+        depth = min(depth, textureLoad(scene_depth, pixel, sample));
+    }
+    return depth;
+}
+)wgsl";
+
 constexpr char kParticleShader[] = R"wgsl(
 struct CameraData {
     view_projection: mat4x4<f32>,
     camera_right: vec4<f32>,
     camera_up: vec4<f32>,
+    depth_reconstruct: vec4<f32>,
 };
 
 struct ParticleInstance {
@@ -104,7 +123,19 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32,
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let current = textureSample(sprite_texture, sprite_sampler, input.uv);
     let next = textureSample(sprite_texture, sprite_sampler, input.next_uv);
-    return mix(current, next, input.frame_blend) * input.color * output_data.material_tint;
+    var color = mix(current, next, input.frame_blend) * input.color * output_data.material_tint;
+    if (output_data.flipbook_grid.w > 0.5) {
+        let scene = eye_depth(scene_depth_at(vec2<i32>(input.position.xy)));
+        let particle = eye_depth(input.position.z);
+        color.a *= smoothstep(0.0, 1.0, clamp((scene - particle) / output_data.flipbook_grid.z, 0.0, 1.0));
+    }
+    return color;
+}
+
+fn eye_depth(depth: f32) -> f32 {
+    let p = camera.depth_reconstruct;
+    let denominator = depth * p.z - p.x;
+    return abs((p.y - depth * p.w) / select(1e-7, denominator, abs(denominator) > 1e-7));
 }
 )wgsl";
 
@@ -220,6 +251,10 @@ bool ReadOutputData(PyObject *program, ParticleOutputData &data, std::string &te
         valid = ReadUnsigned(Field(output, "flipbook_columns"), columns) && columns > 0 &&
                 ReadUnsigned(Field(output, "flipbook_rows"), rows) && rows > 0;
         data.flipbookGrid = glm::vec4(columns, rows, 0.0f, 0.0f);
+        bool softParticles = false;
+        valid = valid && ReadBool(Field(output, "soft_particles"), softParticles) &&
+                ReadFloat(Field(output, "soft_distance"), data.flipbookGrid.z) && data.flipbookGrid.z > 0.0f;
+        data.flipbookGrid.w = softParticles ? 1.0f : 0.0f;
         PyObject *native = Field(Field(output, "material"), "native");
         PyObject *texture = native ? PyObject_CallMethod(native, "get_texture", "s", "texSampler") : nullptr;
         if (!texture || (texture != Py_None && !PyUnicode_Check(texture)))
@@ -430,6 +465,9 @@ struct WebParticleRuntime::State
     wgpu::BindGroupLayout geometryLayout;
     wgpu::Buffer cameraBuffer;
     wgpu::BindGroup cameraGroup;
+    wgpu::BindGroupLayout depthLayout;
+    wgpu::BindGroup depthGroup;
+    wgpu::TextureView depthView;
     std::unordered_map<uint64_t, Graph> graphs;
     std::unordered_map<uint64_t, std::unique_ptr<Emitter>> emitters;
     std::unordered_set<uint64_t> capacityLimitedGraphs;
@@ -512,6 +550,9 @@ struct WebParticleRuntime::State
         cameraBuffer = {};
         geometryLayout = {};
         cameraLayout = {};
+        depthGroup = {};
+        depthView = {};
+        depthLayout = {};
         queue = {};
         device = {};
         rhi = nullptr;
@@ -557,13 +598,13 @@ bool WebParticleRuntime::Initialize(WebGpuRhiDevice &device, WebSceneRenderer &s
     }
 
     wgpu::BufferDescriptor cameraBufferDesc;
-    cameraBufferDesc.size = sizeof(glm::mat4) + sizeof(glm::vec4) * 2;
+    cameraBufferDesc.size = sizeof(glm::mat4) + sizeof(glm::vec4) * 3;
     cameraBufferDesc.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
     m_state->cameraBuffer = m_state->device.CreateBuffer(&cameraBufferDesc);
 
     wgpu::BindGroupLayoutEntry cameraEntry;
     cameraEntry.binding = 0;
-    cameraEntry.visibility = wgpu::ShaderStage::Vertex;
+    cameraEntry.visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
     cameraEntry.buffer.type = wgpu::BufferBindingType::Uniform;
     cameraEntry.buffer.minBindingSize = cameraBufferDesc.size;
     wgpu::BindGroupLayoutDescriptor cameraLayoutDesc;
@@ -621,16 +662,26 @@ bool WebParticleRuntime::ConfigureSampleCount(rhi::SampleCount sceneSampleCount)
         return true;
     if (m_state->renderPipeline && m_state->renderSampleCount == sceneSampleCount)
         return true;
-    // Keep emitter state, compute programs, buffers, and their bind groups.
-    // Only the raster pipeline depends on the scene's multisampling contract.
     const auto colorFormat = m_state->colorFormat;
 
+    wgpu::BindGroupLayoutEntry depthEntry;
+    depthEntry.binding = 0;
+    depthEntry.visibility = wgpu::ShaderStage::Fragment;
+    depthEntry.texture.sampleType = wgpu::TextureSampleType::Depth;
+    depthEntry.texture.viewDimension = wgpu::TextureViewDimension::e2D;
+    depthEntry.texture.multisampled = sceneSampleCount == rhi::SampleCount::Four;
+    wgpu::BindGroupLayoutDescriptor depthLayoutDesc;
+    depthLayoutDesc.entryCount = 1;
+    depthLayoutDesc.entries = &depthEntry;
+    const auto depthLayout = m_state->device.CreateBindGroupLayout(&depthLayoutDesc);
+    const std::string shaderText =
+        std::string(depthEntry.texture.multisampled ? kMultisampleDepthShader : kDepthShader) + kParticleShader;
     wgpu::ShaderSourceWGSL shaderSource;
-    shaderSource.code = kParticleShader;
+    shaderSource.code = shaderText.c_str();
     wgpu::ShaderModuleDescriptor shaderDesc;
     shaderDesc.nextInChain = &shaderSource;
     const auto shader = m_state->device.CreateShaderModule(&shaderDesc);
-    const std::array<wgpu::BindGroupLayout, 2> layouts = {m_state->cameraLayout, m_state->geometryLayout};
+    const std::array<wgpu::BindGroupLayout, 3> layouts = {m_state->cameraLayout, m_state->geometryLayout, depthLayout};
     wgpu::PipelineLayoutDescriptor pipelineLayoutDesc;
     pipelineLayoutDesc.bindGroupLayoutCount = layouts.size();
     pipelineLayoutDesc.bindGroupLayouts = layouts.data();
@@ -671,6 +722,9 @@ bool WebParticleRuntime::ConfigureSampleCount(rhi::SampleCount sceneSampleCount)
     }
     m_state->renderPipeline = candidate;
     m_state->renderSampleCount = sceneSampleCount;
+    m_state->depthLayout = depthLayout;
+    m_state->depthGroup = {};
+    m_state->depthView = {};
     return true;
 }
 
@@ -1143,6 +1197,15 @@ void WebParticleRuntime::NotifySubmission() noexcept
         emitter->runtime->NotifySubmission(true);
 }
 
+bool WebParticleRuntime::HasRenderWork(uint32_t cameraMask) const noexcept
+{
+    return m_state->emissionSupported && m_state->renderPipeline &&
+           std::any_of(m_state->emitters.begin(), m_state->emitters.end(), [cameraMask](const auto &entry) {
+               const auto &emitter = *entry.second;
+               return emitter.drawReady && emitter.playing && (emitter.ownerLayerMask & cameraMask) != 0;
+           });
+}
+
 bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height)
 {
     if (!m_state->emissionSupported || !m_state->renderPipeline || !pass)
@@ -1153,14 +1216,32 @@ bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, Camera &camera, ui
         glm::mat4 viewProjection{1.0f};
         glm::vec4 right{1.0f, 0.0f, 0.0f, 0.0f};
         glm::vec4 up{0.0f, 1.0f, 0.0f, 0.0f};
+        glm::vec4 depthReconstruct{};
     } data;
     data.viewProjection = ToWebClipSpace(camera.GetViewProjectionMatrix());
     const glm::mat4 cameraToWorld = glm::inverse(camera.GetViewMatrix());
     data.right = glm::vec4(glm::normalize(glm::vec3(cameraToWorld[0])), 0.0f);
     data.up = glm::vec4(glm::normalize(glm::vec3(cameraToWorld[1])), 0.0f);
+    const auto projection = camera.GetProjectionMatrix();
+    data.depthReconstruct = {projection[2][2], projection[3][2], projection[2][3], projection[3][3]};
+    const auto depthView = m_state->scene->GetDepthView();
+    if (!depthView)
+        return false;
+    if (!m_state->depthGroup || m_state->depthView.Get() != depthView.Get()) {
+        wgpu::BindGroupEntry entry;
+        entry.binding = 0;
+        entry.textureView = depthView;
+        wgpu::BindGroupDescriptor descriptor;
+        descriptor.layout = m_state->depthLayout;
+        descriptor.entryCount = 1;
+        descriptor.entries = &entry;
+        m_state->depthGroup = m_state->device.CreateBindGroup(&descriptor);
+        m_state->depthView = depthView;
+    }
     m_state->queue.WriteBuffer(m_state->cameraBuffer, 0, &data, sizeof(data));
     pass.SetPipeline(m_state->renderPipeline);
     pass.SetBindGroup(0, m_state->cameraGroup);
+    pass.SetBindGroup(2, m_state->depthGroup);
     bool drew = false;
     for (const auto &[_, emitter] : m_state->emitters) {
         if (!emitter->drawReady || !emitter->playing ||
