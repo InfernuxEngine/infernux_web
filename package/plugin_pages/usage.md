@@ -6,7 +6,7 @@ Build browser Players with CPython 3.13 compiled to WebAssembly and rendering th
 
 ## Before building
 
-Infernux 0.4.2 on Windows x64 or Linux x64, and a WebGPU-capable browser. Ordinary exports require no engine sources, Git submodules, CMake, WSL or Emscripten.
+Infernux 0.4.3 on Windows x64 or Linux x64, and a WebGPU-capable browser. Ordinary exports require no engine sources, Git submodules, CMake, WSL or Emscripten.
 
 ## Included payload
 

@@ -6,7 +6,7 @@
 
 ## 构建前准备
 
-Infernux 0.4.2，Windows x64 或 Linux x64 编辑器，以及支持 WebGPU 的浏览器。普通导出不需要引擎源码、Git 子模块、CMake、WSL 或 Emscripten。
+Infernux 0.4.3，Windows x64 或 Linux x64 编辑器，以及支持 WebGPU 的浏览器。普通导出不需要引擎源码、Git 子模块、CMake、WSL 或 Emscripten。
 
 ## 插件载荷
 

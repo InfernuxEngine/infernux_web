@@ -502,8 +502,18 @@ if(NOT IS_ABSOLUTE "${INFERNUX_WEB_PLAYER_OUTPUT_DIR}")
     message(FATAL_ERROR "INFERNUX_WEB_PLAYER_OUTPUT_DIR must be absolute")
 endif()
 set(_web_player_destination "${INFERNUX_WEB_PLAYER_OUTPUT_DIR}")
+set(_engine_version_source "${INFERNUX_ENGINE_SOURCE_ROOT}/python/infernux/version.py")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_engine_version_source}")
+execute_process(
+    COMMAND "${INFERNUX_WEB_HOST_PYTHON}" -c
+        "import runpy,sys; print(runpy.run_path(sys.argv[1])['ENGINE_VERSION'])"
+        "${_engine_version_source}"
+    OUTPUT_VARIABLE _engine_version
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY
+)
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/Player.inxmanifest" CONTENT
-"{\"$schema\":\"infernux.web_player\",\"engine\":\"0.4.2\",\"platform\":\"web\",\"architecture\":\"wasm32\",\"python_abi\":\"cp313\",\"configuration\":\"$<CONFIG>\",\"python_runtime\":${_python_runtime_manifest}}\n")
+"{\"$schema\":\"infernux.web_player\",\"engine\":\"${_engine_version}\",\"platform\":\"web\",\"architecture\":\"wasm32\",\"python_abi\":\"cp313\",\"configuration\":\"$<CONFIG>\",\"python_runtime\":${_python_runtime_manifest}}\n")
 add_custom_target(prebuild_web_player
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${_web_player_destination}"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
