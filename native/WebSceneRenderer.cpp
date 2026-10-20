@@ -1062,6 +1062,12 @@ WebSceneRenderer::GPUTexture WebSceneRenderer::UploadMaterialTexture(const Textu
     return gpu;
 }
 
+WebSceneRenderer::SampledTexture WebSceneRenderer::ResolveSampledTexture(const std::string &guid)
+{
+    const auto texture = ResolveMaterialTexture(guid, {}, {});
+    return {texture.view, texture.sampler};
+}
+
 WebSceneRenderer::GPUTexture WebSceneRenderer::ResolveMaterialTexture(const std::string &guid,
                                                                       const MaterialTextureSampler &sampler,
                                                                       const GPUTexture &fallback)

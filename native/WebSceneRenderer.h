@@ -44,6 +44,13 @@ class WebSceneRenderer final
     /// Linear HDR clear color from the same camera used by Prepare().
     [[nodiscard]] wgpu::Color GetClearColor() const noexcept { return m_clearColor; }
 
+    struct SampledTexture
+    {
+        wgpu::TextureView view;
+        wgpu::Sampler sampler;
+    };
+    [[nodiscard]] SampledTexture ResolveSampledTexture(const std::string &guid);
+
     /// Extract, upload, and record the directional shadow map before the main
     /// render pass begins.
     bool Prepare(wgpu::CommandEncoder encoder, uint32_t width, uint32_t height, Camera *camera);

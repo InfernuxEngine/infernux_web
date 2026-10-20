@@ -1190,7 +1190,7 @@ void StartSurface()
     InfernuxWebSetScreenUIRenderer(&g_screenUIRenderer);
     const auto particleSampleCount =
         sceneSampleCount == 4 ? infernux::rhi::SampleCount::Four : infernux::rhi::SampleCount::One;
-    if (!g_particleRuntime.Initialize(*g_rhi, infernux::rhi::PixelFormat::RGBA16SFloat, particleSampleCount)) {
+    if (!g_particleRuntime.Initialize(*g_rhi, g_sceneRenderer, infernux::rhi::PixelFormat::RGBA16SFloat, particleSampleCount)) {
         std::fprintf(stderr, "INFERNUX_WEBGPU_PARTICLE_RUNTIME_FAILED %s\n", g_particleRuntime.LastError().c_str());
         InfernuxWebAbortStartup("Particle runtime initialization failed");
         return;

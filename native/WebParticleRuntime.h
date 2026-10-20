@@ -18,6 +18,7 @@ namespace infernux::web
 {
 
 class WebGpuRhiDevice;
+class WebSceneRenderer;
 
 /// WebGPU execution and rendering host for the portable ParticleGraph subset.
 /// Python owns scheduling; this class owns only browser GPU residency.
@@ -30,7 +31,7 @@ class WebParticleRuntime final
     WebParticleRuntime(const WebParticleRuntime &) = delete;
     WebParticleRuntime &operator=(const WebParticleRuntime &) = delete;
 
-    [[nodiscard]] bool Initialize(WebGpuRhiDevice &device, rhi::PixelFormat colorFormat,
+    [[nodiscard]] bool Initialize(WebGpuRhiDevice &device, WebSceneRenderer &scene, rhi::PixelFormat colorFormat,
                                   rhi::SampleCount sceneSampleCount);
     [[nodiscard]] bool ConfigureSampleCount(rhi::SampleCount sceneSampleCount);
     void Shutdown() noexcept;

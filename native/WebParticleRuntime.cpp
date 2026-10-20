@@ -2,6 +2,7 @@
 
 #include "InfernuxWebHostModule.h"
 #include "WebGpuRhiDevice.h"
+#include "WebSceneRenderer.h"
 
 #include <core/types/ColorSpace.h>
 #include <function/renderer/particle/ParticleGpuRuntime.h>
@@ -54,13 +55,18 @@ struct ParticleInstance {
 
 struct OutputData {
     material_tint: vec4<f32>,
+    flipbook_grid: vec4<f32>,
 };
 @group(1) @binding(2) var<uniform> output_data: OutputData;
+@group(1) @binding(3) var sprite_texture: texture_2d<f32>;
+@group(1) @binding(4) var sprite_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) next_uv: vec2<f32>,
+    @location(3) frame_blend: f32,
 };
 
 @vertex
@@ -83,21 +89,30 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32,
     var output: VertexOutput;
     output.position = camera.view_projection * vec4<f32>(world, 1.0);
     output.color = particle.color;
-    output.uv = corner * 0.5 + vec2<f32>(0.5);
+    let grid = max(output_data.flipbook_grid.xy, vec2<f32>(1.0));
+    let frame_position = max(particle.custom_data.x, 0.0) % (grid.x * grid.y);
+    let frame = floor(frame_position);
+    let next_frame = (frame + 1.0) % (grid.x * grid.y);
+    let uv = vec2<f32>(corner.x * 0.5 + 0.5, 0.5 - corner.y * 0.5);
+    output.uv = (uv + vec2<f32>(frame % grid.x, floor(frame / grid.x))) / grid;
+    output.next_uv = (uv + vec2<f32>(next_frame % grid.x, floor(next_frame / grid.x))) / grid;
+    output.frame_blend = fract(frame_position);
     return output;
 }
 
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // Sprite geometry is a quad. Coverage belongs to the selected particle
-    // material/texture; imposing a radial mask here made every untextured
-    // particle circular and diverged from the Vulkan renderer.
-    // Keep authored colors in linear HDR space. Values above one must reach
-    // the RGBA16F scene target so Bloom and tone mapping observe the same
-    // energy as the Vulkan particle material path.
-    return input.color * output_data.material_tint;
+    let current = textureSample(sprite_texture, sprite_sampler, input.uv);
+    let next = textureSample(sprite_texture, sprite_sampler, input.next_uv);
+    return mix(current, next, input.frame_blend) * input.color * output_data.material_tint;
 }
 )wgsl";
+
+struct ParticleOutputData
+{
+    glm::vec4 tint{1.0f};
+    glm::vec4 flipbookGrid{1.0f, 1.0f, 0.0f, 0.0f};
+};
 
 glm::mat4 ToWebClipSpace(const glm::mat4 &vulkanViewProjection)
 {
@@ -189,6 +204,32 @@ glm::vec4 ReadOutputMaterialTint(PyObject *program)
     Py_XDECREF(color);
     Py_DECREF(outputs);
     return tint;
+}
+
+bool ReadOutputData(PyObject *program, ParticleOutputData &data, std::string &textureGuid)
+{
+    data.tint = ReadOutputMaterialTint(program);
+    textureGuid = "white";
+    PyObject *outputs = PySequence_Fast(Field(program, "outputs"), "particle outputs must be a sequence");
+    if (!outputs)
+        return false;
+    bool valid = true;
+    if (PySequence_Fast_GET_SIZE(outputs) > 0) {
+        PyObject *output = PySequence_Fast_GET_ITEM(outputs, 0);
+        uint32_t columns = 0, rows = 0;
+        valid = ReadUnsigned(Field(output, "flipbook_columns"), columns) && columns > 0 &&
+                ReadUnsigned(Field(output, "flipbook_rows"), rows) && rows > 0;
+        data.flipbookGrid = glm::vec4(columns, rows, 0.0f, 0.0f);
+        PyObject *native = Field(Field(output, "material"), "native");
+        PyObject *texture = native ? PyObject_CallMethod(native, "get_texture", "s", "texSampler") : nullptr;
+        if (!texture || (texture != Py_None && !PyUnicode_Check(texture)))
+            valid = false;
+        else if (texture != Py_None)
+            textureGuid = PyUnicode_AsUTF8(texture);
+        Py_XDECREF(texture);
+    }
+    Py_DECREF(outputs);
+    return valid;
 }
 
 bool ReadWordVector(PyObject *value, std::vector<uint32_t> &result)
@@ -304,6 +345,8 @@ struct alignas(16) WebSpawnMetadata
     uint32_t words[8]{};
 };
 static_assert(sizeof(WebSpawnMetadata) == 32);
+// Each emitter binds a storage-buffer view at WebGPU's 256-byte offset alignment.
+constexpr uint64_t kSpawnMetadataStride = 256;
 
 bool DecodeRequest(PyObject *mapping, FrameRequest &request, bool preroll)
 {
@@ -360,6 +403,7 @@ struct WebParticleRuntime::State
         uint64_t artifactRevision = 0;
         bool stateWasPreserved = false;
         uint32_t slot = 0;
+        uint32_t capacity = 0;
         uint32_t ownerLayerMask = 0;
         bool playing = true;
         bool resetPending = false;
@@ -370,9 +414,13 @@ struct WebParticleRuntime::State
         rhi::BindGroupHandle spawnGroup;
         wgpu::Buffer outputBuffer;
         wgpu::BindGroup renderGroup;
+        std::string textureGuid;
+        wgpu::TextureView boundTexture;
+        wgpu::Sampler boundSampler;
     };
 
     WebGpuRhiDevice *rhi = nullptr;
+    WebSceneRenderer *scene = nullptr;
     wgpu::Device device;
     wgpu::Queue queue;
     rhi::PixelFormat colorFormat = rhi::PixelFormat::Undefined;
@@ -407,11 +455,45 @@ struct WebParticleRuntime::State
     void ReleaseEmitter(Emitter &emitter) noexcept
     {
         emitter.renderGroup = {};
+        emitter.boundTexture = {};
+        emitter.boundSampler = {};
         emitter.outputBuffer = {};
         if (rhi)
             rhi->Release(emitter.spawnGroup);
         emitter.spawnGroup = {};
         emitter.runtime.reset();
+    }
+
+    bool PrepareRenderGroup(Emitter &emitter)
+    {
+        const auto texture = scene->ResolveSampledTexture(emitter.textureGuid);
+        if (!texture.view || !texture.sampler)
+            return false;
+        if (emitter.renderGroup && emitter.boundTexture.Get() == texture.view.Get() &&
+            emitter.boundSampler.Get() == texture.sampler.Get())
+            return true;
+        std::array<wgpu::BindGroupEntry, 5> bindings{};
+        bindings[0].binding = 0;
+        bindings[0].buffer = rhi->GetNativeBuffer(emitter.runtime->InstanceBuffer());
+        bindings[0].size = static_cast<uint64_t>(emitter.capacity) * particle::ParticleGpuRuntime::RenderInstanceStride;
+        bindings[1].binding = 1;
+        bindings[1].buffer = rhi->GetNativeBuffer(emitter.runtime->RenderIndexBuffer());
+        bindings[1].size = static_cast<uint64_t>(emitter.capacity) * sizeof(uint32_t);
+        bindings[2].binding = 2;
+        bindings[2].buffer = emitter.outputBuffer;
+        bindings[2].size = sizeof(ParticleOutputData);
+        bindings[3].binding = 3;
+        bindings[3].textureView = texture.view;
+        bindings[4].binding = 4;
+        bindings[4].sampler = texture.sampler;
+        wgpu::BindGroupDescriptor descriptor;
+        descriptor.layout = geometryLayout;
+        descriptor.entryCount = bindings.size();
+        descriptor.entries = bindings.data();
+        emitter.renderGroup = device.CreateBindGroup(&descriptor);
+        emitter.boundTexture = texture.view;
+        emitter.boundSampler = texture.sampler;
+        return static_cast<bool>(emitter.renderGroup);
     }
 
     void Clear() noexcept
@@ -433,6 +515,7 @@ struct WebParticleRuntime::State
         queue = {};
         device = {};
         rhi = nullptr;
+        scene = nullptr;
         emissionSupported = true;
     }
 };
@@ -446,11 +529,12 @@ WebParticleRuntime::~WebParticleRuntime()
     Shutdown();
 }
 
-bool WebParticleRuntime::Initialize(WebGpuRhiDevice &device, rhi::PixelFormat colorFormat,
+bool WebParticleRuntime::Initialize(WebGpuRhiDevice &device, WebSceneRenderer &scene, rhi::PixelFormat colorFormat,
                                     rhi::SampleCount sceneSampleCount)
 {
     Shutdown();
     m_state->rhi = &device;
+    m_state->scene = &scene;
     m_state->device = device.NativeDevice();
     m_state->queue = device.NativeQueue();
     m_state->colorFormat = colorFormat;
@@ -496,16 +580,23 @@ bool WebParticleRuntime::Initialize(WebGpuRhiDevice &device, rhi::PixelFormat co
     cameraGroupDesc.entries = &cameraBinding;
     m_state->cameraGroup = m_state->device.CreateBindGroup(&cameraGroupDesc);
 
-    std::array<wgpu::BindGroupLayoutEntry, 3> geometryEntries{};
+    std::array<wgpu::BindGroupLayoutEntry, 5> geometryEntries{};
     for (uint32_t index = 0; index < 2; ++index) {
         geometryEntries[index].binding = index;
         geometryEntries[index].visibility = wgpu::ShaderStage::Vertex;
         geometryEntries[index].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
     }
     geometryEntries[2].binding = 2;
-    geometryEntries[2].visibility = wgpu::ShaderStage::Fragment;
+    geometryEntries[2].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
     geometryEntries[2].buffer.type = wgpu::BufferBindingType::Uniform;
-    geometryEntries[2].buffer.minBindingSize = sizeof(glm::vec4);
+    geometryEntries[2].buffer.minBindingSize = sizeof(ParticleOutputData);
+    geometryEntries[3].binding = 3;
+    geometryEntries[3].visibility = wgpu::ShaderStage::Fragment;
+    geometryEntries[3].texture.sampleType = wgpu::TextureSampleType::Float;
+    geometryEntries[3].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+    geometryEntries[4].binding = 4;
+    geometryEntries[4].visibility = wgpu::ShaderStage::Fragment;
+    geometryEntries[4].sampler.type = wgpu::SamplerBindingType::Filtering;
     wgpu::BindGroupLayoutDescriptor geometryLayoutDesc;
     geometryLayoutDesc.entryCount = geometryEntries.size();
     geometryLayoutDesc.entries = geometryEntries.data();
@@ -719,7 +810,7 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
     std::vector<uint32_t> zeros(slotCount, 0);
     std::vector<uint32_t> playing(slotCount, 1);
     graph.burstRequests = CreateStorageBuffer(*m_state->rhi, slotCount * sizeof(uint32_t), false, zeros.data());
-    graph.spawnMetadata = CreateStorageBuffer(*m_state->rhi, slotCount * sizeof(WebSpawnMetadata), true);
+    graph.spawnMetadata = CreateStorageBuffer(*m_state->rhi, slotCount * kSpawnMetadataStride, true);
     graph.parameters =
         CreateStorageBuffer(*m_state->rhi, parameters.size() * sizeof(uint32_t), false, parameters.data());
     graph.playingRequests = CreateStorageBuffer(*m_state->rhi, slotCount * sizeof(uint32_t), false, zeros.data());
@@ -779,6 +870,7 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
         }
         emitter->graphId = graphInstanceId;
         emitter->slot = slot;
+        emitter->capacity = capacity;
         emitter->runtime = std::make_unique<particle::ParticleGpuRuntime>();
         if (!emitter->runtime->Create(*m_state->rhi, desc)) {
             Py_DECREF(programSequence);
@@ -799,7 +891,7 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
                                                                 publishedGraph.burstRequests};
         spawnGroupDesc.buffers[spawnGroupDesc.bufferCount++] = {
             1, rhi::BindingType::StorageBuffer, publishedGraph.spawnMetadata,
-            static_cast<uint64_t>(slot) * sizeof(WebSpawnMetadata), sizeof(WebSpawnMetadata)};
+            static_cast<uint64_t>(slot) * kSpawnMetadataStride, sizeof(WebSpawnMetadata)};
         spawnGroupDesc.buffers[spawnGroupDesc.bufferCount++] = {2, rhi::BindingType::StorageBuffer,
                                                                 publishedGraph.parameters};
         spawnGroupDesc.buffers[spawnGroupDesc.bufferCount++] = {3, rhi::BindingType::StorageBuffer,
@@ -810,34 +902,24 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
 
         const auto instances = m_state->rhi->GetNativeBuffer(emitter->runtime->InstanceBuffer());
         const auto indices = m_state->rhi->GetNativeBuffer(emitter->runtime->RenderIndexBuffer());
-        const glm::vec4 materialTint = ReadOutputMaterialTint(program);
+        ParticleOutputData outputData;
+        if (!ReadOutputData(program, outputData, emitter->textureGuid)) {
+            PyErr_Clear();
+            Py_DECREF(programSequence);
+            return "WebGPU particle output material or flipbook layout is invalid";
+        }
         wgpu::BufferDescriptor outputBufferDescriptor;
-        outputBufferDescriptor.size = sizeof(materialTint);
+        outputBufferDescriptor.size = sizeof(outputData);
         outputBufferDescriptor.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
         emitter->outputBuffer = m_state->device.CreateBuffer(&outputBufferDescriptor);
         if (emitter->outputBuffer)
-            m_state->queue.WriteBuffer(emitter->outputBuffer, 0, &materialTint, sizeof(materialTint));
-        std::array<wgpu::BindGroupEntry, 3> geometryBindings{};
-        geometryBindings[0].binding = 0;
-        geometryBindings[0].buffer = instances;
-        geometryBindings[0].size = static_cast<uint64_t>(capacity) * particle::ParticleGpuRuntime::RenderInstanceStride;
-        geometryBindings[1].binding = 1;
-        geometryBindings[1].buffer = indices;
-        geometryBindings[1].size = static_cast<uint64_t>(capacity) * sizeof(uint32_t);
-        geometryBindings[2].binding = 2;
-        geometryBindings[2].buffer = emitter->outputBuffer;
-        geometryBindings[2].size = sizeof(materialTint);
-        wgpu::BindGroupDescriptor geometryGroupDesc;
-        geometryGroupDesc.layout = m_state->geometryLayout;
-        geometryGroupDesc.entryCount = geometryBindings.size();
-        geometryGroupDesc.entries = geometryBindings.data();
-        emitter->renderGroup = m_state->device.CreateBindGroup(&geometryGroupDesc);
-        if (!emitter->spawnGroup.IsValid() || !emitter->outputBuffer || !emitter->renderGroup) {
+            m_state->queue.WriteBuffer(emitter->outputBuffer, 0, &outputData, sizeof(outputData));
+        if (!emitter->spawnGroup.IsValid() || !emitter->outputBuffer || !instances || !indices) {
             Py_DECREF(programSequence);
             return "WebGPU particle bind groups could not be created";
         }
-        std::printf("INFERNUX_WEBGPU_PARTICLE_OUTPUT_READY tint=%.4f,%.4f,%.4f,%.4f hdr=1\n", materialTint.x,
-                    materialTint.y, materialTint.z, materialTint.w);
+        std::printf("INFERNUX_WEBGPU_PARTICLE_OUTPUT_READY tint=%.4f,%.4f,%.4f,%.4f hdr=1\n", outputData.tint.x,
+                    outputData.tint.y, outputData.tint.z, outputData.tint.w);
         m_state->emitters.emplace(emitter->id, std::move(emitter));
     }
     Py_DECREF(programSequence);
@@ -1081,8 +1163,10 @@ bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, Camera &camera, ui
     pass.SetBindGroup(0, m_state->cameraGroup);
     bool drew = false;
     for (const auto &[_, emitter] : m_state->emitters) {
-        if (!emitter->drawReady || !emitter->playing || !emitter->renderGroup ||
+        if (!emitter->drawReady || !emitter->playing ||
             (emitter->ownerLayerMask & camera.GetCullingMask()) == 0)
+            continue;
+        if (!m_state->PrepareRenderGroup(*emitter))
             continue;
         const auto indirect = m_state->rhi->GetNativeBuffer(emitter->runtime->IndirectBuffer());
         if (!indirect)
