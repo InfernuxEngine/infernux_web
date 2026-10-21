@@ -1379,8 +1379,10 @@ class _WebScreenUIRenderer:
         always_on_top: bool, billboard: bool, constant_screen_size: bool,
         ignored_occluder_id: int = 0,
     ) -> None:
+        from infernux.ui.inx_ui_screen_component import _world_ui_pose_matrix
+
         self._host.screen_ui_begin_world_element(
-            tuple(game_object.transform.local_to_world_matrix()),
+            tuple(_world_ui_pose_matrix(game_object.transform)),
             pivot_x, pivot_y, int(game_object.layer), always_on_top,
             billboard, constant_screen_size, ignored_occluder_id,
         )

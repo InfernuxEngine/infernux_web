@@ -24,7 +24,11 @@ def test_python_bridge_submits_guid_generation_and_world_transform(monkeypatch):
     namespace = {"Any": Any}
     exec(compile(ast.Module([cls], type_ignores=[]), "bootstrap.py", "exec"), namespace)
     renderer = namespace["_WebScreenUIRenderer"]()
-    transform = SimpleNamespace(local_to_world_matrix=lambda: range(16))
+    transform = SimpleNamespace(
+        position=SimpleNamespace(x=1.0, y=2.0, z=3.0),
+        rotation=SimpleNamespace(x=0.0, y=0.0, z=0.6, w=0.8),
+        scale=SimpleNamespace(x=0.01, y=2.0, z=3.0),
+    )
     obj = SimpleNamespace(transform=transform, layer=6)
     renderer.set_material_binding(2, "a" * 32, 11, "ui|shader=fixture", (0.2, 0.4, 0.6, 0.8), True, 0.35)
     renderer.begin_world_object(obj, 50.0, 25.0, True, False, True, 9)
@@ -32,7 +36,11 @@ def test_python_bridge_submits_guid_generation_and_world_transform(monkeypatch):
 
     assert calls[0] == ("material", (2, "a" * 32, 11, "ui|shader=fixture",
                                       (0.2, 0.4, 0.6, 0.8), True, 0.35))
-    assert calls[1] == ("world", (tuple(range(16)), 50.0, 25.0, 6, True, False, True, 9))
+    matrix = calls[1][1][0]
+    import pytest
+
+    assert matrix == pytest.approx((0.28, 0.96, 0, 0, -0.96, 0.28, 0, 0, 0, 0, 1, 0, 1, 2, 3, 1))
+    assert calls[1][1][1:] == (50.0, 25.0, 6, True, False, True, 9)
     assert calls[2] == ("end", ())
 
 

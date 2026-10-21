@@ -886,14 +886,10 @@ void WebScreenUIRenderer::AddTextGeometry(int list, float minX, float minY, floa
         if (!RefreshFontAtlas())
             throw std::runtime_error("Web UI font atlas publication failed during text preparation");
     }
-    if (clip)
-        draw->PushClipRect({minX, minY}, {maxX, maxY}, true);
     draw->PushTextureID(ImGui::GetIO().Fonts->TexRef);
     geometry.Render(*draw, minX, minY, maxX, maxY, {r, g, b, a}, alignX, alignY, scale, rotation, mirrorH, mirrorV,
-                    false);
+                    false, clip);
     draw->PopTextureID();
-    if (clip)
-        draw->PopClipRect();
 }
 
 std::pair<float, float> WebScreenUIRenderer::MeasureText(const std::string &text, float fontSize, float wrapWidth,
