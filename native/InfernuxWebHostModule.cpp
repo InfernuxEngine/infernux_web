@@ -15,6 +15,7 @@
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
 #include <core/config/EngineConfig.h>
 #include <function/audio/AudioClipLoader.h>
+#include <function/renderer/gui/InxTextGeometry.h>
 #include <function/resources/AssetDatabase/AssetDatabase.h>
 #include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/resources/InxFileLoader/InxDefaultLoader.hpp>
@@ -25,6 +26,7 @@
 #include <function/resources/InxTexture/TextureLoader.h>
 #include <function/resources/PhysicMaterial/PhysicMaterialLoader.h>
 #include <function/scene/SceneManager.h>
+#include <pybind11/pybind11.h>
 #endif
 
 #include <array>
@@ -639,6 +641,38 @@ PyObject *ScreenUIAddText(PyObject *, PyObject *arguments)
     Py_RETURN_NONE;
 }
 
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+PyObject *ScreenUIAddTextGeometry(PyObject *, PyObject *arguments)
+{
+    int list, mirrorH, mirrorV, clip;
+    double minX, minY, maxX, maxY, r, g, b, a, alignX, alignY, scale, rotation;
+    PyObject *object = nullptr;
+    if (!PyArg_ParseTuple(arguments, "iddddOddddddddppp:screen_ui_add_text_geometry", &list, &minX, &minY, &maxX, &maxY,
+                          &object, &r, &g, &b, &a, &alignX, &alignY, &scale, &rotation, &mirrorH, &mirrorV, &clip))
+        return nullptr;
+    if (!g_screenUIRenderer) {
+        PyErr_SetString(PyExc_RuntimeError, "Web UI renderer is not initialized");
+        return nullptr;
+    }
+    try {
+        auto &geometry = pybind11::cast<infernux::textlayout::TextGeometry &>(pybind11::handle(object));
+        g_screenUIRenderer->AddTextGeometry(
+            list, static_cast<float>(minX), static_cast<float>(minY), static_cast<float>(maxX),
+            static_cast<float>(maxY), geometry, static_cast<float>(r), static_cast<float>(g), static_cast<float>(b),
+            static_cast<float>(a), static_cast<float>(alignX), static_cast<float>(alignY), static_cast<float>(scale),
+            static_cast<float>(rotation), mirrorH != 0, mirrorV != 0, clip != 0);
+        Py_RETURN_NONE;
+    } catch (const pybind11::cast_error &error) {
+        PyErr_SetString(PyExc_TypeError, error.what());
+    } catch (pybind11::error_already_set &error) {
+        error.restore();
+    } catch (const std::exception &error) {
+        PyErr_SetString(PyExc_RuntimeError, error.what());
+    }
+    return nullptr;
+}
+#endif
+
 PyObject *ScreenUIMeasureText(PyObject *, PyObject *arguments)
 {
     const char *text = nullptr;
@@ -814,6 +848,9 @@ PyMethodDef kMethods[] = {
     {"screen_ui_add_filled_rect", ScreenUIAddFilledRect, METH_VARARGS, nullptr},
     {"screen_ui_add_image", ScreenUIAddImage, METH_VARARGS, nullptr},
     {"screen_ui_add_text", ScreenUIAddText, METH_VARARGS, nullptr},
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+    {"screen_ui_add_text_geometry", ScreenUIAddTextGeometry, METH_VARARGS, nullptr},
+#endif
     {"screen_ui_measure_text", ScreenUIMeasureText, METH_VARARGS, nullptr},
     {"screen_ui_resolve_texture", ScreenUIResolveTexture, METH_VARARGS, nullptr},
     {"screen_ui_upload_image", ScreenUIUploadImage, METH_VARARGS, nullptr},

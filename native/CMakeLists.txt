@@ -172,6 +172,8 @@ if(NOT EXISTS "${_web_zstd_source}/CMakeLists.txt")
     message(FATAL_ERROR "Initialize the engine's external/zstd_for_infernux submodule before building Web Players")
 endif()
 add_subdirectory("${_web_zstd_source}" "${CMAKE_BINARY_DIR}/_deps/infernux-web-zstd" EXCLUDE_FROM_ALL)
+add_subdirectory("${INFERNUX_ENGINE_SOURCE_ROOT}/external/unicode"
+    "${CMAKE_BINARY_DIR}/_deps/infernux-web-unicode" EXCLUDE_FROM_ALL)
 
 add_executable(InfernuxWebPlayerHost
     main.cpp
@@ -184,6 +186,8 @@ add_executable(InfernuxWebPlayerHost
     WebTextureUpload.cpp
     WebSceneRenderer.cpp
     WebScreenUIRenderer.cpp
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/gui/InxTextLayout.cpp"
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/gui/InxTextGeometry.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/particle/ParticleGpuContactRuntime.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/particle/ParticleGpuContinuationRuntime.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/particle/ParticleGpuRuntime.cpp"
@@ -256,6 +260,7 @@ target_link_libraries(InfernuxWebPlayerHost PRIVATE
     "${_python_mpdecimal}"
     "${_python_hacl}"
     libzstd_static
+    infernux_utf8proc
     SDL3::SDL3-static
     dl
     pthread
@@ -305,6 +310,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
         ${_web_scene_binding_sources}
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingSemanticCatalog.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingTagLayer.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingText.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingVector2f.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingVector3f.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingVector4f.cpp"
@@ -351,7 +357,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
         # native Wasm exception ABI used by the final Player and LunaSVG.
         target_compile_options(plutovg PRIVATE "-sSUPPORT_LONGJMP=wasm")
     endif()
-    target_link_libraries(InfernuxWebResourceRuntimeProbe PRIVATE lunasvg::lunasvg)
+    target_link_libraries(InfernuxWebResourceRuntimeProbe PRIVATE lunasvg::lunasvg infernux_utf8proc)
     add_library(InfernuxWebPlatformRuntimeProbe OBJECT EXCLUDE_FROM_ALL
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/platform/input/InputManager.cpp"
     )
@@ -460,6 +466,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
         target_compile_definitions(InfernuxWebPlayerHost PRIVATE
             INFERNUX_WEB_ENGINE_RUNTIME=1
         )
+        target_include_directories(InfernuxWebPlayerHost PRIVATE "${_web_pybind11_include}")
         target_link_libraries(InfernuxWebPlayerHost PRIVATE Jolt lunasvg::lunasvg)
     endif()
 endif()

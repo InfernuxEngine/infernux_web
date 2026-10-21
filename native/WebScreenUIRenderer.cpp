@@ -2,6 +2,7 @@
 #include "WebTextureUpload.h"
 
 #include "InfernuxWebHostModule.h"
+#include <function/renderer/gui/InxTextGeometry.h>
 #include <function/renderer/gui/InxTextLayout.h>
 #include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/resources/InxMaterial/InxMaterial.h>
@@ -868,6 +869,31 @@ void WebScreenUIRenderer::AddText(int list, float minX, float minY, float maxX, 
     if (clip)
         draw->PopClipRect();
     TransformVertices(*draw, firstVertex, minX, minY, maxX, maxY, rotation, mirrorH, mirrorV);
+}
+
+void WebScreenUIRenderer::AddTextGeometry(int list, float minX, float minY, float maxX, float maxY,
+                                          textlayout::TextGeometry &geometry, float r, float g, float b, float a,
+                                          float alignX, float alignY, float scale, float rotation, bool mirrorH,
+                                          bool mirrorV, bool clip)
+{
+    ImDrawList *draw = DrawList(list);
+    if (!draw)
+        return;
+    ImGui::SetCurrentContext(m_context);
+    geometry.Prepare(scale);
+    if (!ImGui::GetIO().Fonts->IsBuilt()) {
+        m_fontAtlasDirty = true;
+        if (!RefreshFontAtlas())
+            throw std::runtime_error("Web UI font atlas publication failed during text preparation");
+    }
+    if (clip)
+        draw->PushClipRect({minX, minY}, {maxX, maxY}, true);
+    draw->PushTextureID(ImGui::GetIO().Fonts->TexRef);
+    geometry.Render(*draw, minX, minY, maxX, maxY, {r, g, b, a}, alignX, alignY, scale, rotation, mirrorH, mirrorV,
+                    false);
+    draw->PopTextureID();
+    if (clip)
+        draw->PopClipRect();
 }
 
 std::pair<float, float> WebScreenUIRenderer::MeasureText(const std::string &text, float fontSize, float wrapWidth,

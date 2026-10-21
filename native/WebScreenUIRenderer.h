@@ -14,6 +14,10 @@
 
 namespace infernux
 {
+namespace textlayout
+{
+class TextGeometry;
+}
 struct TextureCpuData;
 struct MaterialTextureSampler;
 } // namespace infernux
@@ -54,6 +58,9 @@ class WebScreenUIRenderer final
                  float b, float a, float alignX, float alignY, float fontSize, float wrapWidth, float rotation,
                  bool mirrorH, bool mirrorV, const std::string &fontPath, float lineHeight, float letterSpacing,
                  bool clip, const std::vector<std::string> &fallbackFontPaths = {});
+    void AddTextGeometry(int list, float minX, float minY, float maxX, float maxY, textlayout::TextGeometry &geometry,
+                         float r, float g, float b, float a, float alignX, float alignY, float scale, float rotation,
+                         bool mirrorH, bool mirrorV, bool clip);
     [[nodiscard]] std::pair<float, float> MeasureText(const std::string &text, float fontSize, float wrapWidth,
                                                       const std::string &fontPath, float lineHeight,
                                                       float letterSpacing,
