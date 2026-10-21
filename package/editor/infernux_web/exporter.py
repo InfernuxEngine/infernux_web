@@ -322,6 +322,9 @@ def _publish_web_player(
     if match is None:
         raise RuntimeError("Web host entry point has no valid asset revision")
     revision = match.group(1)
+    from infernux.engine.player_dependencies import stage_engine_licenses
+
+    notices = stage_engine_licenses(host_build / "licenses" / "infernux")
     names = (
         "infernux-player.html",
         f"infernux-player.{revision}.js",
@@ -335,6 +338,7 @@ def _publish_web_player(
         "infernux.webmanifest",
         "infernux-branding.js",
         WEBGPU_CAPABILITY_FILENAME,
+        *(path.relative_to(host_build).as_posix() for path in notices),
     )
     missing = [name for name in names if not (host_build / name).is_file()]
     if missing:
@@ -388,11 +392,13 @@ def _publish_web_player(
         # all resources it names intact.
         for name in names:
             source = host_build / name
-            temporary = output_root / f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
+            destination = output_root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{time.time_ns()}.tmp")
             staged[name] = temporary
             shutil.copy2(source, temporary)
         artifacts = [
-            BuildArtifact(str(output_root / name), (output_root / name).suffix.lstrip("."),
+            BuildArtifact(str(output_root / name), (output_root / name).suffix.lstrip(".") or "file",
                           size=staged[name].stat().st_size)
             for name in names
         ]

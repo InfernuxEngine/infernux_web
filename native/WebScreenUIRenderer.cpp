@@ -704,6 +704,11 @@ void WebScreenUIRenderer::BeginFrame(uint32_t width, uint32_t height)
     if (!m_context || !m_camera || !m_overlay || !m_world)
         return;
     ImGui::SetCurrentContext(m_context);
+    if (!ImGui::GetIO().Fonts->IsBuilt()) {
+        m_fontAtlasDirty = true;
+        if (!RefreshFontAtlas())
+            throw std::runtime_error("Web UI font atlas publication failed before geometry recording");
+    }
     m_cacheValid = false;
     ResetDrawList(*m_camera, width, height);
     ResetDrawList(*m_overlay, width, height);
@@ -721,7 +726,8 @@ void WebScreenUIRenderer::BeginFrame(uint32_t width, uint32_t height)
 
 bool WebScreenUIRenderer::BeginFrameCached(uint32_t width, uint32_t height, uint64_t contentRevision)
 {
-    if (m_cacheValid && width == m_cachedWidth && height == m_cachedHeight && contentRevision == m_cachedRevision)
+    if (m_cacheValid && width == m_cachedWidth && height == m_cachedHeight && contentRevision == m_cachedRevision &&
+        ImGui::GetIO().Fonts->IsBuilt())
         return true;
     BeginFrame(width, height);
     m_cacheValid = true;
