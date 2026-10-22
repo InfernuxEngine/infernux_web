@@ -1553,7 +1553,7 @@ def _process_screen_ui_events(delta_time: float) -> None:
     )
     from infernux.input import Input, TouchPhase
     from infernux.ui.ui_event_data import PointerType
-    from infernux.ui.ui_event_system import UIPointerFrame
+    from infernux.ui.ui_event_system import UIPointerFrame, _mouse_pointer_frames
     from infernux.ui.ui_canvas_utils import runtime_ui_scenes
 
     scene = _player_scene_manager.get_active_scene()
@@ -1583,17 +1583,12 @@ def _process_screen_ui_events(delta_time: float) -> None:
         include_scene_hit=True,
     )
 
-    pointers = [
-        UIPointerFrame(
-            pointer_id=-1,
-            pointer_type=PointerType.Mouse,
-            canvas_positions=mouse_positions,
-            down=bool(down),
-            up=bool(up),
-            held=bool(held),
-            scroll_delta=(float(scroll_x), float(scroll_y)),
-        )
-    ]
+    pointers = _mouse_pointer_frames(
+        mouse_positions,
+        ((held, down, up), Input.get_game_mouse_frame_state(1)[4:],
+         Input.get_game_mouse_frame_state(2)[4:]),
+        (float(scroll_x), float(scroll_y)),
+    )
     touches = tuple(Input.touches)
     touch_points = tuple(
         (
