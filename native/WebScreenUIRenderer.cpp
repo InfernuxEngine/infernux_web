@@ -139,7 +139,7 @@ struct VertexInput {
     @location(2) color: vec4<f32>,
     @location(3) local_position: vec2<f32>,
     @location(4) anchor: vec3<f32>,
-    @location(5) local_offset: vec2<f32>,
+    @location(5) local_offset: vec3<f32>,
     @location(6) policy: f32,
 };
 struct VertexOutput {
@@ -172,7 +172,8 @@ struct WorldConstants {
         var offset = input.position - input.anchor;
         if ((policy & 1u) != 0u) {
             offset = pc.camera_right.xyz * input.local_offset.x
-                   + pc.camera_up.xyz * input.local_offset.y;
+                   + pc.camera_up.xyz * input.local_offset.y
+                   + cross(pc.camera_right.xyz, pc.camera_up.xyz) * input.local_offset.z;
         }
         if ((policy & 2u) != 0u) {
             let clip_w = (pc.view_projection * vec4<f32>(input.anchor, 1.0)).w;
@@ -502,7 +503,7 @@ bool WebScreenUIRenderer::CreateWorldPipelines()
     attribute(2, wgpu::VertexFormat::Float32x4, offsetof(WorldVertex, color));
     attribute(3, wgpu::VertexFormat::Float32x2, offsetof(WorldVertex, localPosition));
     attribute(4, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, anchor));
-    attribute(5, wgpu::VertexFormat::Float32x2, offsetof(WorldVertex, localOffset));
+    attribute(5, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, localOffset));
     attribute(6, wgpu::VertexFormat::Float32, offsetof(WorldVertex, policy));
     wgpu::VertexBufferLayout vertexLayout;
     vertexLayout.arrayStride = sizeof(WorldVertex);
@@ -599,7 +600,7 @@ wgpu::RenderPipeline WebScreenUIRenderer::ResolveMaterialPipeline(const Material
         attribute(2, wgpu::VertexFormat::Float32x4, offsetof(WorldVertex, color));
         attribute(3, wgpu::VertexFormat::Float32x2, offsetof(WorldVertex, localPosition));
         attribute(4, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, anchor));
-        attribute(5, wgpu::VertexFormat::Float32x2, offsetof(WorldVertex, localOffset));
+        attribute(5, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, localOffset));
         attribute(6, wgpu::VertexFormat::Float32, offsetof(WorldVertex, policy));
     } else {
         attribute(0, wgpu::VertexFormat::Float32x2, offsetof(GPUVertex, position));
@@ -808,9 +809,11 @@ void WebScreenUIRenderer::EndWorldElement()
     if (!m_worldElementOpen || !m_world)
         throw std::logic_error("World UI element end has no matching begin");
     m_pendingWorldElement.vertexEnd = m_world->VtxBuffer.Size;
+    m_pendingWorldElement.vertexDepths.resize(m_pendingWorldElement.vertexEnd - m_pendingWorldElement.vertexStart,
+                                              0.0f);
     m_pendingWorldElement.commandEnd = m_world->CmdBuffer.Size;
     if (m_pendingWorldElement.vertexEnd > m_pendingWorldElement.vertexStart)
-        m_worldElements.push_back(m_pendingWorldElement);
+        m_worldElements.push_back(std::move(m_pendingWorldElement));
     m_world->AddCallback(CommandBoundary, nullptr);
     m_pendingWorldElement = {};
     m_worldElementOpen = false;
@@ -883,12 +886,15 @@ void WebScreenUIRenderer::AddText(int list, float minX, float minY, float maxX, 
 void WebScreenUIRenderer::AddTextGeometry(int list, float minX, float minY, float maxX, float maxY,
                                           textlayout::TextGeometry &geometry, float r, float g, float b, float a,
                                           float alignX, float alignY, float scale, float rotation, bool mirrorH,
-                                          bool mirrorV, bool clip)
+                                          bool mirrorV, bool clip, float opacity)
 {
     ImDrawList *draw = DrawList(list);
     if (!draw)
         return;
     ImGui::SetCurrentContext(m_context);
+    const bool world = list == 2;
+    if (world && !m_worldElementOpen)
+        throw std::logic_error("World text requires an active world element");
     geometry.Prepare(scale);
     if (!ImGui::GetIO().Fonts->IsBuilt()) {
         m_fontAtlasDirty = true;
@@ -897,7 +903,8 @@ void WebScreenUIRenderer::AddTextGeometry(int list, float minX, float minY, floa
     }
     draw->PushTextureID(ImGui::GetIO().Fonts->TexRef);
     geometry.Render(*draw, minX, minY, maxX, maxY, {r, g, b, a}, alignX, alignY, scale, rotation, mirrorH, mirrorV,
-                    false, clip);
+                    false, clip, world ? &m_pendingWorldElement.vertexDepths : nullptr,
+                    world ? m_pendingWorldElement.vertexStart : 0, opacity);
     draw->PopTextureID();
 }
 
@@ -1177,7 +1184,8 @@ bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, const glm::m
             WorldVertex &target = vertices[static_cast<size_t>(index)];
             const float localX = (source.pos.x - span.pivotX) * 0.01f;
             const float localY = (span.pivotY - source.pos.y) * 0.01f;
-            const glm::vec3 position = glm::vec3(span.localToWorld * glm::vec4(localX, localY, 0.0f, 1.0f));
+            const float localZ = span.vertexDepths[static_cast<size_t>(index - span.vertexStart)] * 0.01f;
+            const glm::vec3 position = glm::vec3(span.localToWorld * glm::vec4(localX, localY, localZ, 1.0f));
             const ImVec4 color = ImGui::ColorConvertU32ToFloat4(source.col);
             target.position[0] = position.x;
             target.position[1] = position.y;
@@ -1195,6 +1203,7 @@ bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, const glm::m
             target.anchor[2] = anchor.z;
             target.localOffset[0] = localX;
             target.localOffset[1] = localY;
+            target.localOffset[2] = localZ;
             target.policy = static_cast<float>((span.billboard ? 1 : 0) | (span.constantScreenSize ? 2 : 0));
         }
         const glm::vec4 viewAnchor = view * glm::vec4(anchor, 1.0f);

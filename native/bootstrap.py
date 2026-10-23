@@ -1410,10 +1410,10 @@ class _WebScreenUIRenderer:
 
     def add_text_geometry(self, ui_list, min_x, min_y, max_x, max_y, geometry,
                           r=1.0, g=1.0, b=1.0, a=1.0, align_x=0.0, align_y=0.0,
-                          scale=1.0, rotation=0.0, mirror_h=False, mirror_v=False, clip=False):
+                          scale=1.0, rotation=0.0, mirror_h=False, mirror_v=False, clip=False, opacity=1.0):
         self._host.screen_ui_add_text_geometry(
             ui_list, min_x, min_y, max_x, max_y, geometry, r, g, b, a,
-            align_x, align_y, scale, rotation, mirror_h, mirror_v, clip,
+            align_x, align_y, scale, rotation, mirror_h, mirror_v, clip, opacity,
         )
 
     def measure_text(self, *arguments: Any) -> tuple[float, float]:

@@ -648,10 +648,11 @@ PyObject *ScreenUIAddText(PyObject *, PyObject *arguments)
 PyObject *ScreenUIAddTextGeometry(PyObject *, PyObject *arguments)
 {
     int list, mirrorH, mirrorV, clip;
-    double minX, minY, maxX, maxY, r, g, b, a, alignX, alignY, scale, rotation;
+    double minX, minY, maxX, maxY, r, g, b, a, alignX, alignY, scale, rotation, opacity;
     PyObject *object = nullptr;
-    if (!PyArg_ParseTuple(arguments, "iddddOddddddddppp:screen_ui_add_text_geometry", &list, &minX, &minY, &maxX, &maxY,
-                          &object, &r, &g, &b, &a, &alignX, &alignY, &scale, &rotation, &mirrorH, &mirrorV, &clip))
+    if (!PyArg_ParseTuple(arguments, "iddddOddddddddpppd:screen_ui_add_text_geometry", &list, &minX, &minY, &maxX,
+                          &maxY, &object, &r, &g, &b, &a, &alignX, &alignY, &scale, &rotation, &mirrorH, &mirrorV,
+                          &clip, &opacity))
         return nullptr;
     if (!g_screenUIRenderer) {
         PyErr_SetString(PyExc_RuntimeError, "Web UI renderer is not initialized");
@@ -663,7 +664,7 @@ PyObject *ScreenUIAddTextGeometry(PyObject *, PyObject *arguments)
             list, static_cast<float>(minX), static_cast<float>(minY), static_cast<float>(maxX),
             static_cast<float>(maxY), geometry, static_cast<float>(r), static_cast<float>(g), static_cast<float>(b),
             static_cast<float>(a), static_cast<float>(alignX), static_cast<float>(alignY), static_cast<float>(scale),
-            static_cast<float>(rotation), mirrorH != 0, mirrorV != 0, clip != 0);
+            static_cast<float>(rotation), mirrorH != 0, mirrorV != 0, clip != 0, static_cast<float>(opacity));
         Py_RETURN_NONE;
     } catch (const pybind11::cast_error &error) {
         PyErr_SetString(PyExc_TypeError, error.what());

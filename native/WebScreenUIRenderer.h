@@ -60,7 +60,7 @@ class WebScreenUIRenderer final
                  bool clip, const std::vector<std::string> &fallbackFontPaths = {});
     void AddTextGeometry(int list, float minX, float minY, float maxX, float maxY, textlayout::TextGeometry &geometry,
                          float r, float g, float b, float a, float alignX, float alignY, float scale, float rotation,
-                         bool mirrorH, bool mirrorV, bool clip);
+                         bool mirrorH, bool mirrorV, bool clip, float opacity = 1.0f);
     [[nodiscard]] std::pair<float, float> MeasureText(const std::string &text, float fontSize, float wrapWidth,
                                                       const std::string &fontPath, float lineHeight,
                                                       float letterSpacing,
@@ -98,6 +98,7 @@ class WebScreenUIRenderer final
         int commandStart = 0;
         int commandEnd = 0;
         glm::mat4 localToWorld{1.0f};
+        std::vector<float> vertexDepths;
         float pivotX = 0.0f;
         float pivotY = 0.0f;
         uint32_t layer = 0;
@@ -121,7 +122,7 @@ class WebScreenUIRenderer final
         float color[4];
         float localPosition[2];
         float anchor[3];
-        float localOffset[2];
+        float localOffset[3];
         float policy;
     };
 
