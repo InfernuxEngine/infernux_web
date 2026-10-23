@@ -189,6 +189,7 @@ class WebPlatformExporter(PlatformExporter):
                 "display_mode": str(build_settings["display_mode"]),
                 "window_width": int(build_settings["window_width"]),
                 "window_height": int(build_settings["window_height"]),
+                "render_output": build_settings["render_output"],
             }
             default_shell = (
                 Path(__file__).resolve().parent / "templates" / "host" / "shell.html"
@@ -1492,6 +1493,7 @@ def _assemble_web_host(
         "@INFERNUX_WEB_DISPLAY_MODE@": str(presentation["display_mode"]),
         "@INFERNUX_WEB_CANVAS_WIDTH@": str(presentation["window_width"]),
         "@INFERNUX_WEB_CANVAS_HEIGHT@": str(presentation["window_height"]),
+        "@INFERNUX_WEB_RENDER_OUTPUT@": json.dumps(presentation["render_output"]),
     }
     for marker, value in replacements.items():
         document = document.replace(marker, value)
@@ -1505,6 +1507,7 @@ def _assemble_web_host(
         "mode": presentation["display_mode"],
         "width": presentation["window_width"],
         "height": presentation["window_height"],
+        "render_output": presentation["render_output"],
     }))
     script = (f"<script>{loader}</script>\n"
               f'<script src="infernux-player.{revision}.js"></script>')

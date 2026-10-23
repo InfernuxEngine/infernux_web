@@ -59,10 +59,14 @@ EM_JS(int, InfernuxWebForceFallbackAdapter, (), {
 
 EM_JS(int, InfernuxWebFixedCanvasWidth, (), {
     const presentation = Module.infernuxPresentation;
+    if (presentation.render_output.width > 0) return presentation.render_output.width;
     return presentation.mode === "windowed" ? presentation.width : 0;
 });
 
-EM_JS(int, InfernuxWebFixedCanvasHeight, (), { return Module.infernuxPresentation.height; });
+EM_JS(int, InfernuxWebFixedCanvasHeight, (), {
+    const presentation = Module.infernuxPresentation;
+    return presentation.render_output.height || presentation.height;
+});
 
 // Use the Emscripten terminal error path so the host's onAbort handler ends
 // loading, and startup cannot continue after a failed runtime contract.
@@ -178,9 +182,10 @@ class WebFullscreenRendererHost final : public infernux::FullscreenRendererHost
         return 0;
     }
 
-    [[nodiscard]] infernux::rhi::ShaderModuleHandle AcquireShaderModule(
-        const std::string &name, infernux::rhi::ShaderStage stage,
-        uint32_t inputCount, uint32_t inputBufferMask) override
+    [[nodiscard]] infernux::rhi::ShaderModuleHandle AcquireShaderModule(const std::string &name,
+                                                                        infernux::rhi::ShaderStage stage,
+                                                                        uint32_t inputCount,
+                                                                        uint32_t inputBufferMask) override
     {
         const char *stageName = nullptr;
         if (stage == infernux::rhi::ShaderStage::Vertex)
@@ -398,15 +403,12 @@ bool SynchronizeRenderSettings()
     Py_DECREF(settings);
     if (!decoded)
         return false;
-    const auto particleSamples =
-        sampleCount == 4 ? infernux::rhi::SampleCount::Four : infernux::rhi::SampleCount::One;
+    const auto particleSamples = sampleCount == 4 ? infernux::rhi::SampleCount::Four : infernux::rhi::SampleCount::One;
     // Reconfigure only sample-dependent attachments/pipelines. Reinitializing
     // the renderers would discard particle simulation and persistent UI state.
-    return g_sceneRenderer.ConfigureSampleCount(sampleCount) &&
-           g_screenUIRenderer.ConfigureSampleCount(sampleCount) &&
+    return g_sceneRenderer.ConfigureSampleCount(sampleCount) && g_screenUIRenderer.ConfigureSampleCount(sampleCount) &&
            g_particleRuntime.ConfigureSampleCount(particleSamples) &&
-           g_postProcessRenderer.ConfigureSampleCount(sampleCount) &&
-           g_postProcessRenderer.Configure(values);
+           g_postProcessRenderer.ConfigureSampleCount(sampleCount) && g_postProcessRenderer.Configure(values);
 }
 
 void DispatchInput(const char *kind, PyObject *payload)
@@ -1106,8 +1108,7 @@ void Frame()
         // presented.  Rendering the Hub UI over the clear target during that
         // handoff made the Web Player start with a solid green background
         // before the first sky frame was ready.
-        const bool renderScreenUi =
-            !g_webGpuValidationFailed && (g_splashActive || (scenePrepared && renderedScene));
+        const bool renderScreenUi = !g_webGpuValidationFailed && (g_splashActive || (scenePrepared && renderedScene));
         if (renderScreenUi) {
             try {
                 (void)g_screenUIRenderer.Render(presentPass, 0, g_width, g_height);
@@ -1194,8 +1195,7 @@ void StartSurface()
         InfernuxWebAbortStartup("Scene rendering initialization failed");
         return;
     }
-    if (!g_screenUIRenderer.Initialize(g_device, g_queue, g_surfaceFormat, sceneColorFormat,
-                                       sceneSampleCount)) {
+    if (!g_screenUIRenderer.Initialize(g_device, g_queue, g_surfaceFormat, sceneColorFormat, sceneSampleCount)) {
         std::fprintf(stderr, "INFERNUX_WEB_SCREEN_UI_INITIALIZATION_FAILED\n");
         InfernuxWebAbortStartup("Screen UI initialization failed");
         return;
@@ -1203,7 +1203,8 @@ void StartSurface()
     InfernuxWebSetScreenUIRenderer(&g_screenUIRenderer);
     const auto particleSampleCount =
         sceneSampleCount == 4 ? infernux::rhi::SampleCount::Four : infernux::rhi::SampleCount::One;
-    if (!g_particleRuntime.Initialize(*g_rhi, g_sceneRenderer, infernux::rhi::PixelFormat::RGBA16SFloat, particleSampleCount)) {
+    if (!g_particleRuntime.Initialize(*g_rhi, g_sceneRenderer, infernux::rhi::PixelFormat::RGBA16SFloat,
+                                      particleSampleCount)) {
         std::fprintf(stderr, "INFERNUX_WEBGPU_PARTICLE_RUNTIME_FAILED %s\n", g_particleRuntime.LastError().c_str());
         InfernuxWebAbortStartup("Particle runtime initialization failed");
         return;

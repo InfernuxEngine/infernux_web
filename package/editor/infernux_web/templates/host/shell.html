@@ -106,7 +106,8 @@
     const playerPresentation = Object.freeze({
       mode: '@INFERNUX_WEB_DISPLAY_MODE@',
       width: Number('@INFERNUX_WEB_CANVAS_WIDTH@'),
-      height: Number('@INFERNUX_WEB_CANVAS_HEIGHT@')
+      height: Number('@INFERNUX_WEB_CANVAS_HEIGHT@'),
+      render_output: @INFERNUX_WEB_RENDER_OUTPUT@
     });
     const diagnosticsInTitle = new URLSearchParams(window.location.search).has('diagnostics');
     const versionedAssets = Object.freeze({
@@ -231,6 +232,9 @@
         forward(event);
         event.preventDefault();
       });
+      canvasNode.addEventListener('pointerleave', (event) => {
+        if (!activePointers.has(event.pointerId)) forward(event, 1);
+      });
       for (const terminal of ['pointerup', 'pointercancel']) {
         canvasNode.addEventListener(terminal, (event) => {
           activePointers.delete(event.pointerId);
@@ -276,6 +280,20 @@
       }
       canvasNode.style.width = '100%';
       canvasNode.style.height = '100%';
+      const output = playerPresentation.render_output;
+      canvasNode.style.imageRendering = output.filter === 'nearest' ? 'pixelated' : 'auto';
+      if (output.width > 0) {
+        const bounds = shell.getBoundingClientRect();
+        let scale = Math.min(bounds.width / output.width, bounds.height / output.height);
+        if (output.filter === 'nearest' && scale >= 1) scale = Math.floor(scale);
+        const width = output.width * scale;
+        const height = output.height * scale;
+        canvasNode.style.position = 'absolute';
+        canvasNode.style.left = `${Math.floor((bounds.width - width) * 0.5)}px`;
+        canvasNode.style.top = `${Math.floor((bounds.height - height) * 0.5)}px`;
+        canvasNode.style.width = `${width}px`;
+        canvasNode.style.height = `${height}px`;
+      }
     }
     function installViewportBridge() {
       const safeAreaProbe = document.getElementById('infernux-safe-area-probe');

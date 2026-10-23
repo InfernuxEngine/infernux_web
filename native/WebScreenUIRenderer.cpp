@@ -1034,6 +1034,9 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
         return false;
     if (!RefreshFontAtlas())
         return false;
+    // Queue uploads require four-byte alignment even for 16-bit triangle indices.
+    if ((draw->IdxBuffer.Size * sizeof(ImDrawIdx)) % 4 != 0)
+        draw->IdxBuffer.push_back(0);
     std::vector<GPUVertex> vertices(static_cast<size_t>(draw->VtxBuffer.Size));
     for (int index = 0; index < draw->VtxBuffer.Size; ++index) {
         const ImDrawVert &source = draw->VtxBuffer[index];
@@ -1217,6 +1220,8 @@ bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, const glm::m
         return a.distance > b.distance;
     });
     const uint64_t vertexBytes = vertices.size() * sizeof(WorldVertex);
+    if ((m_world->IdxBuffer.Size * sizeof(ImDrawIdx)) % 4 != 0)
+        m_world->IdxBuffer.push_back(0);
     const uint64_t indexBytes = static_cast<uint64_t>(m_world->IdxBuffer.Size) * sizeof(ImDrawIdx);
     constexpr uint64_t constantStride = 256;
     static_assert(sizeof(WorldConstants) <= constantStride);

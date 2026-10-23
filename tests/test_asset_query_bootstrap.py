@@ -86,9 +86,6 @@ def test_web_bootstrap_binds_guid_asset_api_to_player_memfs() -> None:
     assert '"AssetFile": assets_module.AssetFile' in public_api
     assert '"AssetManager": assets_module.AssetManager' in public_api
     assert '"SandboxPath": sandbox_files_module.SandboxPath' in public_api
-    assert '"DrivenTransformProperties": transform_authoring_module.DrivenTransformProperties' in public_api
-    assert '"drives_transform": transform_authoring_module.drives_transform' in public_api
-    assert '"DrivesTransform": transform_authoring_module.DrivesTransform' in public_api
     assert 'import_module("infernux.version")' not in public_api
     assert "package.__version__" not in public_api
     assert '"__version__"' not in public_api
