@@ -50,7 +50,7 @@ class WebScreenUIRenderer final
     void EndWorldElement();
 
     void AddFilledRect(int list, float minX, float minY, float maxX, float maxY, float r, float g, float b, float a,
-                       float rounding);
+                       float rounding, float rotation, bool mirrorH, bool mirrorV);
     void AddImage(int list, uint64_t textureId, float minX, float minY, float maxX, float maxY, float uv0X, float uv0Y,
                   float uv1X, float uv1Y, float r, float g, float b, float a, float rotation, bool mirrorH,
                   bool mirrorV, float rounding);

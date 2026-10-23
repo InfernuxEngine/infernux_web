@@ -527,15 +527,18 @@ PyObject *ScreenUIPopClipRect(PyObject *, PyObject *arguments)
 PyObject *ScreenUIAddFilledRect(PyObject *, PyObject *arguments)
 {
     int list = 0;
-    double values[9]{};
-    if (!PyArg_ParseTuple(arguments, "iddddddddd:screen_ui_add_filled_rect", &list, &values[0], &values[1], &values[2],
-                          &values[3], &values[4], &values[5], &values[6], &values[7], &values[8]))
+    double values[10]{};
+    int mirrorH = 0, mirrorV = 0;
+    if (!PyArg_ParseTuple(arguments, "iddddddddddpp:screen_ui_add_filled_rect", &list, &values[0], &values[1],
+                          &values[2], &values[3], &values[4], &values[5], &values[6], &values[7], &values[8],
+                          &values[9], &mirrorH, &mirrorV))
         return nullptr;
     if (g_screenUIRenderer)
         g_screenUIRenderer->AddFilledRect(
             list, static_cast<float>(values[0]), static_cast<float>(values[1]), static_cast<float>(values[2]),
             static_cast<float>(values[3]), static_cast<float>(values[4]), static_cast<float>(values[5]),
-            static_cast<float>(values[6]), static_cast<float>(values[7]), static_cast<float>(values[8]));
+            static_cast<float>(values[6]), static_cast<float>(values[7]), static_cast<float>(values[8]),
+            static_cast<float>(values[9]), mirrorH != 0, mirrorV != 0);
     Py_RETURN_NONE;
 }
 

@@ -817,11 +817,14 @@ void WebScreenUIRenderer::EndWorldElement()
 }
 
 void WebScreenUIRenderer::AddFilledRect(int list, float minX, float minY, float maxX, float maxY, float r, float g,
-                                        float b, float a, float rounding)
+                                        float b, float a, float rounding, float rotation, bool mirrorH, bool mirrorV)
 {
     ImDrawList *draw = DrawList(list);
-    if (draw)
-        draw->AddRectFilled({minX, minY}, {maxX, maxY}, ImGui::ColorConvertFloat4ToU32({r, g, b, a}), rounding);
+    if (!draw)
+        return;
+    const int firstVertex = draw->VtxBuffer.Size;
+    draw->AddRectFilled({minX, minY}, {maxX, maxY}, ImGui::ColorConvertFloat4ToU32({r, g, b, a}), rounding);
+    TransformVertices(*draw, firstVertex, minX, minY, maxX, maxY, rotation, mirrorH, mirrorV);
 }
 
 void WebScreenUIRenderer::AddImage(int list, uint64_t textureId, float minX, float minY, float maxX, float maxY,

@@ -883,7 +883,7 @@ class _WebSplashPlayer:
         )
         self._host.screen_ui_begin_frame(view_width, view_height)
         self._host.screen_ui_add_filled_rect(
-            1, 0.0, 0.0, float(view_width), float(view_height), 0.0, 0.0, 0.0, 1.0, 0.0
+            1, 0.0, 0.0, float(view_width), float(view_height), 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, False, False
         )
         self._host.screen_ui_add_image(
             1,
@@ -1361,8 +1361,14 @@ class _WebScreenUIRenderer:
             )
         )
 
-    def add_filled_rect(self, *arguments: Any) -> None:
-        self._host.screen_ui_add_filled_rect(*arguments)
+    def add_filled_rect(
+        self, ui_list: int, min_x: float, min_y: float, max_x: float, max_y: float,
+        r: float = 1.0, g: float = 1.0, b: float = 1.0, a: float = 1.0, rounding: float = 0.0,
+        rotation: float = 0.0, mirror_h: bool = False, mirror_v: bool = False,
+    ) -> None:
+        self._host.screen_ui_add_filled_rect(
+            ui_list, min_x, min_y, max_x, max_y, r, g, b, a, rounding, rotation, mirror_h, mirror_v,
+        )
 
     def set_material_binding(
         self, ui_list: int, guid: str, generation: int, pipeline_key: str,

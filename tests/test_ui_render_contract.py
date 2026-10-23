@@ -20,6 +20,7 @@ def test_python_bridge_submits_guid_generation_and_world_transform(monkeypatch):
     host.screen_ui_set_material_binding = lambda *args: calls.append(("material", args))
     host.screen_ui_begin_world_element = lambda *args: calls.append(("world", args))
     host.screen_ui_end_world_element = lambda: calls.append(("end", ()))
+    host.screen_ui_add_filled_rect = lambda *args: calls.append(("rect", args))
     monkeypatch.setitem(__import__("sys").modules, "_InfernuxWebHost", host)
     namespace = {"Any": Any}
     exec(compile(ast.Module([cls], type_ignores=[]), "bootstrap.py", "exec"), namespace)
@@ -42,6 +43,8 @@ def test_python_bridge_submits_guid_generation_and_world_transform(monkeypatch):
     assert matrix == pytest.approx((0.28, 0.96, 0, 0, -0.96, 0.28, 0, 0, 0, 0, 1, 0, 1, 2, 3, 1))
     assert calls[1][1][1:] == (50.0, 25.0, 6, True, False, True, 9)
     assert calls[2] == ("end", ())
+    renderer.add_filled_rect(1, 10, 20, 70, 40, rotation=45, mirror_h=True)
+    assert calls[3] == ("rect", (1, 10, 20, 70, 40, 1, 1, 1, 1, 0, 45, True, False))
 
 
 def test_native_world_draw_is_depth_aware_and_material_shader_is_consumed():
