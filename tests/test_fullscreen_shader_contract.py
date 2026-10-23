@@ -39,7 +39,7 @@ def test_fullscreen_shader_contract_compiles_and_rejects_mismatched_bindings(tmp
 
 
 def test_web_fullscreen_host_uses_the_four_argument_contract():
-    source = (ROOT / "native" / "main.cpp").read_text(encoding="utf-8")
+    source = " ".join((ROOT / "native" / "main.cpp").read_text(encoding="utf-8").split())
     assert "uint32_t inputCount, uint32_t inputBufferMask) override" in source
     assert "ValidateFullscreenShaderInputs(source, inputCount, inputBufferMask, contractError)" in source
 

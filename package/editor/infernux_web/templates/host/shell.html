@@ -233,7 +233,7 @@
         event.preventDefault();
       });
       canvasNode.addEventListener('pointerleave', (event) => {
-        if (!activePointers.has(event.pointerId)) forward(event, 1);
+        if (event.pointerType === 'mouse' && !activePointers.has(event.pointerId)) forward(event, 1);
       });
       for (const terminal of ['pointerup', 'pointercancel']) {
         canvasNode.addEventListener(terminal, (event) => {
