@@ -1,3 +1,9 @@
+# 0.2.23 — Infernux 0.4.3-v5 Player shutdown fix
+
+- Rebuild the Web Player and both host shader-tool payloads from frozen engine commit `de7cc8c8b0ecbfbb7afd8553f256a1fa236f0aaa`.
+- Unload native scenes before releasing asset catalogs so component shutdown retains font and other asset references.
+- Keep the package engine requirement `>=0.4.3` and exact matching precompiled Player release.
+
 # 0.2.22 — Infernux 0.4.3-v5
 
 - Rebuild the Web Player and both Windows/Linux shader-tool payloads against Infernux 0.4.3-v5.
