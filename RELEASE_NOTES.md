@@ -1,3 +1,9 @@
+# 0.2.22 — Infernux 0.4.3-v5
+
+- Rebuild the Web Player and both Windows/Linux shader-tool payloads against Infernux 0.4.3-v5.
+- Build from frozen engine commit `f683bfa678eb680748c20be91badb9fe668ec553`.
+- Keep the package engine requirement `>=0.4.3`; precompiled Players require the exact matching engine release.
+
 # 0.2.18 — Infernux 0.4.3
 
 - Rebuild the complete Player payload against the final 0.4.3 engine source, including asset import-failure publication.
