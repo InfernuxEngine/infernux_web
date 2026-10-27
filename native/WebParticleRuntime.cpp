@@ -703,9 +703,9 @@ bool WebParticleRuntime::ConfigureSampleCount(rhi::SampleCount sceneSampleCount)
     fragment.targetCount = 1;
     fragment.targets = &colorTarget;
     wgpu::DepthStencilState depth;
-    depth.format = wgpu::TextureFormat::Depth24Plus;
+    depth.format = wgpu::TextureFormat::Depth32Float;
     depth.depthWriteEnabled = wgpu::OptionalBool::False;
-    depth.depthCompare = wgpu::CompareFunction::LessEqual;
+    depth.depthCompare = wgpu::CompareFunction::GreaterEqual;
     wgpu::RenderPipelineDescriptor pipelineDesc;
     pipelineDesc.layout = m_state->device.CreatePipelineLayout(&pipelineLayoutDesc);
     pipelineDesc.vertex.module = shader;
@@ -1244,8 +1244,7 @@ bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, Camera &camera, ui
     pass.SetBindGroup(2, m_state->depthGroup);
     bool drew = false;
     for (const auto &[_, emitter] : m_state->emitters) {
-        if (!emitter->drawReady || !emitter->playing ||
-            (emitter->ownerLayerMask & camera.GetCullingMask()) == 0)
+        if (!emitter->drawReady || !emitter->playing || (emitter->ownerLayerMask & camera.GetCullingMask()) == 0)
             continue;
         if (!m_state->PrepareRenderGroup(*emitter))
             continue;

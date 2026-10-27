@@ -108,7 +108,7 @@ struct Parameters {
     encode_srgb: f32,
     tonemapping_mode: f32,
     bloom_tint: vec3<f32>,
-    padding: f32,
+    dithering: f32,
 };
 @group(0) @binding(0) var source_sampler: sampler;
 @group(0) @binding(1) var scene_color: texture_2d<f32>;
@@ -141,6 +141,15 @@ fn linear_to_srgb_channel(value: f32) -> f32 {
 fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(linear_to_srgb_channel(color.r), linear_to_srgb_channel(color.g), linear_to_srgb_channel(color.b));
 }
+fn srgb_to_linear_channel(value: f32) -> f32 {
+    return select(pow((value + 0.055) / 1.055, 2.4), value / 12.92, value <= 0.04045);
+}
+fn gradient_noise(pixel: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
+}
+fn triangular_dither(pixel: vec2<f32>, offset: vec2<f32>) -> f32 {
+    return gradient_noise(pixel + offset) - gradient_noise(pixel.yx + offset.yx + vec2<f32>(37.0, 17.0));
+}
 @fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let scene = textureSampleLevel(scene_color, source_sampler, input.uv, 0.0).rgb;
     let bloom = textureSampleLevel(bloom_color, source_sampler, input.uv, 0.0).rgb;
@@ -149,7 +158,17 @@ fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
     if (mode == 1u) { color = color / (color + vec3<f32>(1.0)); }
     if (mode == 2u) { color = aces_film(color); }
     if (mode == 0u) { color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)); }
-    if (parameters.encode_srgb > 0.5) { color = linear_to_srgb(color); }
+    if (parameters.dithering > 0.5) {
+        // Quantize in display space, including when the surface encodes sRGB in hardware.
+        let pixel = floor(input.position.xy);
+        let noise = vec3<f32>(triangular_dither(pixel, vec2<f32>(0.0, 0.0)),
+                              triangular_dither(pixel, vec2<f32>(19.0, 47.0)),
+                              triangular_dither(pixel, vec2<f32>(73.0, 11.0)));
+        let encoded = clamp(linear_to_srgb(color) + noise / 255.0, vec3<f32>(0.0), vec3<f32>(1.0));
+        if (parameters.encode_srgb > 0.5) { color = encoded; }
+        else { color = vec3<f32>(srgb_to_linear_channel(encoded.r), srgb_to_linear_channel(encoded.g),
+                                 srgb_to_linear_channel(encoded.b)); }
+    } else if (parameters.encode_srgb > 0.5) { color = linear_to_srgb(color); }
     return vec4<f32>(color, 1.0);
 }
 )wgsl";
@@ -539,10 +558,15 @@ bool WebPostProcessRenderer::PrepareBloom(wgpu::CommandEncoder encoder)
     return true;
 }
 
-bool WebPostProcessRenderer::Render(wgpu::RenderPassEncoder pass)
+bool WebPostProcessRenderer::Render(wgpu::RenderPassEncoder pass, bool dithering)
 {
     if (!pass || !m_resolvePipeline || !m_resolveGroup || !m_sceneColorView)
         return false;
+    const float dither = dithering ? 1.0f : 0.0f;
+    if (m_resolveValues.dithering != dither) {
+        m_resolveValues.dithering = dither;
+        m_device.GetQueue().WriteBuffer(m_resolveParameters, 0, &m_resolveValues, sizeof(m_resolveValues));
+    }
     pass.SetPipeline(m_resolvePipeline);
     pass.SetBindGroup(0, m_resolveGroup);
     pass.Draw(3, 1, 0, 0);

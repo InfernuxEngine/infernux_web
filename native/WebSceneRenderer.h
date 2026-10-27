@@ -42,7 +42,10 @@ class WebSceneRenderer final
     [[nodiscard]] wgpu::TextureView GetDepthView() const noexcept;
 
     /// Linear HDR clear color from the same camera used by Prepare().
-    [[nodiscard]] wgpu::Color GetClearColor() const noexcept { return m_clearColor; }
+    [[nodiscard]] wgpu::Color GetClearColor() const noexcept
+    {
+        return m_clearColor;
+    }
 
     struct SampledTexture
     {
@@ -164,12 +167,11 @@ class WebSceneRenderer final
     bool CreateShadowResources();
     bool CreateMaterialTextureResources();
     bool CreateCameraBindGroups();
-    [[nodiscard]] GPUTexture ResolveMaterialTexture(const std::string &guid,
-                                                     const MaterialTextureSampler &sampler,
-                                                     const GPUTexture &fallback);
-    [[nodiscard]] wgpu::BindGroup ResolveMaterialTextureSet(
-        const std::shared_ptr<InxMaterial> &material,
-        const std::shared_ptr<const RendererParameterBlock> &parameters);
+    [[nodiscard]] GPUTexture ResolveMaterialTexture(const std::string &guid, const MaterialTextureSampler &sampler,
+                                                    const GPUTexture &fallback);
+    [[nodiscard]] wgpu::BindGroup
+    ResolveMaterialTextureSet(const std::shared_ptr<InxMaterial> &material,
+                              const std::shared_ptr<const RendererParameterBlock> &parameters);
     [[nodiscard]] wgpu::BindGroup CreateMaterialTextureGroup(const std::array<GPUTexture, 6> &textures);
     [[nodiscard]] GPUTexture UploadMaterialTexture(const TextureCpuData &texture, const std::string &filterMode,
                                                    const std::string &wrapMode, int anisoLevel,
@@ -198,6 +200,7 @@ class WebSceneRenderer final
     GPUTexture m_blackTexture;
     GPUTexture m_normalTexture;
     wgpu::BindGroup m_defaultMaterialTextureGroup;
+    wgpu::BindGroup m_skyTextureGroup;
     std::unordered_map<std::string, MaterialTextureState> m_materialTextures;
     std::unordered_map<std::string, MaterialTextureSetState> m_materialTextureSets;
     uint64_t m_materialTextureGeneration = 1;

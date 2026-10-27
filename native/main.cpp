@@ -219,11 +219,6 @@ class WebFullscreenRendererHost final : public infernux::FullscreenRendererHost
         return {};
     }
 
-    [[nodiscard]] infernux::rhi::BindGroupHandle GetCurrentGlobalsGroup() override
-    {
-        return {};
-    }
-
     void ReportError(const std::string &message) override
     {
         std::fprintf(stderr, "INFERNUX_WEB_RENDER_ERROR %s\n", message.c_str());
@@ -1011,7 +1006,7 @@ void Frame()
             depthAttachment.view = g_sceneRenderer.GetDepthView();
             depthAttachment.depthLoadOp = wgpu::LoadOp::Clear;
             depthAttachment.depthStoreOp = wgpu::StoreOp::Store;
-            depthAttachment.depthClearValue = 1.0f;
+            depthAttachment.depthClearValue = 0.0f;
         }
         wgpu::CommandEncoder encoder = g_device.CreateCommandEncoder();
         if (!g_splashActive && g_particleRuntimeReady && !g_webGpuValidationFailed &&
@@ -1020,6 +1015,7 @@ void Frame()
             InfernuxWebAbortStartup("Particle GPU frame could not be recorded");
             return;
         }
+        bool dithering = false;
         bool scenePrepared = false;
         bool renderedScene = false;
         if (g_sceneRenderer.HasDepthTarget())
@@ -1032,6 +1028,7 @@ void Frame()
                       cameras.end());
         for (size_t index = 0; !g_splashActive && !g_webGpuValidationFailed && index < cameras.size(); ++index) {
             auto *camera = cameras[index];
+            dithering = camera->GetDithering();
             if (!g_sceneRenderer.Prepare(encoder, g_width, g_height, camera)) {
                 InfernuxWebAbortStartup("Camera frame could not be prepared");
                 return;
@@ -1055,7 +1052,7 @@ void Frame()
                 colorAttachment.loadOp = wgpu::LoadOp::Load;
                 particleDepth.view = depthAttachment.view;
                 particleDepth.depthReadOnly = true;
-                particleDepth.depthClearValue = 1.0f;
+                particleDepth.depthClearValue = 0.0f;
                 particlePass.colorAttachmentCount = 1;
                 particlePass.colorAttachments = &colorAttachment;
                 particlePass.depthStencilAttachment = &particleDepth;
@@ -1101,7 +1098,7 @@ void Frame()
         presentDescriptor.colorAttachments = &presentAttachment;
         wgpu::RenderPassEncoder presentPass = encoder.BeginRenderPass(&presentDescriptor);
         if (!g_splashActive && !g_webGpuValidationFailed)
-            (void)g_postProcessRenderer.Render(presentPass);
+            (void)g_postProcessRenderer.Render(presentPass, dithering);
         // Keep the authored splash visible while it is active.  Once the
         // splash has handed off to gameplay, do not expose the persistent
         // screen UI until a complete scene frame has been prepared and

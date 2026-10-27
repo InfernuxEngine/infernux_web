@@ -42,7 +42,7 @@ class WebPostProcessRenderer final
     [[nodiscard]] wgpu::TextureView SceneColorAttachmentView() const noexcept;
     [[nodiscard]] wgpu::TextureView SceneColorView() const noexcept;
     [[nodiscard]] bool PrepareBloom(wgpu::CommandEncoder encoder);
-    [[nodiscard]] bool Render(wgpu::RenderPassEncoder pass);
+    [[nodiscard]] bool Render(wgpu::RenderPassEncoder pass, bool dithering = false);
 
   private:
     struct DownsampleParameters
@@ -70,7 +70,7 @@ class WebPostProcessRenderer final
         float encodeSrgb = 1.0f;
         float toneMappingMode = 0.0f;
         std::array<float, 3> bloomTint = {1.0f, 1.0f, 1.0f};
-        float padding = 0.0f;
+        float dithering = 0.0f;
     };
     struct BloomLevel
     {
