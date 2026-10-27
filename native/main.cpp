@@ -219,11 +219,6 @@ class WebFullscreenRendererHost final : public infernux::FullscreenRendererHost
         return {};
     }
 
-    [[nodiscard]] infernux::rhi::BindGroupHandle GetCurrentGlobalsGroup() override
-    {
-        return {};
-    }
-
     void ReportError(const std::string &message) override
     {
         std::fprintf(stderr, "INFERNUX_WEB_RENDER_ERROR %s\n", message.c_str());
