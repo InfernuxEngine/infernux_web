@@ -323,7 +323,7 @@ fn sample_shadow(position: vec4<f32>, normal: vec3<f32>) -> f32 {
         for (var x = -1; x <= 1; x = x + 1) {
             visibility += textureSampleCompareLevel(shadow_map, shadow_sampler,
                                                      uv + vec2<f32>(f32(x), f32(y)) * texel,
-                                                     ndc.z - 0.0008 - normal_bias);
+                                                     ndc.z + 0.0008 + normal_bias);
         }
     }
     let filtered = visibility / 9.0;
@@ -529,6 +529,8 @@ struct CameraData {
     ambient: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> camera: CameraData;
+@group(1) @binding(0) var sky_sampler: sampler;
+@group(1) @binding(1) var sky_texture: texture_2d<f32>;
 
 struct SkyOutput {
     @builtin(position) position: vec4<f32>,
@@ -540,15 +542,22 @@ fn vertex_main(@builtin(vertex_index) index: u32) -> SkyOutput {
     let positions = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
     var output: SkyOutput;
-    output.position = vec4<f32>(positions[index], 1.0, 1.0);
+    output.position = vec4<f32>(positions[index], 0.0, 1.0);
     output.clip_position = positions[index];
     return output;
 }
 
 @fragment
 fn fragment_main(input: SkyOutput) -> @location(0) vec4<f32> {
-    let far_world = camera.inverse_view_projection * vec4<f32>(input.clip_position, 1.0, 1.0);
+    let far_world = camera.inverse_view_projection * vec4<f32>(input.clip_position, 0.0, 1.0);
     let direction = normalize(far_world.xyz / far_world.w - camera.camera_position.xyz);
+    if (camera.sky_horizon.w > 0.5) {
+        let uv = vec2<f32>(fract(atan2(direction.z, direction.x) / 6.28318530718 + 0.5
+                                 + camera.sky_ground.w / 360.0),
+                           acos(clamp(direction.y, -1.0, 1.0)) / 3.14159265359);
+        let color = textureSampleLevel(sky_texture, sky_sampler, uv, 0.0).rgb;
+        return vec4<f32>(color * camera.sky_top_exposure.rgb * camera.sky_top_exposure.w, 1.0);
+    }
     let y = direction.y;
     let base = mix(camera.sky_ground.rgb, camera.sky_top_exposure.rgb,
                    smoothstep(-0.10, 0.45, y));
@@ -594,10 +603,9 @@ fn vertex_main(@location(0) position: vec3<f32>,
 }
 )wgsl";
 
-const MaterialProperty *ResolvedMaterialProperty(
-    const std::shared_ptr<InxMaterial> &material,
-    const std::shared_ptr<const RendererParameterBlock> &parameters,
-    const char *name)
+const MaterialProperty *ResolvedMaterialProperty(const std::shared_ptr<InxMaterial> &material,
+                                                 const std::shared_ptr<const RendererParameterBlock> &parameters,
+                                                 const char *name)
 {
     if (parameters) {
         const auto found = parameters->properties.find(name);
@@ -625,8 +633,7 @@ glm::vec4 MaterialColor(const std::shared_ptr<InxMaterial> &material,
 }
 
 float MaterialFloat(const std::shared_ptr<InxMaterial> &material,
-                    const std::shared_ptr<const RendererParameterBlock> &parameters,
-                    const char *name, float fallback)
+                    const std::shared_ptr<const RendererParameterBlock> &parameters, const char *name, float fallback)
 {
     const MaterialProperty *property = ResolvedMaterialProperty(material, parameters, name);
     if (!property || property->type != MaterialPropertyType::Float)
@@ -637,8 +644,8 @@ float MaterialFloat(const std::shared_ptr<InxMaterial> &material,
 }
 
 glm::vec4 MaterialVector(const std::shared_ptr<InxMaterial> &material,
-                         const std::shared_ptr<const RendererParameterBlock> &parameters,
-                         const char *name, const glm::vec4 &fallback)
+                         const std::shared_ptr<const RendererParameterBlock> &parameters, const char *name,
+                         const glm::vec4 &fallback)
 {
     const MaterialProperty *property = ResolvedMaterialProperty(material, parameters, name);
     if (!property)
@@ -673,9 +680,8 @@ MaterialTextureBinding MaterialTexture(const std::shared_ptr<InxMaterial> &mater
     return {fallback, {}};
 }
 
-std::array<MaterialTextureBinding, 6> MaterialTextures(
-    const std::shared_ptr<InxMaterial> &material,
-    const std::shared_ptr<const RendererParameterBlock> &parameters)
+std::array<MaterialTextureBinding, 6> MaterialTextures(const std::shared_ptr<InxMaterial> &material,
+                                                       const std::shared_ptr<const RendererParameterBlock> &parameters)
 {
     constexpr std::array<const char *, 5> baseNames = {"baseColorTexture", "albedoMap", "albedoTexture", "mainTexture",
                                                        "texSampler"};
@@ -693,8 +699,7 @@ std::array<MaterialTextureBinding, 6> MaterialTextures(
 }
 
 int MaterialInt(const std::shared_ptr<InxMaterial> &material,
-                const std::shared_ptr<const RendererParameterBlock> &parameters,
-                const char *name, int fallback)
+                const std::shared_ptr<const RendererParameterBlock> &parameters, const char *name, int fallback)
 {
     const MaterialProperty *property = ResolvedMaterialProperty(material, parameters, name);
     if (!property || property->type != MaterialPropertyType::Int)
@@ -898,7 +903,7 @@ bool WebSceneRenderer::CreateShadowResources()
     samplerDescriptor.addressModeV = wgpu::AddressMode::ClampToEdge;
     samplerDescriptor.minFilter = wgpu::FilterMode::Linear;
     samplerDescriptor.magFilter = wgpu::FilterMode::Linear;
-    samplerDescriptor.compare = wgpu::CompareFunction::LessEqual;
+    samplerDescriptor.compare = wgpu::CompareFunction::GreaterEqual;
     m_shadowSampler = m_device.CreateSampler(&samplerDescriptor);
     return m_shadowView && m_shadowSampler;
 }
@@ -936,8 +941,8 @@ bool WebSceneRenderer::CreateMaterialTextureResources()
     m_whiteTexture = createSolid({255, 255, 255, 255}, true);
     m_blackTexture = createSolid({0, 0, 0, 255}, true);
     m_normalTexture = createSolid({128, 128, 255, 255}, false);
-    const std::array<GPUTexture, 6> defaults = {m_whiteTexture, m_whiteTexture, m_whiteTexture, m_whiteTexture,
-                                                m_normalTexture, m_whiteTexture};
+    const std::array<GPUTexture, 6> defaults = {m_whiteTexture, m_whiteTexture,  m_whiteTexture,
+                                                m_whiteTexture, m_normalTexture, m_whiteTexture};
     m_defaultMaterialTextureGroup = CreateMaterialTextureGroup(defaults);
     return m_whiteTexture.view && m_blackTexture.view && m_normalTexture.view && m_defaultMaterialTextureGroup;
 }
@@ -1004,10 +1009,14 @@ WebSceneRenderer::GPUTexture WebSceneRenderer::UploadMaterialTexture(const Textu
                                                                  : wgpu::AddressMode::Repeat;
     const auto address = [addressMode](MaterialSamplerAddress value) {
         switch (value) {
-        case MaterialSamplerAddress::Repeat: return wgpu::AddressMode::Repeat;
-        case MaterialSamplerAddress::Clamp: return wgpu::AddressMode::ClampToEdge;
-        case MaterialSamplerAddress::Mirror: return wgpu::AddressMode::MirrorRepeat;
-        case MaterialSamplerAddress::Inherit: return addressMode;
+        case MaterialSamplerAddress::Repeat:
+            return wgpu::AddressMode::Repeat;
+        case MaterialSamplerAddress::Clamp:
+            return wgpu::AddressMode::ClampToEdge;
+        case MaterialSamplerAddress::Mirror:
+            return wgpu::AddressMode::MirrorRepeat;
+        case MaterialSamplerAddress::Inherit:
+            return addressMode;
         }
         return addressMode;
     };
@@ -1017,9 +1026,12 @@ WebSceneRenderer::GPUTexture WebSceneRenderer::UploadMaterialTexture(const Textu
     const bool point = filterMode == "point";
     const auto filter = [point](MaterialSamplerFilter value) {
         switch (value) {
-        case MaterialSamplerFilter::Nearest: return wgpu::FilterMode::Nearest;
-        case MaterialSamplerFilter::Linear: return wgpu::FilterMode::Linear;
-        case MaterialSamplerFilter::Inherit: return point ? wgpu::FilterMode::Nearest : wgpu::FilterMode::Linear;
+        case MaterialSamplerFilter::Nearest:
+            return wgpu::FilterMode::Nearest;
+        case MaterialSamplerFilter::Linear:
+            return wgpu::FilterMode::Linear;
+        case MaterialSamplerFilter::Inherit:
+            return point ? wgpu::FilterMode::Nearest : wgpu::FilterMode::Linear;
         }
         return wgpu::FilterMode::Nearest;
     };
@@ -1029,8 +1041,12 @@ WebSceneRenderer::GPUTexture WebSceneRenderer::UploadMaterialTexture(const Textu
     samplerDescriptor.magFilter = filter(sampler.magFilter);
     const bool assetMipLinear = filterMode == "trilinear" || assetAnisotropy > 1u;
     switch (sampler.mipFilter) {
-    case MaterialSamplerFilter::Nearest: samplerDescriptor.mipmapFilter = wgpu::MipmapFilterMode::Nearest; break;
-    case MaterialSamplerFilter::Linear: samplerDescriptor.mipmapFilter = wgpu::MipmapFilterMode::Linear; break;
+    case MaterialSamplerFilter::Nearest:
+        samplerDescriptor.mipmapFilter = wgpu::MipmapFilterMode::Nearest;
+        break;
+    case MaterialSamplerFilter::Linear:
+        samplerDescriptor.mipmapFilter = wgpu::MipmapFilterMode::Linear;
+        break;
     case MaterialSamplerFilter::Inherit:
         samplerDescriptor.mipmapFilter =
             assetMipLinear ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
@@ -1117,9 +1133,9 @@ WebSceneRenderer::GPUTexture WebSceneRenderer::ResolveMaterialTexture(const std:
     return state.gpu;
 }
 
-wgpu::BindGroup WebSceneRenderer::ResolveMaterialTextureSet(
-    const std::shared_ptr<InxMaterial> &material,
-    const std::shared_ptr<const RendererParameterBlock> &parameters)
+wgpu::BindGroup
+WebSceneRenderer::ResolveMaterialTextureSet(const std::shared_ptr<InxMaterial> &material,
+                                            const std::shared_ptr<const RendererParameterBlock> &parameters)
 {
     const std::array<MaterialTextureBinding, 6> bindings = MaterialTextures(material, parameters);
     std::array<GPUTexture, 6> textures{};
@@ -1210,9 +1226,9 @@ bool WebSceneRenderer::CreatePipelines()
     fragment.targets = &colorTarget;
 
     wgpu::DepthStencilState depth;
-    depth.format = wgpu::TextureFormat::Depth24Plus;
+    depth.format = wgpu::TextureFormat::Depth32Float;
     depth.depthWriteEnabled = wgpu::OptionalBool::True;
-    depth.depthCompare = wgpu::CompareFunction::LessEqual;
+    depth.depthCompare = wgpu::CompareFunction::GreaterEqual;
 
     wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor;
     const std::array<wgpu::BindGroupLayout, 2> sceneLayouts = {m_cameraLayout, m_materialTextureLayout};
@@ -1235,8 +1251,7 @@ bool WebSceneRenderer::CreatePipelines()
     transparentBlend.alpha.srcFactor = wgpu::BlendFactor::One;
     transparentBlend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
     const std::array<wgpu::FrontFace, 2> frontFaces = {wgpu::FrontFace::CCW, wgpu::FrontFace::CW};
-    const std::array<wgpu::CullMode, 3> cullModes = {wgpu::CullMode::None, wgpu::CullMode::Front,
-                                                    wgpu::CullMode::Back};
+    const std::array<wgpu::CullMode, 3> cullModes = {wgpu::CullMode::None, wgpu::CullMode::Front, wgpu::CullMode::Back};
     for (size_t face = 0; face < frontFaces.size(); ++face) {
         for (size_t cull = 0; cull < cullModes.size(); ++cull) {
             const size_t pipelineIndex = face * cullModes.size() + cull;
@@ -1274,7 +1289,7 @@ bool WebSceneRenderer::CreatePipelines()
     skyPipelineDescriptor.primitive.cullMode = wgpu::CullMode::None;
     skyPipelineDescriptor.multisample.count = m_sceneSampleCount;
     wgpu::DepthStencilState skyDepth;
-    skyDepth.format = wgpu::TextureFormat::Depth24Plus;
+    skyDepth.format = wgpu::TextureFormat::Depth32Float;
     skyDepth.depthWriteEnabled = wgpu::OptionalBool::False;
     skyDepth.depthCompare = wgpu::CompareFunction::Always;
     skyPipelineDescriptor.depthStencil = &skyDepth;
@@ -1288,9 +1303,9 @@ bool WebSceneRenderer::CreatePipelines()
     wgpu::DepthStencilState shadowDepth;
     shadowDepth.format = wgpu::TextureFormat::Depth32Float;
     shadowDepth.depthWriteEnabled = wgpu::OptionalBool::True;
-    shadowDepth.depthCompare = wgpu::CompareFunction::LessEqual;
-    shadowDepth.depthBias = 2;
-    shadowDepth.depthBiasSlopeScale = 2.0f;
+    shadowDepth.depthCompare = wgpu::CompareFunction::GreaterEqual;
+    shadowDepth.depthBias = -2;
+    shadowDepth.depthBiasSlopeScale = -2.0f;
     wgpu::PipelineLayoutDescriptor shadowPipelineLayoutDescriptor;
     shadowPipelineLayoutDescriptor.bindGroupLayoutCount = 1;
     shadowPipelineLayoutDescriptor.bindGroupLayouts = &m_shadowCameraLayout;
@@ -1342,7 +1357,7 @@ void WebSceneRenderer::Resize(uint32_t width, uint32_t height)
     wgpu::TextureDescriptor descriptor;
     descriptor.dimension = wgpu::TextureDimension::e2D;
     descriptor.size = {width, height, 1};
-    descriptor.format = wgpu::TextureFormat::Depth24Plus;
+    descriptor.format = wgpu::TextureFormat::Depth32Float;
     descriptor.mipLevelCount = 1;
     descriptor.sampleCount = m_sceneSampleCount;
     descriptor.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
@@ -1439,11 +1454,38 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
     m_cameraData.viewProjection = ToWebClipSpace(frame->PrimaryView().viewProjection);
     m_cameraData.inverseViewProjection = glm::inverse(m_cameraData.viewProjection);
     m_cameraData.cameraPosition = glm::vec4(frame->PrimaryView().position, 1.0f);
-    m_cameraData.skyTopExposure =
-        glm::vec4(inx::color::SrgbToLinear(environment.skyTopColor), environment.skyExposure);
-    m_cameraData.skyHorizon = glm::vec4(inx::color::SrgbToLinear(environment.skyHorizonColor), 1.0f);
+    m_cameraData.skyTopExposure = glm::vec4(inx::color::SrgbToLinear(environment.skyTopColor), environment.skyExposure);
+    m_cameraData.skyHorizon = glm::vec4(inx::color::SrgbToLinear(environment.skyHorizonColor), 0.0f);
     m_cameraData.skyGround = glm::vec4(inx::color::SrgbToLinear(environment.skyGroundColor), 1.0f);
     m_drawSky = m_diagnosticSkyEnabled && camera->GetClearFlags() == CameraClearFlags::Skybox;
+    m_skyTextureGroup = m_defaultMaterialTextureGroup;
+    if (m_drawSky && !environment.skyboxMaterialGuid.empty()) {
+        const auto sky = scene->ResolveSkyboxMaterial();
+        if (!sky) {
+            ReportFrameIssue("missing-skybox-material");
+            return false;
+        }
+        const float exposure = MaterialFloat(sky, {}, "exposure", 1.0f);
+        if (sky->GetShaderName() != "Skybox Procedural" && sky->HasProperty("texSampler")) {
+            m_skyTextureGroup = ResolveMaterialTextureSet(sky, {});
+            m_cameraData.skyTopExposure = glm::vec4(
+                glm::vec3(inx::color::SrgbToLinear(MaterialVector(sky, {}, "tint", glm::vec4(1.0f)))), exposure);
+            m_cameraData.skyHorizon.w = 1.0f;
+            m_cameraData.skyGround.w = MaterialFloat(sky, {}, "rotation", 0.0f);
+        } else {
+            m_cameraData.skyTopExposure =
+                glm::vec4(inx::color::SrgbToLinear(
+                              glm::vec3(MaterialVector(sky, {}, "skyTopColor", glm::vec4(environment.skyTopColor, 1)))),
+                          exposure);
+            m_cameraData.skyHorizon =
+                glm::vec4(inx::color::SrgbToLinear(glm::vec3(
+                              MaterialVector(sky, {}, "skyHorizonColor", glm::vec4(environment.skyHorizonColor, 1)))),
+                          0);
+            m_cameraData.skyGround = glm::vec4(inx::color::SrgbToLinear(glm::vec3(MaterialVector(
+                                                   sky, {}, "groundColor", glm::vec4(environment.skyGroundColor, 1)))),
+                                               0);
+        }
+    }
 
     using AmbientSource = SceneEnvironmentSettings::AmbientSource;
     switch (static_cast<AmbientSource>(environment.ambientSource)) {
@@ -1498,8 +1540,8 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
         const size_t indexCount = draw.indexCount;
         const size_t vertexBase = vertices.size();
         const glm::vec4 materialColor = inx::color::SrgbToLinear(MaterialColor(draw.material, draw.parameterBlock));
-        const glm::vec4 emission =
-            inx::color::SrgbToLinear(MaterialVector(draw.material, draw.parameterBlock, "emissionColor", glm::vec4(0.0f)));
+        const glm::vec4 emission = inx::color::SrgbToLinear(
+            MaterialVector(draw.material, draw.parameterBlock, "emissionColor", glm::vec4(0.0f)));
         const glm::vec4 materialParameters(
             std::clamp(MaterialFloat(draw.material, draw.parameterBlock, "metallic", 0.0f), 0.0f, 1.0f),
             std::clamp(MaterialFloat(draw.material, draw.parameterBlock, "smoothness", 0.5f), 0.0f, 1.0f),
@@ -1516,8 +1558,10 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
         if (draw.material && draw.material->GetRenderState().alphaClipEnabled)
             alphaClipThreshold = std::clamp(draw.material->GetRenderState().alphaClipThreshold, 0.0f, 1.0f);
         const glm::vec4 surfaceParameters(
-            shadingModel, std::clamp(MaterialFloat(draw.material, draw.parameterBlock, "diffuseThreshold", 0.45f), 0.0f, 1.0f),
-            std::clamp(MaterialFloat(draw.material, draw.parameterBlock, "bandSoftness", 0.04f), 0.0f, 0.25f), alphaClipThreshold);
+            shadingModel,
+            std::clamp(MaterialFloat(draw.material, draw.parameterBlock, "diffuseThreshold", 0.45f), 0.0f, 1.0f),
+            std::clamp(MaterialFloat(draw.material, draw.parameterBlock, "bandSoftness", 0.04f), 0.0f, 0.25f),
+            alphaClipThreshold);
         const std::array<int, 6> textureUvSets = {
             MaterialInt(draw.material, draw.parameterBlock, "baseColorUvSet", 0),
             MaterialInt(draw.material, draw.parameterBlock, "metallicUvSet", 0),
@@ -1564,9 +1608,9 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
             return false;
         }
         const glm::mat3 worldNormal = glm::inverseTranspose(glm::mat3(draw.worldMatrix));
-        const bool lineDraw = std::any_of(
-            range.indices.sourceVertices.begin(), range.indices.sourceVertices.end(),
-            [&](uint32_t index) { return sourceVertices[index].boneIndices.w == kLineVertexMarker; });
+        const bool lineDraw =
+            std::any_of(range.indices.sourceVertices.begin(), range.indices.sourceVertices.end(),
+                        [&](uint32_t index) { return sourceVertices[index].boneIndices.w == kLineVertexMarker; });
         range.line = lineDraw;
 
         vertices.reserve(vertices.size() + range.indices.sourceVertices.size());
@@ -1743,9 +1787,9 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
             forward = glm::vec3(0.0f, -1.0f, 0.0f);
         target.directionOuterCos =
             glm::vec4(glm::normalize(forward), std::cos(glm::radians(light->GetOuterSpotAngle() * 0.5f)));
-        target.parameters = glm::vec4(std::cos(glm::radians(light->GetSpotAngle() * 0.5f)),
-                                      type == LightType::Spot ? 1.0f : 0.0f,
-                                      type == LightType::Directional ? 1.0f : 0.0f, 0.0f);
+        target.parameters =
+            glm::vec4(std::cos(glm::radians(light->GetSpotAngle() * 0.5f)), type == LightType::Spot ? 1.0f : 0.0f,
+                      type == LightType::Directional ? 1.0f : 0.0f, 0.0f);
     }
     m_cameraData.lightCounts.x = additionalLightCount;
 
@@ -1764,7 +1808,7 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
                                   : glm::vec3(0.0f, 1.0f, 0.0f);
     const glm::vec3 lightPosition = center - rayDirection * (radius * 2.0f);
     const glm::mat4 lightView = glm::lookAtRH(lightPosition, center, lightUp);
-    const glm::mat4 lightProjection = glm::orthoRH_ZO(-radius, radius, -radius, radius, 0.1f, radius * 4.5f);
+    const glm::mat4 lightProjection = glm::orthoRH_ZO(-radius, radius, -radius, radius, radius * 4.5f, 0.1f);
     m_cameraData.lightViewProjection = lightProjection * lightView;
 
     m_vertices.swap(vertices);
@@ -1803,11 +1847,11 @@ bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uin
     const uint64_t indexBytes32 = m_indexStreams.uint32Indices.size() * sizeof(uint32_t);
     const uint64_t drawDataBytes = m_drawData.size() * sizeof(WebDrawData);
     const uint64_t previousDrawDataCapacity = m_drawDataCapacity;
-    if ((vertexBytes > 0 &&
-         !EnsureBuffer(m_vertexBuffer, m_vertexCapacity, vertexBytes, wgpu::BufferUsage::Vertex)) ||
+    if ((vertexBytes > 0 && !EnsureBuffer(m_vertexBuffer, m_vertexCapacity, vertexBytes, wgpu::BufferUsage::Vertex)) ||
         (indexBytes16 > 0 &&
          !EnsureBuffer(m_indexBuffer16, m_indexCapacity16, indexBytes16, wgpu::BufferUsage::Index)) ||
-        (indexBytes32 > 0 && !EnsureBuffer(m_indexBuffer32, m_indexCapacity32, indexBytes32, wgpu::BufferUsage::Index)) ||
+        (indexBytes32 > 0 &&
+         !EnsureBuffer(m_indexBuffer32, m_indexCapacity32, indexBytes32, wgpu::BufferUsage::Index)) ||
         (drawDataBytes > 0 &&
          !EnsureBuffer(m_drawDataBuffer, m_drawDataCapacity, drawDataBytes, wgpu::BufferUsage::Storage)))
         return false;
@@ -1828,7 +1872,7 @@ bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uin
         depthAttachment.view = m_shadowView;
         depthAttachment.depthLoadOp = wgpu::LoadOp::Clear;
         depthAttachment.depthStoreOp = wgpu::StoreOp::Store;
-        depthAttachment.depthClearValue = 1.0f;
+        depthAttachment.depthClearValue = 0.0f;
         wgpu::RenderPassDescriptor descriptor;
         descriptor.colorAttachmentCount = 0;
         descriptor.colorAttachments = nullptr;
@@ -1862,7 +1906,7 @@ bool WebSceneRenderer::RenderPrepared(wgpu::RenderPassEncoder pass)
     if (m_drawSky && m_skyPipeline) {
         pass.SetPipeline(m_skyPipeline);
         pass.SetBindGroup(0, m_cameraGroup);
-        pass.SetBindGroup(1, m_defaultMaterialTextureGroup);
+        pass.SetBindGroup(1, m_skyTextureGroup);
         pass.Draw(3, 1, 0, 0);
     }
 

@@ -531,9 +531,9 @@ bool WebScreenUIRenderer::CreateWorldPipelines()
     pipelineLayoutDescriptor.bindGroupLayouts = &m_worldLayout;
     const wgpu::PipelineLayout pipelineLayout = m_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
     wgpu::DepthStencilState depth;
-    depth.format = wgpu::TextureFormat::Depth24Plus;
+    depth.format = wgpu::TextureFormat::Depth32Float;
     depth.depthWriteEnabled = wgpu::OptionalBool::False;
-    depth.depthCompare = wgpu::CompareFunction::LessEqual;
+    depth.depthCompare = wgpu::CompareFunction::GreaterEqual;
     wgpu::RenderPipelineDescriptor descriptor;
     descriptor.layout = pipelineLayout;
     descriptor.vertex.module = shader;
@@ -632,9 +632,9 @@ wgpu::RenderPipeline WebScreenUIRenderer::ResolveMaterialPipeline(const Material
     layoutDescriptor.bindGroupLayouts = &layout;
     const wgpu::PipelineLayout pipelineLayout = m_device.CreatePipelineLayout(&layoutDescriptor);
     wgpu::DepthStencilState depth;
-    depth.format = wgpu::TextureFormat::Depth24Plus;
+    depth.format = wgpu::TextureFormat::Depth32Float;
     depth.depthWriteEnabled = wgpu::OptionalBool::False;
-    depth.depthCompare = alwaysOnTop ? wgpu::CompareFunction::Always : wgpu::CompareFunction::LessEqual;
+    depth.depthCompare = alwaysOnTop ? wgpu::CompareFunction::Always : wgpu::CompareFunction::GreaterEqual;
     wgpu::RenderPipelineDescriptor descriptor;
     descriptor.layout = pipelineLayout;
     descriptor.vertex.module = vertexModule;
