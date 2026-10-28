@@ -15,7 +15,7 @@
 
 | 包标识 | 版本 | 适配引擎 | 构建环境 | 目标平台 |
 | --- | --- | --- | --- | --- |
-| `infernux/platform-web` | 0.2.18 | Infernux >=0.4.3; payload 0.4.3 | Windows/Linux x64 | WebAssembly + WebGPU |
+| `infernux/platform-web` | 0.2.24 | Infernux >=0.4.3; payload 0.4.3-v8; Python 3.13 | Windows/Linux x64 | WebAssembly + WebGPU |
 
 ## 安装与导出
 

@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ChenlizheMe/Infernux
-          ref: de7cc8c8b0ecbfbb7afd8553f256a1fa236f0aaa
+          ref: e57387c0b65fa0b4838341faafa0572d100e8411
           submodules: recursive
           path: engine
       - uses: actions/checkout@v4
@@ -111,7 +111,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ChenlizheMe/Infernux
-          ref: de7cc8c8b0ecbfbb7afd8553f256a1fa236f0aaa
+          ref: e57387c0b65fa0b4838341faafa0572d100e8411
           submodules: recursive
           path: engine
       - uses: actions/checkout@v4
