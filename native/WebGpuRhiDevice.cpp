@@ -1174,12 +1174,12 @@ void WebGpuRhiDevice::CopyTexture(void *raw, rhi::TextureHandle source, rhi::Tex
     wgpu::TexelCopyTextureInfo srcInfo;
     srcInfo.texture = src->texture;
     srcInfo.mipLevel = region.sourceMip;
-    srcInfo.origin = {0, 0, region.sourceLayer};
+    srcInfo.origin = {region.sourceX, region.sourceY, region.sourceLayer + region.sourceZ};
     srcInfo.aspect = ToWebAspect(region.aspect);
     wgpu::TexelCopyTextureInfo dstInfo;
     dstInfo.texture = dst->texture;
     dstInfo.mipLevel = region.destinationMip;
-    dstInfo.origin = {0, 0, region.destinationLayer};
+    dstInfo.origin = {region.destinationX, region.destinationY, region.destinationLayer + region.destinationZ};
     dstInfo.aspect = ToWebAspect(region.aspect);
     wgpu::Extent3D size{region.width, region.height, region.depth};
     context.encoder.CopyTextureToTexture(&srcInfo, &dstInfo, &size);

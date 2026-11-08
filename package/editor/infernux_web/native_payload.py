@@ -245,10 +245,15 @@ def inspect_python_runtime(document: object) -> dict[str, object]:
     return document
 
 
-def inspect_player_payload(root: Path, *, engine: str) -> dict[str, object]:
+def inspect_player_payload(root: Path, *, engine: str, engine_release: str | None = None,
+                           source_revision: str | None = None) -> dict[str, object]:
     manifest = json.loads((root / "Player.inxmanifest").read_text(encoding="utf-8"))
     expected = {"$schema": "infernux.web_player", "engine": engine,
                 "platform": "web", "architecture": "wasm32", "python_abi": WEB_PYTHON_ABI}
+    if engine_release is not None:
+        expected["engine_release"] = engine_release
+    if source_revision is not None:
+        expected["engine_source_revision"] = source_revision
     if not isinstance(manifest, dict) or any(manifest.get(k) != v for k, v in expected.items()):
         raise ValueError("Web Player payload does not match this engine")
     if manifest.get("configuration") not in {"Release", "RelWithDebInfo"}:
@@ -261,6 +266,10 @@ def inspect_player_payload(root: Path, *, engine: str) -> dict[str, object]:
             "publish/player payload into the platform plugin before building"
         )
     inspect_python_runtime(python_runtime)
+    if not isinstance(manifest.get("engine_release"), str) or not (
+        manifest["engine_release"] == engine or manifest["engine_release"].startswith(engine + "-v")
+    ):
+        raise ValueError("Web Player payload has no matching hotfix release identity")
     for name in PLAYER_FILES:
         if not (root / name).is_file():
             raise FileNotFoundError(f"Web platform plugin is missing {root / name}")

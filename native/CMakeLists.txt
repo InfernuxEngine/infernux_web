@@ -301,6 +301,16 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
     list(FILTER _web_scene_binding_sources INCLUDE REGEX "/BindingScene[^/]*\\.cpp$")
     set(_web_runtime_binding_sources
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingModule.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingRuntimeNumerics.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingAnimationCurve.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingMotionPath.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingTweenNumerics.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingEulerTween.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingVectorTween.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingStringTween.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingRectLayout.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingRandom.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingCpuCompute.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingAssetRegistry.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingBatch.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingAudio.cpp"
@@ -519,8 +529,17 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
     COMMAND_ERROR_IS_FATAL ANY
 )
+execute_process(
+    COMMAND "${INFERNUX_WEB_HOST_PYTHON}" -c
+        "import runpy,sys; print(runpy.run_path(sys.argv[1])['ENGINE_RELEASE'])"
+        "${_engine_version_source}"
+    OUTPUT_VARIABLE _engine_release OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND git -C "${INFERNUX_ENGINE_SOURCE_ROOT}" rev-parse HEAD
+    OUTPUT_VARIABLE _engine_source_revision OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/Player.inxmanifest" CONTENT
-"{\"$schema\":\"infernux.web_player\",\"engine\":\"${_engine_version}\",\"platform\":\"web\",\"architecture\":\"wasm32\",\"python_abi\":\"cp313\",\"configuration\":\"$<CONFIG>\",\"python_runtime\":${_python_runtime_manifest}}\n")
+"{\"$schema\":\"infernux.web_player\",\"engine\":\"${_engine_version}\",\"engine_release\":\"${_engine_release}\",\"engine_source_revision\":\"${_engine_source_revision}\",\"platform\":\"web\",\"architecture\":\"wasm32\",\"python_abi\":\"cp313\",\"configuration\":\"$<CONFIG>\",\"python_runtime\":${_python_runtime_manifest}}\n")
 add_custom_target(prebuild_web_player
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${_web_player_destination}"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different

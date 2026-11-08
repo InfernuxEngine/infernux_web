@@ -180,6 +180,27 @@ class WebPlatformExporter(PlatformExporter):
         staging = _web_staging_directory(request)
         logs: tuple[str, ...] = ()
         try:
+            from infernux.engine.player_runtime_repair import prepare_player_runtime
+            from infernux.version import ENGINE_RELEASE, ENGINE_VERSION
+            from infernux.plugins.platform_releases import PLAYER_SOURCE_REVISION
+            from .native_payload import inspect_player_payload
+            import os
+
+            build_options = {
+                "emsdk": os.environ.get("INFERNUX_EMSDK_ROOT") or os.environ.get("EMSDK", ""),
+                "cpython_source": os.environ.get("INFERNUX_WEB_CPYTHON_ROOT") or os.environ.get("INFERNUX_WEB_CPYTHON_SOURCE", ""),
+                "python_runtime_manifest": os.environ.get("INFERNUX_WEB_PYTHON_RUNTIME_MANIFEST", ""),
+                "numpy_payload_root": os.environ.get("INFERNUX_WEB_NUMPY_PAYLOAD_ROOT", ""),
+            }
+            compatible = prepare_player_runtime(
+                request, details["player_root"],
+                lambda root: inspect_player_payload(root, engine=ENGINE_VERSION, engine_release=ENGINE_RELEASE,
+                                                    source_revision=PLAYER_SOURCE_REVISION),
+                options=build_options,
+            )
+            details["player_root"] = str(compatible)
+            details["player"] = inspect_player_payload(compatible, engine=ENGINE_VERSION, engine_release=ENGINE_RELEASE,
+                                                        source_revision=PLAYER_SOURCE_REVISION)
             from infernux.engine.platform_content_cook import (
                 build_settings_for_request,
             )

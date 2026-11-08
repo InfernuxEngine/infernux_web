@@ -5,6 +5,7 @@
 #include "WebParticleRuntime.h"
 #include "WebScreenUIRenderer.h"
 
+#include <function/renderer/gui/InxTextLayout.h>
 #include <function/resources/InxTexture/InxTexture.h>
 #include <platform/filesystem/InxPack.h>
 #include <platform/input/InputManager.h>
@@ -181,14 +182,10 @@ PyObject *InitializeRuntimeAssets(PyObject *, PyObject *arguments)
         registry.RegisterLoader(infernux::ResourceType::Mesh, std::make_unique<infernux::MeshLoader>());
         registry.RegisterLoader(infernux::ResourceType::Audio, std::make_unique<infernux::AudioClipLoader>());
         registry.RegisterLoader(infernux::ResourceType::Script, std::make_unique<infernux::InxPythonScriptLoader>());
-        registry.RegisterLoader(infernux::ResourceType::DefaultText,
-                                std::make_unique<infernux::InxDefaultTextLoader>());
-        registry.RegisterLoader(infernux::ResourceType::RenderEffect,
-                                std::make_unique<infernux::InxDefaultTextLoader>(infernux::ResourceType::RenderEffect));
-        registry.RegisterLoader(infernux::ResourceType::ParticleGraph, std::make_unique<infernux::InxDefaultTextLoader>(
-                                                                           infernux::ResourceType::ParticleGraph));
-        registry.RegisterLoader(infernux::ResourceType::DefaultBinary,
-                                std::make_unique<infernux::InxDefaultBinaryLoader>());
+        for (const auto type : {infernux::ResourceType::DefaultText, infernux::ResourceType::DefaultBinary,
+                                infernux::ResourceType::RenderEffect, infernux::ResourceType::ParticleGraph,
+                                infernux::ResourceType::DataAsset})
+            registry.RegisterLoader(type, std::make_unique<infernux::InxDefaultLoader>(type));
         registry.PopulateAssetDatabaseLoaders();
         return PyLong_FromSize_t(assetCount);
     } catch (const std::exception &error) {
@@ -677,6 +674,21 @@ PyObject *ScreenUIAddTextGeometry(PyObject *, PyObject *arguments)
 }
 #endif
 
+PyObject *ScreenUISetDefaultFont(PyObject *, PyObject *arguments)
+{
+    const char *path = nullptr;
+    if (!PyArg_ParseTuple(arguments, "s:screen_ui_set_default_font", &path))
+        return nullptr;
+    ImFont *font = infernux::textlayout::ResolveFont(path);
+    if (!font) {
+        PyErr_SetString(PyExc_RuntimeError, "Web Player bundled font could not be loaded");
+        return nullptr;
+    }
+    infernux::textlayout::SetDefaultFont(font);
+    ImGui::GetIO().FontDefault = font;
+    Py_RETURN_NONE;
+}
+
 PyObject *ScreenUIMeasureText(PyObject *, PyObject *arguments)
 {
     const char *text = nullptr;
@@ -855,6 +867,7 @@ PyMethodDef kMethods[] = {
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
     {"screen_ui_add_text_geometry", ScreenUIAddTextGeometry, METH_VARARGS, nullptr},
 #endif
+    {"screen_ui_set_default_font", ScreenUISetDefaultFont, METH_VARARGS, nullptr},
     {"screen_ui_measure_text", ScreenUIMeasureText, METH_VARARGS, nullptr},
     {"screen_ui_resolve_texture", ScreenUIResolveTexture, METH_VARARGS, nullptr},
     {"screen_ui_upload_image", ScreenUIUploadImage, METH_VARARGS, nullptr},

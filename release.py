@@ -81,6 +81,7 @@ def build_release(
         "reference": metadata["reference"],
         "version": metadata["version"],
         "engine": metadata["engine"],
+        "engine_release": json.loads((player_payload / "Player.inxmanifest").read_text(encoding="utf-8"))["engine_release"],
         "artifact": {"name": artifact.name},
         "generator": "Infernux platform package release.py",
         "release_tag": tag,

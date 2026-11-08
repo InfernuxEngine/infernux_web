@@ -1,34 +1,25 @@
 # Infernux Web 平台插件
 
-这是 [Infernux](https://github.com/ChenlizheMe/Infernux) 游戏引擎的官方网页构建插件。它把游戏导出为 WebAssembly，让引擎的 Python 玩法层直接在浏览器中运行，并通过 WebGPU 完成渲染。
+[English](README.md) · [引擎版本制品](https://github.com/ChenlizheMe/Infernux/releases)
 
-[English](README.md) · [Infernux 引擎](https://github.com/ChenlizheMe/Infernux) · [插件模板](https://github.com/InfernuxEngine/infernux_plugin_template) · [发布制品](https://github.com/InfernuxEngine/infernux_web/releases)
+为 Infernux 提供 `web-wasm32` 构建目标。构建宿主与目标：Windows/Linux x64 → WebAssembly。
 
-![Infernux Web 导出流程](package/plugin_pages/media/overview.png)
+![Infernux Web 构建流程](package/plugin_pages/media/overview.png)
 
-## 插件提供什么
+## 安装与使用
 
-- 编辑器中的 `web-wasm32` 构建目标
-- 预编译的 WebAssembly/JavaScript Player 与 CPython 数据
-- 面向 Windows x64、Linux x64 构建机的 glslang 和 Tint 工具
-- WebGPU 渲染、浏览器输入桥接与可定制的 HTML 外壳
+通过引擎的官方插件目录安装。平台插件随引擎版本统一构建，必须匹配引擎热修号、Python ABI 和目标平台。例如引擎 `0.4.3-v8` 对应平台安装包 `0.4.3.post8`；本仓库的源码包元数据会在最终打包时替换为自动生成的版本标识。
 
-| 包标识 | 版本 | 适配引擎 | 构建环境 | 目标平台 |
-| --- | --- | --- | --- | --- |
-| `infernux/platform-web` | 0.2.24 | Infernux >=0.4.3; payload 0.4.3-v8; Python 3.13 | Windows/Linux x64 | WebAssembly + WebGPU |
+下载服务按 `platform-plugins/<engine_release>/` 保存制品，GitHub 备用下载来自同一个引擎 Release。四个平台子仓库不再各自独立发布二进制。
 
-## 安装与导出
+版本匹配时直接使用预编译 Player。已安装插件的载荷不匹配时，引擎构建器尝试从当前引擎版本的源码重新编译，验证后覆盖该插件的 Player 载荷，后续直接复用。重建需要相应工具链，不会替换引擎 SDK。
 
-在 Infernux 中打开**插件**窗口，从官方列表选择 **Infernux Web Platform**，导入并启用即可。官方安装优先走 Infernux 分发服务，网络不可用时回退到 GitHub Releases；也可以手动导入 Releases 页面中的 `infernux.platform-web.inxpkg`。
+## 维护
 
-在构建设置中选择 `web-wasm32` 后导出，并把整个输出目录发布到服务器。开发环境可以使用 localhost 的 HTTP 服务，正式部署应使用 HTTPS；不能直接通过 `file://` 打开页面。运行设备和浏览器必须支持 WebGPU。普通用户不需要安装 Emscripten，也不需要编译引擎。
+在引擎仓库使用 `scripts/release/build_platform_plugins.py` 构建或打包此平台。引擎 CI 使用同一源码提交生成四个平台插件，统一核对版本与摘要，全部成功后才能发布引擎。平台仓库自身的 CI 负责源码与打包检查。`package.py`、`release.py` 保留为独立开发检查工具。
 
-如果需要修改网页外观，可把 `package/editor/infernux_web/templates/host/shell.html` 复制到项目的 `ProjectSettings/WebTemplate/shell.html`，保留运行时标记和 canvas 接入点，再调整页面结构与样式。
-
-## 仓库说明
-
-只有 `package/` 会作为插件发布。外层的原生源码、构建脚本、测试与 CI 供维护者使用。发布流程会把 Web Player 和 Shader 工具直接生成到 `package/`；推送与版本一致的 `v<version>` 标签后，GitHub Actions 自动发布 `.inxpkg` 和 release manifest。
+安装包只包含 `package/` 和编译后的平台载荷。测试、CMake、CI、构建工具和缓存不会进入安装包。具体环境变量与批处理命令见引擎的[平台 Player 发布说明](https://github.com/ChenlizheMe/Infernux/blob/main/docs/learn/platform-player-releases.md)。
 
 ## 许可证
 
-[MIT](LICENSE)。随包提供的第三方组件继续遵守各自的许可证。
+[MIT](LICENSE)。捆绑依赖保留各自的许可证。

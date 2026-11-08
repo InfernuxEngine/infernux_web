@@ -242,8 +242,11 @@ WebScreenUIRenderer::~WebScreenUIRenderer()
         IM_DELETE(m_overlay);
     if (m_world)
         IM_DELETE(m_world);
-    if (m_ownsContext && m_context)
+    if (m_ownsContext && m_context) {
+        textlayout::SetDefaultFont(nullptr);
+        textlayout::ClearFontCache();
         ImGui::DestroyContext(m_context);
+    }
 }
 
 bool WebScreenUIRenderer::Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::TextureFormat colorFormat,
@@ -876,7 +879,7 @@ void WebScreenUIRenderer::AddText(int list, float minX, float minY, float maxX, 
         draw->PushClipRect({minX, minY}, {maxX, maxY}, true);
     draw->PushTextureID(ImGui::GetIO().Fonts->TexRef);
     textlayout::RenderTextBox(draw, minX, minY, maxX, maxY, layout, ImGui::ColorConvertFloat4ToU32({r, g, b, a}),
-                              alignX, alignY, letterSpacing);
+                              alignX, alignY);
     draw->PopTextureID();
     if (clip)
         draw->PopClipRect();
