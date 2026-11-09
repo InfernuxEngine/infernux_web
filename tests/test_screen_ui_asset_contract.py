@@ -11,17 +11,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_native_texture_bridge_rejects_path_identity_fallback() -> None:
     source = (ROOT / "native/InfernuxWebHostModule.cpp").read_text(encoding="utf-8")
+    loader = (ROOT / "native/WebTextureAssetLoad.h").read_text(encoding="utf-8")
     function = source.split("PyObject *ScreenUIResolveTexture", 1)[1].split(
         "PyObject *ScreenUIUploadImage", 1
     )[0]
 
-    assert "database->ContainsGuid(guid)" in function
+    assert "state.load.Poll(guid)" in function
     assert "GetGuidFromPath" not in function
+    assert "GetGuidFromPath" not in loader
+    guid_check = loader.index("if (!database->ContainsGuid(guid))")
+    begin_load = loader.index("registry.BeginLoadAsset(guid, ResourceType::Texture)")
+    assert guid_check < loader.index("return Result::Missing;", guid_check) < begin_load
 
 
 def test_screen_and_world_ui_bind_groups_include_material_sampler_identity() -> None:
     renderer = (ROOT / "native/WebScreenUIRenderer.cpp").read_text(encoding="utf-8")
     host = (ROOT / "native/InfernuxWebHostModule.cpp").read_text(encoding="utf-8")
+    loader = (ROOT / "native/WebTextureAssetLoad.h").read_text(encoding="utf-8")
     sampler = renderer.split("WebScreenUIRenderer::ResolveMaterialSampler", 1)[1].split(
         "ImDrawList *WebScreenUIRenderer::DrawList", 1
     )[0]
@@ -38,9 +44,10 @@ def test_screen_and_world_ui_bind_groups_include_material_sampler_identity() -> 
         assert "ResolveMaterialSampler(" in draw_path
         assert "textureGroups.find(samplerKey)" in draw_path
         assert "textureGroups.emplace(samplerKey," in draw_path
-    assert "state.filterMode = texture->GetFilterMode()" in host
-    assert "state.wrapMode = texture->GetWrapMode()" in host
-    assert "state.anisoLevel = texture->GetAnisoLevel()" in host
+    assert "m_data.filterMode = texture->GetFilterMode()" in loader
+    assert "m_data.wrapMode = texture->GetWrapMode()" in loader
+    assert "m_data.anisoLevel = texture->GetAnisoLevel()" in loader
+    assert "data.texture, state.textureId, data.filterMode, data.wrapMode, data.anisoLevel" in host
 
 
 def test_python_texture_cache_extracts_asset_reference_guid() -> None:

@@ -58,6 +58,7 @@ class ReleaseTests(unittest.TestCase):
         self.player = player
         (player / "Player.inxmanifest").write_text(json.dumps({
             "$schema": "infernux.web_player", "engine": self.metadata["engine"].removeprefix(">="), "platform": "web",
+            "engine_release": self.metadata["engine"].removeprefix(">=") + "-v8",
             "architecture": "wasm32", "python_abi": "cp313", "configuration": "Release",
             "python_runtime": _python_runtime_manifest(),
         }), encoding="utf-8")
@@ -155,12 +156,9 @@ class ReleaseTests(unittest.TestCase):
         assert "${CMAKE_CURRENT_SOURCE_DIR}/../../package/editor/infernux_web/tools" not in tools_cmake
 
         workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
-        assert "engine/out/build/web-precompiled-player/publish/player/" in workflow
-        assert "package/editor/infernux_web/player/" not in workflow
-        assert "engine/out/build/web-shader-tools/publish/tools/" in workflow
-        assert "package/editor/infernux_web/tools/" not in workflow
-        assert "--player-payload artifacts/web-player" in workflow
-        assert "--tools-payload artifacts/web-tools" in workflow
+        assert "engine-platform-plugins.yml" in workflow
+        assert "gh release upload" not in workflow
+        assert "gh release create" not in workflow
 
 
 if __name__ == "__main__":
