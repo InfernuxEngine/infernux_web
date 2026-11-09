@@ -14,6 +14,8 @@
 #include <stb_image.h>
 
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+#include "WebTextureAssetLoad.h"
+
 #include <core/config/EngineConfig.h>
 #include <function/audio/AudioClipLoader.h>
 #include <function/renderer/gui/InxTextGeometry.h>
@@ -54,12 +56,8 @@ bool g_textInputActive = false;
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
 struct ScreenUITextureLoad
 {
-    std::shared_ptr<infernux::TextureUploadStagingTicket> ticket;
+    infernux::web::WebTextureAssetLoad load;
     uint64_t textureId = 0;
-    bool failed = false;
-    std::string filterMode = "bilinear";
-    std::string wrapMode = "clamp";
-    int anisoLevel = 1;
 };
 std::unordered_map<std::string, ScreenUITextureLoad> g_screenUITextures;
 #endif
@@ -728,49 +726,39 @@ PyObject *ScreenUIResolveTexture(PyObject *, PyObject *arguments)
         return nullptr;
     if (!g_screenUIRenderer || guidText == nullptr || *guidText == '\0')
         return PyLong_FromLongLong(-1);
+    uint64_t publishedTexture = 0;
     try {
-        auto &registry = infernux::AssetRegistry::Instance();
-        auto *database = registry.GetAssetDatabase();
-        if (!database)
-            return PyLong_FromLongLong(-1);
         const std::string guid(guidText);
-        if (!database->ContainsGuid(guid))
-            return PyLong_FromLongLong(-1);
-
         auto &state = g_screenUITextures[guid];
-        if (state.textureId != 0)
-            return PyLong_FromUnsignedLongLong(state.textureId);
-        if (state.failed)
-            return PyLong_FromLongLong(-1);
-        if (!state.ticket) {
-            const auto texture = registry.LoadAsset<infernux::InxTexture>(guid, infernux::ResourceType::Texture);
-            if (!texture) {
-                state.failed = true;
-                return PyLong_FromLongLong(-1);
+        publishedTexture = state.textureId;
+        using Result = infernux::web::WebTextureAssetLoad::Result;
+        const auto status = state.load.Poll(guid);
+        if (status == Result::Missing) {
+            if (state.textureId) {
+                g_screenUIRenderer->ReleaseTexture(state.textureId);
+                state.textureId = 0;
             }
-            state.filterMode = texture->GetFilterMode();
-            state.wrapMode = texture->GetWrapMode();
-            state.anisoLevel = texture->GetAnisoLevel();
-            state.ticket = registry.BeginTextureUploadStaging(guid);
-        }
-        const auto staging = registry.TryConsumeTextureUploadStaging(state.ticket);
-        if (!staging)
-            return PyLong_FromLongLong(0);
-        state.textureId =
-            g_screenUIRenderer->UploadTexture(*staging, 0, state.filterMode, state.wrapMode, state.anisoLevel);
-        state.ticket.reset();
-        if (state.textureId == 0) {
-            state.failed = true;
-            std::fprintf(stderr, "INFERNUX_WEB_SCREEN_UI_TEXTURE_UNSUPPORTED guid=%s format=%s\n", guid.c_str(),
-                         infernux::TextureFormatName(staging->format));
             return PyLong_FromLongLong(-1);
         }
-        std::printf("INFERNUX_WEB_SCREEN_UI_TEXTURE_READY guid=%s id=%llu\n", guid.c_str(),
-                    static_cast<unsigned long long>(state.textureId));
-        return PyLong_FromUnsignedLongLong(state.textureId);
+        if (status == Result::Ready) {
+            const auto data = state.load.TakeData();
+            const uint64_t replacement = g_screenUIRenderer->UploadTexture(
+                data.texture, state.textureId, data.filterMode, data.wrapMode, data.anisoLevel);
+            if (replacement) {
+                state.textureId = replacement;
+                std::printf("INFERNUX_WEB_SCREEN_UI_TEXTURE_READY guid=%s id=%llu\n", guid.c_str(),
+                            static_cast<unsigned long long>(state.textureId));
+            } else {
+                std::fprintf(stderr, "INFERNUX_WEB_SCREEN_UI_TEXTURE_UNSUPPORTED guid=%s format=%s\n", guid.c_str(),
+                             infernux::TextureFormatName(data.texture.format));
+            }
+        }
+        if (state.textureId)
+            return PyLong_FromUnsignedLongLong(state.textureId);
+        return PyLong_FromLongLong(status == Result::Pending ? 0 : -1);
     } catch (const std::exception &error) {
         std::fprintf(stderr, "INFERNUX_WEB_SCREEN_UI_TEXTURE_FAILED guid=%s error=%s\n", guidText, error.what());
-        return PyLong_FromLongLong(-1);
+        return publishedTexture ? PyLong_FromUnsignedLongLong(publishedTexture) : PyLong_FromLongLong(-1);
     }
 #endif
 }

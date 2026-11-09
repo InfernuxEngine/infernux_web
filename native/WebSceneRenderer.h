@@ -1,6 +1,7 @@
 #pragma once
 
 #include "WebIndexPacking.h"
+#include "WebTextureAssetLoad.h"
 
 #include <function/renderer/RenderWorld.h>
 #include <function/resources/InxMaterial/MaterialProperty.h>
@@ -19,7 +20,6 @@ namespace infernux
 class InxMaterial;
 class Camera;
 struct RendererParameterBlock;
-class TextureUploadStagingTicket;
 struct TextureCpuData;
 } // namespace infernux
 
@@ -120,12 +120,8 @@ class WebSceneRenderer final
 
     struct MaterialTextureState
     {
-        std::shared_ptr<TextureUploadStagingTicket> ticket;
+        WebTextureAssetLoad load;
         GPUTexture gpu;
-        std::string filterMode = "linear";
-        std::string wrapMode = "repeat";
-        int anisoLevel = 1;
-        bool failed = false;
     };
 
     struct MaterialTextureSetState

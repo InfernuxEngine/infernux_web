@@ -11,6 +11,7 @@
 #include <platform/filesystem/InxPack.h>
 #include <platform/input/InputManager.h>
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+#include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/scene/Camera.h>
 #include <function/scene/Scene.h>
 #include <function/scene/SceneManager.h>
@@ -939,6 +940,9 @@ void Frame()
         acceptanceClockEnabled ? (g_acceptancePaused ? 0.0 : g_acceptanceFixedDeltaSeconds) : wallDeltaSeconds;
     bool pauseAcceptanceAfterRender = false;
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+    auto &registry = infernux::AssetRegistry::Instance();
+    if (registry.IsInitialized())
+        registry.PollTextureReads();
     if (infernux::JobSystem::IsAvailable())
         infernux::JobSystem::Get().RunPendingJobs(64);
 #endif

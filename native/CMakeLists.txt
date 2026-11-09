@@ -311,6 +311,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingRectLayout.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingRandom.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingCpuCompute.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingFrameWork.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingAssetRegistry.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingBatch.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingAudio.cpp"
@@ -318,6 +319,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingPhysics.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingResources.cpp"
         ${_web_scene_binding_sources}
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingSkeleton.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingSemanticCatalog.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingTagLayer.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingText.cpp"

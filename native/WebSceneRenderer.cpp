@@ -1097,40 +1097,30 @@ WebSceneRenderer::GPUTexture WebSceneRenderer::ResolveMaterialTexture(const std:
     const std::string samplerIdentity = SamplerIdentity(sampler);
     const std::string textureIdentity = guid + '\x1e' + samplerIdentity;
     MaterialTextureState &state = m_materialTextures[textureIdentity];
-    if (state.gpu.view)
-        return state.gpu;
-    if (state.failed)
-        return fallback;
-
-    AssetRegistry &registry = AssetRegistry::Instance();
-    if (!state.ticket) {
-        const auto texture = registry.LoadAsset<InxTexture>(guid, ResourceType::Texture);
-        if (!texture) {
-            state.failed = true;
-            std::fprintf(stderr, "INFERNUX_WEB_MATERIAL_TEXTURE_FAILED guid=%s reason=asset-load\n", guid.c_str());
-            return fallback;
+    try {
+        const auto status = state.load.Poll(guid);
+        if (status == WebTextureAssetLoad::Result::Missing && state.gpu.view) {
+            state.gpu = {};
+            ++m_materialTextureGeneration;
+        } else if (status == WebTextureAssetLoad::Result::Ready) {
+            const auto data = state.load.TakeData();
+            const auto &texture = data.texture;
+            auto gpu = UploadMaterialTexture(texture, data.filterMode, data.wrapMode, data.anisoLevel, sampler);
+            if (gpu.view) {
+                state.gpu = std::move(gpu);
+                ++m_materialTextureGeneration;
+                std::printf("INFERNUX_WEB_MATERIAL_TEXTURE_READY guid=%s width=%u height=%u mips=%u filter=%s wrap=%s sampler=%s\n",
+                            guid.c_str(), texture.mipLevels.front().width, texture.mipLevels.front().height,
+                            state.gpu.mipLevels, data.filterMode.c_str(), data.wrapMode.c_str(), samplerIdentity.c_str());
+            } else {
+                std::fprintf(stderr, "INFERNUX_WEB_MATERIAL_TEXTURE_FAILED guid=%s format=%s\n", guid.c_str(),
+                             TextureFormatName(texture.format));
+            }
         }
-        state.filterMode = texture->GetFilterMode();
-        state.wrapMode = texture->GetWrapMode();
-        state.anisoLevel = texture->GetAnisoLevel();
-        state.ticket = registry.BeginTextureUploadStaging(guid);
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "INFERNUX_WEB_MATERIAL_TEXTURE_FAILED guid=%s error=%s\n", guid.c_str(), error.what());
     }
-    const auto staging = registry.TryConsumeTextureUploadStaging(state.ticket);
-    if (!staging)
-        return fallback;
-    state.gpu = UploadMaterialTexture(*staging, state.filterMode, state.wrapMode, state.anisoLevel, sampler);
-    state.ticket.reset();
-    if (!state.gpu.view) {
-        state.failed = true;
-        std::fprintf(stderr, "INFERNUX_WEB_MATERIAL_TEXTURE_FAILED guid=%s format=%s\n", guid.c_str(),
-                     TextureFormatName(staging->format));
-        return fallback;
-    }
-    ++m_materialTextureGeneration;
-    std::printf("INFERNUX_WEB_MATERIAL_TEXTURE_READY guid=%s width=%u height=%u mips=%u filter=%s wrap=%s sampler=%s\n",
-                guid.c_str(), staging->mipLevels.front().width, staging->mipLevels.front().height, state.gpu.mipLevels,
-                state.filterMode.c_str(), state.wrapMode.c_str(), samplerIdentity.c_str());
-    return state.gpu;
+    return state.gpu.view ? state.gpu : fallback;
 }
 
 wgpu::BindGroup
@@ -1657,7 +1647,7 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
                 renderTangentValue = glm::vec4(tangent, normalScale);
                 vertexAlpha = std::clamp(source.boneWeights.y, 0.0f, 1.0f);
             } else {
-                const glm::mat4 skin = SkinMatrix(source, draw.skinBoneMatrices);
+                const glm::mat4 skin = SkinMatrix(source, draw.skinBoneMatrices.get());
                 const glm::vec3 localPosition = glm::vec3(skin * glm::vec4(source.pos, 1.0f));
                 renderPosition = localPosition;
                 const glm::vec3 localNormal = glm::mat3(skin) * source.normal;

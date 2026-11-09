@@ -468,8 +468,6 @@ def _install_platform_runtime_api(native_module: Any) -> None:
 
 def _install_runtime_lifecycle_bridge(scene_manager: Any, scheduler: Any) -> None:
     from infernux.engine.runtime_change_journal import RuntimeFrameBarrier
-    from infernux.lib import NativeRuntimeFrameBarrier
-
     scheduler.bind_native_bridge(scene_manager)
     scene_manager.set_runtime_lifecycle_callbacks(
         scheduler.begin_native_frame,
@@ -479,35 +477,19 @@ def _install_runtime_lifecycle_bridge(scene_manager: Any, scheduler: Any) -> Non
         scheduler.execute_native_editor_update,
         scheduler.end_native_frame,
     )
-    barrier_map = {
-        NativeRuntimeFrameBarrier.TRANSFORM_TO_PHYSICS:
-            RuntimeFrameBarrier.TRANSFORM_TO_PHYSICS,
-        NativeRuntimeFrameBarrier.PHYSICS_SIMULATION:
-            RuntimeFrameBarrier.PHYSICS_SIMULATION,
-        NativeRuntimeFrameBarrier.PHYSICS_TO_TRANSFORM:
-            RuntimeFrameBarrier.PHYSICS_TO_TRANSFORM,
-        NativeRuntimeFrameBarrier.TRANSFORM_RESOLVE:
-            RuntimeFrameBarrier.TRANSFORM_RESOLVE,
-        NativeRuntimeFrameBarrier.FINAL_TRANSFORM_RESOLVE:
-            RuntimeFrameBarrier.FINAL_TRANSFORM_RESOLVE,
-        NativeRuntimeFrameBarrier.ANIMATION_TIMELINE:
-            RuntimeFrameBarrier.ANIMATION_TIMELINE,
-        NativeRuntimeFrameBarrier.RENDER_EXTRACTION:
-            RuntimeFrameBarrier.RENDER_EXTRACTION,
-        NativeRuntimeFrameBarrier.RENDER_GRAPH:
-            RuntimeFrameBarrier.RENDER_GRAPH,
-        NativeRuntimeFrameBarrier.SNAPSHOT_PUBLICATION:
-            RuntimeFrameBarrier.SNAPSHOT_PUBLICATION,
-        NativeRuntimeFrameBarrier.PENDING_DESTROY:
-            RuntimeFrameBarrier.PENDING_DESTROY,
-    }
+
     def consume_runtime_barrier(native_barrier: Any) -> None:
-        barrier = barrier_map[native_barrier]
+        barrier = RuntimeFrameBarrier.from_native(native_barrier)
         changes = scheduler.consume_native_barrier(barrier)
         if barrier == RuntimeFrameBarrier.TRANSFORM_TO_PHYSICS:
             if changes is not None:
                 scheduler.execute_native_phase(
                     "physics_pre_step", float(scene_manager.get_fixed_time_step())
+                )
+        elif barrier == RuntimeFrameBarrier.ANIMATION_EVALUATION:
+            if changes is not None:
+                scheduler.execute_native_phase(
+                    "animation_update", scene_manager.get_frame_delta_time()
                 )
         elif barrier == RuntimeFrameBarrier.PHYSICS_TO_TRANSFORM:
             if changes is not None:
@@ -1450,22 +1432,30 @@ class _WebScreenUITextureCache:
         ready = self._textures.get(guid)
         if ready:
             return ready
+        return self._update(guid)
+
+    def _update(self, guid: str) -> int:
         resolved = int(self._host.screen_ui_resolve_texture(guid))
         if resolved > 0:
+            if self._textures.get(guid) != resolved:
+                self.generation += 1
             self._textures[guid] = resolved
             self._pending.discard(guid)
-            self.generation += 1
+            self._failed.discard(guid)
             return resolved
+        if self._textures.pop(guid, None) is not None:
+            self.generation += 1
         if resolved < 0:
             self._failed.add(guid)
             self._pending.discard(guid)
         else:
             self._pending.add(guid)
+            self._failed.discard(guid)
         return 0
 
     def poll(self) -> None:
-        for identifier in tuple(self._pending):
-            self.get(identifier)
+        for guid in (*self._textures, *self._pending, *self._failed):
+            self._update(guid)
 
 
 def _submit_screen_ui() -> None:
