@@ -52,7 +52,7 @@ def build_release(
         raise ValueError(f"Release tag must match package version: {expected}")
     player_payload = player_payload.expanduser().resolve()
     tools_payload = tools_payload.expanduser().resolve()
-    _require_native_payloads(root, player_payload, tools_payload, metadata["engine"].removeprefix(">="))
+    _require_native_payloads(root, player_payload, tools_payload, metadata["engine"].removeprefix("=="))
     destination = output if output is not None else root / "dist"
     destination.mkdir(parents=True, exist_ok=True)
     stem = metadata["reference"].replace("/", ".")
