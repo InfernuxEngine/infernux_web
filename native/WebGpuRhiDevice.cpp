@@ -839,7 +839,7 @@ rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::G
 
     wgpu::FragmentState fragmentState;
     fragmentState.module = fragment->module;
-    fragmentState.entryPoint = "main";
+    fragmentState.entryPoint = desc.fragmentEntryPoint;
     fragmentState.targetCount = desc.colorTargetCount;
     fragmentState.targets = targets.data();
 
@@ -851,7 +851,7 @@ rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::G
     wgpu::RenderPipelineDescriptor native;
     native.layout = pipelineLayout;
     native.vertex.module = vertex->module;
-    native.vertex.entryPoint = "main";
+    native.vertex.entryPoint = desc.vertexEntryPoint;
     native.fragment = &fragmentState;
     native.primitive.topology = ToWebTopology(desc.topology);
     native.primitive.frontFace = ToWebFrontFace(desc.raster.frontFace);
@@ -898,7 +898,7 @@ rhi::ComputePipelineHandle WebGpuRhiDevice::CreateComputePipeline(const rhi::Com
     wgpu::ComputePipelineDescriptor native;
     native.layout = m_device.CreatePipelineLayout(&layoutDesc);
     native.compute.module = shader->module;
-    native.compute.entryPoint = "main";
+    native.compute.entryPoint = desc.entryPoint;
     payload.pipeline = m_device.CreateComputePipeline(&native);
     if (!payload.pipeline) {
         SetError("WebGPU failed to create compute pipeline");
