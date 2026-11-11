@@ -298,6 +298,7 @@ WebGpuRhiDevice::WebGpuRhiDevice(wgpu::Device device, wgpu::Queue queue, uint32_
     m_capabilities.limits.maxBindingLayouts = limits.maxBindGroups;
     m_capabilities.limits.maxSampledTexturesPerStage = limits.maxSampledTexturesPerShaderStage;
     m_capabilities.limits.maxStorageBuffersPerStage = limits.maxStorageBuffersPerShaderStage;
+    m_capabilities.limits.minStorageBufferOffsetAlignment = limits.minStorageBufferOffsetAlignment;
     m_capabilities.limits.maxSamplerAnisotropy = 16.0f;
     auto &portable = m_capabilities.portable;
     portable.storageTextures = limits.maxStorageTexturesPerShaderStage > 0;
@@ -325,6 +326,18 @@ WebGpuRhiDevice::WebGpuRhiDevice(wgpu::Device device, wgpu::Queue queue, uint32_
             rhi::FormatFeature::Sampled | rhi::FormatFeature::TransferSource | rhi::FormatFeature::TransferDestination;
         caps.optimalTiling |= rhi::IsDepthFormat(format) ? rhi::FormatFeature::DepthStencilAttachment
                                                          : rhi::FormatFeature::ColorAttachment;
+        switch (format) {
+        case rhi::PixelFormat::RGBA8UNorm:
+        case rhi::PixelFormat::RGBA16SFloat:
+        case rhi::PixelFormat::R32SFloat:
+        case rhi::PixelFormat::RGBA32SFloat:
+        case rhi::PixelFormat::RG32UInt:
+        case rhi::PixelFormat::RGBA32UInt:
+            caps.optimalTiling |= rhi::FormatFeature::Storage;
+            break;
+        default:
+            break;
+        }
         caps.sampleCounts = rhi::SampleCountBit(rhi::SampleCount::One);
         if (format == rhi::PixelFormat::RGBA16SFloat)
             caps.sampleCounts |= rhi::SampleCountBit(rhi::SampleCount::Four);
@@ -516,6 +529,7 @@ rhi::SamplerHandle WebGpuRhiDevice::CreateSampler(const rhi::SamplerDesc &desc)
     native.lodMinClamp = desc.minLod;
     native.lodMaxClamp = std::max(desc.minLod, desc.maxLod);
     native.maxAnisotropy = static_cast<uint16_t>(std::clamp(std::lround(desc.maxAnisotropy), 1l, 16l));
+    native.compare = desc.compareEnabled ? ToWebCompare(desc.compare) : wgpu::CompareFunction::Undefined;
     auto sampler = m_device.CreateSampler(&native);
     if (!sampler) {
         SetError("WebGPU failed to create sampler");
@@ -558,6 +572,12 @@ rhi::ShaderModuleHandle WebGpuRhiDevice::CreateShaderModule(const rhi::ShaderMod
 wgpu::BindGroupLayout WebGpuRhiDevice::CreateNativeBindingLayout(const rhi::BindingLayoutDesc &desc,
                                                                  bool includePushConstant)
 {
+    constexpr std::array sampleTypes{wgpu::TextureSampleType::Float, wgpu::TextureSampleType::UnfilterableFloat,
+                                     wgpu::TextureSampleType::Sint, wgpu::TextureSampleType::Uint};
+    constexpr std::array samplerTypes{wgpu::SamplerBindingType::Filtering, wgpu::SamplerBindingType::NonFiltering,
+                                      wgpu::SamplerBindingType::Comparison};
+    constexpr std::array storageAccess{wgpu::StorageTextureAccess::WriteOnly, wgpu::StorageTextureAccess::ReadOnly,
+                                       wgpu::StorageTextureAccess::ReadWrite};
     std::vector<wgpu::BindGroupLayoutEntry> entries;
     entries.reserve(desc.entryCount * 2 + (includePushConstant ? 1 : 0));
     for (uint32_t index = 0; index < desc.entryCount; ++index) {
@@ -572,23 +592,27 @@ wgpu::BindGroupLayout WebGpuRhiDevice::CreateNativeBindingLayout(const rhi::Bind
         switch (source.type) {
         case rhi::BindingType::UniformBuffer:
             entry.buffer.type = wgpu::BufferBindingType::Uniform;
+            entry.buffer.minBindingSize = source.minBufferBindingSize;
             break;
         case rhi::BindingType::StorageBuffer:
             entry.buffer.type =
                 source.readOnlyStorage ? wgpu::BufferBindingType::ReadOnlyStorage : wgpu::BufferBindingType::Storage;
+            entry.buffer.minBindingSize = source.minBufferBindingSize;
             break;
         case rhi::BindingType::SampledTexture:
             entry.texture.sampleType =
-                source.depthRead ? wgpu::TextureSampleType::Depth : wgpu::TextureSampleType::Float;
-            entry.texture.viewDimension = wgpu::TextureViewDimension::e2D;
+                source.depthRead ? wgpu::TextureSampleType::Depth : sampleTypes[static_cast<size_t>(source.sampleType)];
+            entry.texture.viewDimension = ToWebViewDimension(source.viewDimension);
+            entry.texture.multisampled = source.multisampled;
             break;
         case rhi::BindingType::Sampler:
-            entry.sampler.type = wgpu::SamplerBindingType::Filtering;
+            entry.sampler.type = samplerTypes[static_cast<size_t>(source.samplerType)];
             break;
         case rhi::BindingType::CombinedTextureSampler: {
             entry.texture.sampleType =
-                source.depthRead ? wgpu::TextureSampleType::Depth : wgpu::TextureSampleType::Float;
-            entry.texture.viewDimension = wgpu::TextureViewDimension::e2D;
+                source.depthRead ? wgpu::TextureSampleType::Depth : sampleTypes[static_cast<size_t>(source.sampleType)];
+            entry.texture.viewDimension = ToWebViewDimension(source.viewDimension);
+            entry.texture.multisampled = source.multisampled;
             entries.push_back(entry);
             wgpu::BindGroupLayoutEntry sampler;
             sampler.binding = WebSamplerBinding(source.binding);
@@ -599,8 +623,10 @@ wgpu::BindGroupLayout WebGpuRhiDevice::CreateNativeBindingLayout(const rhi::Bind
             continue;
         }
         case rhi::BindingType::StorageTexture:
-            SetError("RHI storage texture layouts do not yet carry the WebGPU format and access contract");
-            return {};
+            entry.storageTexture.access = storageAccess[static_cast<size_t>(source.storageAccess)];
+            entry.storageTexture.format = ToWebFormat(source.storageFormat);
+            entry.storageTexture.viewDimension = ToWebViewDimension(source.viewDimension);
+            break;
         }
         entries.push_back(entry);
     }
