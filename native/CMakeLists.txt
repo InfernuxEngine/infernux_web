@@ -21,6 +21,19 @@ set(INFERNUX_WEB_PLAYER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/publish/player" 
 set(INFERNUX_ENGINE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." CACHE PATH
     "Infernux source directory providing the backend-neutral RHI contract")
 set(INFERNUX_EXTERNAL_ROOT "${INFERNUX_ENGINE_SOURCE_ROOT}/external")
+include("${INFERNUX_ENGINE_SOURCE_ROOT}/cmake/InfernuxSlang.cmake")
+add_library(InfernuxWebShaderCompiler STATIC
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/resources/ShaderAsset/SlangCompiler.cpp"
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/resources/ShaderAsset/SlangLayout.cpp")
+target_include_directories(InfernuxWebShaderCompiler PUBLIC "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux")
+target_link_libraries(InfernuxWebShaderCompiler PRIVATE ${INFERNUX_SLANG_TARGET})
+target_compile_features(InfernuxWebShaderCompiler PRIVATE cxx_std_17)
+target_compile_options(InfernuxWebShaderCompiler PRIVATE "-fwasm-exceptions")
+target_compile_definitions(InfernuxWebShaderCompiler PRIVATE
+    INFERNUX_SLANG_MODULE_NAME="${INFERNUX_SLANG_MODULE_NAME}")
+if(INFERNUX_SLANG_MODULE_TARGETS)
+    add_dependencies(InfernuxWebShaderCompiler ${INFERNUX_SLANG_MODULE_TARGETS})
+endif()
 option(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE
     "Compile the existing Infernux Python binding surface for wasm without linking it"
     OFF
@@ -261,6 +274,7 @@ target_link_libraries(InfernuxWebPlayerHost PRIVATE
     "${_python_hacl}"
     libzstd_static
     infernux_utf8proc
+    InfernuxWebShaderCompiler
     SDL3::SDL3-static
     dl
     pthread
@@ -301,6 +315,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
     list(FILTER _web_scene_binding_sources INCLUDE REGEX "/BindingScene[^/]*\\.cpp$")
     set(_web_runtime_binding_sources
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingModule.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingShaderCompiler.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingRuntimeNumerics.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingAnimationCurve.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingMotionPath.cpp"
@@ -359,6 +374,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
     list(FILTER _web_resource_runtime_sources EXCLUDE REGEX "TextureProcessor\\.cpp$")
     list(FILTER _web_resource_runtime_sources EXCLUDE REGEX "InxShaderLoader\\.cpp$")
     list(FILTER _web_resource_runtime_sources EXCLUDE REGEX "InxPack\\.cpp$")
+    list(FILTER _web_resource_runtime_sources EXCLUDE REGEX "/ShaderAsset/Slang(Compiler|Layout)\\.cpp$")
     add_library(InfernuxWebResourceRuntimeProbe OBJECT EXCLUDE_FROM_ALL
         ${_web_resource_runtime_sources}
     )
@@ -513,6 +529,7 @@ target_link_options(InfernuxWebPlayerHost PRIVATE
     "--preload-file=${_python_assets}@/usr/local"
     "--preload-file=${_numpy_site_packages}@/usr/local/lib/python3.13/site-packages"
     "--preload-file=${CMAKE_CURRENT_SOURCE_DIR}/bootstrap.py@/infernux/bootstrap.py"
+    "--preload-file=${INFERNUX_SLANG_MODULE_DIR}@/infernux/${INFERNUX_SLANG_MODULE_NAME}"
 )
 
 # Keep generated Player payloads outside the source tree. Release packaging
