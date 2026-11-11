@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_fullscreen_shader_contract_compiles_and_rejects_mismatched_bindings(tmp_path):
     source = ROOT / "tests" / "fullscreen_shader_contract.cpp"
+    include_dir = ROOT.parents[2] / "cpp" / "infernux"
     output = tmp_path / ("fullscreen_shader_contract.exe" if os.name == "nt" else "fullscreen_shader_contract")
     if os.name == "nt":
         compiler = shutil.which("cl")
@@ -24,17 +25,17 @@ def test_fullscreen_shader_contract_compiles_and_rejects_mismatched_bindings(tmp
         if not vcvars.is_file():
             pytest.skip("The MSVC x64 environment script is unavailable")
         command = (
-            f'call "{vcvars}" >nul && "{compiler}" /nologo /EHsc /std:c++17 '
-            f'"{source}" "/Fe:{output}" "/Fo:{tmp_path / "fullscreen_shader_contract.obj"}"'
+            f'chcp 65001 >nul && call "{vcvars}" >nul && "{compiler}" /nologo /EHsc /std:c++20 /utf-8 '
+            f'"/I{include_dir}" "{source}" "/Fe:{output}" "/Fo:{tmp_path / "fullscreen_shader_contract.obj"}"'
         )
     else:
         compiler = shutil.which("c++")
         if compiler is None:
             pytest.skip("A C++ compiler is not available in this test environment")
-        command = [compiler, "-std=c++17", str(source), "-o", str(output)]
-    compile_result = subprocess.run(command, capture_output=True, text=True, shell=os.name == "nt")
+        command = [compiler, "-std=c++20", "-I", str(include_dir), str(source), "-o", str(output)]
+    compile_result = subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace", shell=os.name == "nt")
     assert compile_result.returncode == 0, compile_result.stdout + compile_result.stderr
-    contract_result = subprocess.run([str(output)], capture_output=True, text=True)
+    contract_result = subprocess.run([str(output)], capture_output=True, encoding="utf-8")
     assert contract_result.returncode == 0, contract_result.stdout + contract_result.stderr
 
 

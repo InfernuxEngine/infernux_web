@@ -1,6 +1,7 @@
 #include "WebGpuRhiDevice.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -13,81 +14,6 @@ namespace infernux::web
 {
 namespace
 {
-
-bool IsIdentifierCharacter(char value)
-{
-    return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') ||
-           value == '_';
-}
-
-bool HasIdentifierUseAfter(std::string_view source, std::string_view identifier, size_t offset)
-{
-    while ((offset = source.find(identifier, offset)) != std::string_view::npos) {
-        const bool startsCleanly = offset == 0 || !IsIdentifierCharacter(source[offset - 1]);
-        const size_t end = offset + identifier.size();
-        const bool endsCleanly = end == source.size() || !IsIdentifierCharacter(source[end]);
-        if (startsCleanly && endsCleanly)
-            return true;
-        offset = end;
-    }
-    return false;
-}
-
-std::array<std::vector<uint32_t>, rhi::ComputePipelineDesc::MaxBindingLayouts>
-ReflectUsedComputeBindings(std::string_view source)
-{
-    std::array<std::vector<uint32_t>, rhi::ComputePipelineDesc::MaxBindingLayouts> result;
-    size_t cursor = 0;
-    while ((cursor = source.find("@group(", cursor)) != std::string_view::npos) {
-        const size_t groupStart = cursor + 7;
-        size_t groupEnd = groupStart;
-        while (groupEnd < source.size() && source[groupEnd] >= '0' && source[groupEnd] <= '9')
-            ++groupEnd;
-        if (groupEnd == groupStart)
-            break;
-        const uint32_t group =
-            static_cast<uint32_t>(std::stoul(std::string(source.substr(groupStart, groupEnd - groupStart))));
-        const size_t bindingMarker = source.find("@binding(", groupEnd);
-        const size_t statementEnd = source.find(';', groupEnd);
-        if (bindingMarker == std::string_view::npos || statementEnd == std::string_view::npos ||
-            bindingMarker > statementEnd) {
-            cursor = groupEnd;
-            continue;
-        }
-        const size_t bindingStart = bindingMarker + 9;
-        size_t bindingEnd = bindingStart;
-        while (bindingEnd < source.size() && source[bindingEnd] >= '0' && source[bindingEnd] <= '9')
-            ++bindingEnd;
-        const size_t colon = source.rfind(':', statementEnd);
-        if (bindingEnd == bindingStart || colon == std::string_view::npos || colon < bindingEnd ||
-            group >= result.size()) {
-            cursor = statementEnd + 1;
-            continue;
-        }
-        size_t identifierEnd = colon;
-        while (identifierEnd > bindingEnd && (source[identifierEnd - 1] == ' ' || source[identifierEnd - 1] == '\t'))
-            --identifierEnd;
-        size_t identifierStart = identifierEnd;
-        while (identifierStart > bindingEnd && IsIdentifierCharacter(source[identifierStart - 1]))
-            --identifierStart;
-        const std::string_view identifier = source.substr(identifierStart, identifierEnd - identifierStart);
-        if (!identifier.empty() && HasIdentifierUseAfter(source, identifier, statementEnd + 1)) {
-            const uint32_t binding =
-                static_cast<uint32_t>(std::stoul(std::string(source.substr(bindingStart, bindingEnd - bindingStart))));
-            auto &bindings = result[group];
-            if (std::find(bindings.begin(), bindings.end(), binding) == bindings.end())
-                bindings.push_back(binding);
-        }
-        cursor = statementEnd + 1;
-    }
-    return result;
-}
-
-bool UsesBinding(const std::vector<uint32_t> *usedBindings, uint32_t binding)
-{
-    return usedBindings == nullptr ||
-           std::find(usedBindings->begin(), usedBindings->end(), binding) != usedBindings->end();
-}
 
 wgpu::ShaderStage ToWebShaderStage(rhi::ShaderStage stages)
 {
@@ -332,8 +258,11 @@ uint64_t AlignedUniformSize(uint32_t byteSize)
 } // namespace
 
 const rhi::GraphicsCommandEncoder::Dispatch WebGpuRhiDevice::s_graphicsDispatch = {
-    &WebGpuRhiDevice::BindPipeline, &WebGpuRhiDevice::BindGroup,    &WebGpuRhiDevice::PushConstants,
-    &WebGpuRhiDevice::Draw,         &WebGpuRhiDevice::DrawIndirect,
+    &WebGpuRhiDevice::BindPipeline,        &WebGpuRhiDevice::BindGroup,
+    &WebGpuRhiDevice::PushConstants,       &WebGpuRhiDevice::Draw,
+    &WebGpuRhiDevice::DrawIndirect,        &WebGpuRhiDevice::BindVertexBuffer,
+    &WebGpuRhiDevice::BindIndexBuffer,     &WebGpuRhiDevice::DrawIndexed,
+    &WebGpuRhiDevice::DrawIndexedIndirect,
 };
 
 const rhi::ComputeCommandEncoder::DispatchTable WebGpuRhiDevice::s_computeDispatch = {
@@ -343,8 +272,9 @@ const rhi::ComputeCommandEncoder::DispatchTable WebGpuRhiDevice::s_computeDispat
 };
 
 const rhi::TransferCommandEncoder::DispatchTable WebGpuRhiDevice::s_transferDispatch = {
-    &WebGpuRhiDevice::CopyBuffer,   &WebGpuRhiDevice::CopyTexture, &WebGpuRhiDevice::ResolveTexture, nullptr,
-    &WebGpuRhiDevice::UpdateBuffer,
+    &WebGpuRhiDevice::CopyBuffer,          &WebGpuRhiDevice::CopyTexture,  &WebGpuRhiDevice::ResolveTexture,
+    &WebGpuRhiDevice::FillBuffer,          &WebGpuRhiDevice::UpdateBuffer, &WebGpuRhiDevice::CopyTextureToBuffer,
+    &WebGpuRhiDevice::CopyBufferToTexture,
 };
 
 WebGpuRhiDevice::WebGpuRhiDevice(wgpu::Device device, wgpu::Queue queue, uint32_t maxStorageBuffersPerStage)
@@ -561,6 +491,11 @@ rhi::TextureViewHandle WebGpuRhiDevice::CreateTextureView(const rhi::TextureView
     native.mipLevelCount = desc.mipCount;
     native.baseArrayLayer = desc.baseLayer;
     native.arrayLayerCount = desc.layerCount;
+    if (desc.usage != rhi::TextureUsageFlags::None && !rhi::HasTextureUsage(texture->desc.usage, desc.usage)) {
+        SetError("WebGPU texture view usage must be a subset of its allocation");
+        return {};
+    }
+    native.usage = ToWebTextureUsage(desc.usage == rhi::TextureUsageFlags::None ? texture->desc.usage : desc.usage);
     auto view = texture->texture.CreateView(&native);
     if (!view) {
         SetError("WebGPU failed to create texture view");
@@ -617,22 +552,16 @@ rhi::ShaderModuleHandle WebGpuRhiDevice::CreateShaderModule(const rhi::ShaderMod
         SetError("WebGPU failed to create WGSL shader module");
         return {};
     }
-    return Register<rhi::ShaderModuleHandle>(m_shaderModules, m_freeShaderModule,
-                                             {std::move(module), std::move(normalizedSource)});
+    return Register<rhi::ShaderModuleHandle>(m_shaderModules, m_freeShaderModule, {std::move(module)});
 }
 
 wgpu::BindGroupLayout WebGpuRhiDevice::CreateNativeBindingLayout(const rhi::BindingLayoutDesc &desc,
-                                                                 bool includePushConstant,
-                                                                 const std::vector<uint32_t> *usedBindings)
+                                                                 bool includePushConstant)
 {
     std::vector<wgpu::BindGroupLayoutEntry> entries;
     entries.reserve(desc.entryCount * 2 + (includePushConstant ? 1 : 0));
     for (uint32_t index = 0; index < desc.entryCount; ++index) {
         const auto &source = desc.entries[index];
-        if (!UsesBinding(usedBindings, source.binding) &&
-            !(source.type == rhi::BindingType::CombinedTextureSampler &&
-              UsesBinding(usedBindings, WebSamplerBinding(source.binding))))
-            continue;
         if (source.count != 1 || source.binding >= WebSamplerBindingBase) {
             SetError("WebGPU binding arrays and reserved bindings are not supported by this ABI");
             return {};
@@ -694,23 +623,23 @@ rhi::BindingLayoutHandle WebGpuRhiDevice::CreateBindingLayout(const rhi::Binding
         SetError("WebGPU binding layout has too many entries");
         return {};
     }
-    // Compute shaders use stage-specific layouts. Creating the Vulkan-sized
-    // superset here would exceed WebGPU limits before unused resources can be
-    // removed, so native layouts are materialized with each pipeline instead.
-    return Register<rhi::BindingLayoutHandle>(m_bindingLayouts, m_freeBindingLayout, {{}, desc});
+    // Program preparation supplies the actual reflected layout. The backend
+    // owns its immutable native object; it never reconstructs shader semantics
+    // by scanning target text or recreates this layout on every draw.
+    auto layout = CreateNativeBindingLayout(desc, false);
+    if (!layout)
+        return {};
+    return Register<rhi::BindingLayoutHandle>(m_bindingLayouts, m_freeBindingLayout, {std::move(layout), desc});
 }
 
 wgpu::BindGroup WebGpuRhiDevice::CreateNativeBindGroup(const rhi::BindGroupDesc *desc, wgpu::BindGroupLayout layout,
-                                                       wgpu::Buffer pushConstantBuffer,
-                                                       const std::vector<uint32_t> *usedBindings)
+                                                       wgpu::Buffer pushConstantBuffer)
 {
     std::vector<wgpu::BindGroupEntry> entries;
     if (desc) {
         entries.reserve(desc->bufferCount + desc->textureCount * 2 + (pushConstantBuffer ? 1 : 0));
         for (uint32_t index = 0; index < desc->bufferCount; ++index) {
             const auto &source = desc->buffers[index];
-            if (!UsesBinding(usedBindings, source.binding))
-                continue;
             const auto *buffer = Resolve(m_buffers, source.buffer);
             if (!buffer) {
                 SetError("invalid WebGPU buffer binding");
@@ -725,10 +654,6 @@ wgpu::BindGroup WebGpuRhiDevice::CreateNativeBindGroup(const rhi::BindGroupDesc 
         }
         for (uint32_t index = 0; index < desc->textureCount; ++index) {
             const auto &source = desc->textures[index];
-            if (!UsesBinding(usedBindings, source.binding) &&
-                !(source.type == rhi::BindingType::CombinedTextureSampler &&
-                  UsesBinding(usedBindings, WebSamplerBinding(source.binding))))
-                continue;
             if (source.type != rhi::BindingType::Sampler) {
                 const auto *view = Resolve(m_textureViews, source.texture);
                 if (!view) {
@@ -781,11 +706,18 @@ rhi::BindGroupHandle WebGpuRhiDevice::CreateBindGroup(const rhi::BindGroupDesc &
         SetError("invalid WebGPU binding layout handle");
         return {};
     }
-    return Register<rhi::BindGroupHandle>(m_bindGroups, m_freeBindGroup, {{}, desc});
+    auto group = CreateNativeBindGroup(&desc, layout->layout, {});
+    if (!group)
+        return {};
+    return Register<rhi::BindGroupHandle>(m_bindGroups, m_freeBindGroup, {std::move(group), desc});
 }
 
 rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::GraphicsPipelineDesc &desc)
 {
+    if (!desc.vertexInput.IsValid()) {
+        SetError("invalid WebGPU vertex input layout");
+        return {};
+    }
     const auto *vertex = Resolve(m_shaderModules, desc.vertexShader);
     const auto *fragment = Resolve(m_shaderModules, desc.fragmentShader);
     if (!vertex || !fragment || !desc.useDynamicRendering || !desc.HasValidRenderingContract() ||
@@ -803,8 +735,9 @@ rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::G
             SetError("invalid WebGPU graphics binding layout");
             return {};
         }
-        payload.layouts[index] =
-            CreateNativeBindingLayout(layout->desc, index == WebPushConstantGroup && desc.pushConstantBytes > 0);
+        payload.layouts[index] = index == WebPushConstantGroup && desc.pushConstantBytes > 0
+                                     ? CreateNativeBindingLayout(layout->desc, true)
+                                     : layout->layout;
         if (!payload.layouts[index])
             return {};
     }
@@ -852,6 +785,36 @@ rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::G
     native.layout = pipelineLayout;
     native.vertex.module = vertex->module;
     native.vertex.entryPoint = desc.vertexEntryPoint;
+    const auto &input = desc.vertexInput;
+    constexpr std::array<wgpu::VertexFormat, 18> vertexFormats{
+        wgpu::VertexFormat::Float32,   wgpu::VertexFormat::Float32x2, wgpu::VertexFormat::Float32x3,
+        wgpu::VertexFormat::Float32x4, wgpu::VertexFormat::Sint32,    wgpu::VertexFormat::Sint32x2,
+        wgpu::VertexFormat::Sint32x3,  wgpu::VertexFormat::Sint32x4,  wgpu::VertexFormat::Uint32,
+        wgpu::VertexFormat::Uint32x2,  wgpu::VertexFormat::Uint32x3,  wgpu::VertexFormat::Uint32x4,
+        wgpu::VertexFormat::Float16x2, wgpu::VertexFormat::Float16x4, wgpu::VertexFormat::Unorm8x4,
+        wgpu::VertexFormat::Snorm8x4,  wgpu::VertexFormat::Uint16x4,  wgpu::VertexFormat::Unorm16x4};
+    std::array<wgpu::VertexBufferLayout, rhi::VertexInputLayout::MaxBuffers> vertexBuffers{};
+    std::array<wgpu::VertexAttribute, rhi::VertexInputLayout::MaxAttributes> vertexAttributes{};
+    uint32_t nextAttribute = 0;
+    for (uint32_t slot = 0; slot < input.bufferCount; ++slot) {
+        auto &layout = vertexBuffers[slot];
+        layout.arrayStride = input.buffers[slot].stride;
+        layout.stepMode = input.buffers[slot].stepMode == rhi::VertexStepMode::Vertex ? wgpu::VertexStepMode::Vertex
+                                                                                      : wgpu::VertexStepMode::Instance;
+        layout.attributes = vertexAttributes.data() + nextAttribute;
+        for (uint32_t index = 0; index < input.attributeCount; ++index) {
+            const auto &attribute = input.attributes[index];
+            if (attribute.bufferSlot != slot)
+                continue;
+            auto &nativeAttribute = vertexAttributes[nextAttribute++];
+            nativeAttribute.shaderLocation = attribute.location;
+            nativeAttribute.format = vertexFormats[static_cast<size_t>(attribute.format)];
+            nativeAttribute.offset = attribute.offset;
+            ++layout.attributeCount;
+        }
+    }
+    native.vertex.bufferCount = input.bufferCount;
+    native.vertex.buffers = vertexBuffers.data();
     native.fragment = &fragmentState;
     native.primitive.topology = ToWebTopology(desc.topology);
     native.primitive.frontFace = ToWebFrontFace(desc.raster.frontFace);
@@ -877,15 +840,15 @@ rhi::ComputePipelineHandle WebGpuRhiDevice::CreateComputePipeline(const rhi::Com
     ComputePipelinePayload payload;
     payload.layoutCount = desc.bindingLayoutCount;
     payload.pushConstantBytes = desc.pushConstantBytes;
-    payload.usedBindings = ReflectUsedComputeBindings(shader->source);
     for (uint32_t index = 0; index < desc.bindingLayoutCount; ++index) {
         const auto *layout = Resolve(m_bindingLayouts, desc.bindingLayouts[index]);
         if (!layout) {
             SetError("invalid WebGPU compute binding layout");
             return {};
         }
-        payload.layouts[index] = CreateNativeBindingLayout(
-            layout->desc, index == WebPushConstantGroup && desc.pushConstantBytes > 0, &payload.usedBindings[index]);
+        payload.layouts[index] = index == WebPushConstantGroup && desc.pushConstantBytes > 0
+                                     ? CreateNativeBindingLayout(layout->desc, true)
+                                     : layout->layout;
     }
     if (desc.pushConstantBytes > 0 && payload.layoutCount == 0) {
         rhi::BindingLayoutDesc empty;
@@ -975,6 +938,12 @@ wgpu::Buffer WebGpuRhiDevice::GetNativeBuffer(rhi::BufferHandle handle) const no
     return payload ? payload->buffer : wgpu::Buffer{};
 }
 
+wgpu::TextureView WebGpuRhiDevice::GetNativeTextureView(rhi::TextureViewHandle handle) const noexcept
+{
+    const auto *payload = Resolve(m_textureViews, handle);
+    return payload ? payload->view : wgpu::TextureView{};
+}
+
 wgpu::Buffer WebGpuRhiDevice::CreatePushConstantBuffer(uint32_t byteSize, const void *data)
 {
     wgpu::BufferDescriptor desc;
@@ -1001,9 +970,7 @@ void WebGpuRhiDevice::BindGraphicsGroup(WebGpuGraphicsCommandContext &context, u
         if (native)
             context.pass.SetBindGroup(setIndex, native);
     } else if (group) {
-        auto native = CreateNativeBindGroup(&group->desc, pipeline->layouts[setIndex], {});
-        if (native)
-            context.pass.SetBindGroup(setIndex, native);
+        context.pass.SetBindGroup(setIndex, group->group);
     }
 }
 
@@ -1017,14 +984,11 @@ void WebGpuRhiDevice::BindComputeGroup(WebGpuComputeCommandContext &context, uin
         if (!context.pushConstantBuffer)
             return;
         auto native = CreateNativeBindGroup(group ? &group->desc : nullptr, pipeline->layouts[setIndex],
-                                            context.pushConstantBuffer, &pipeline->usedBindings[setIndex]);
+                                            context.pushConstantBuffer);
         if (native)
             context.pass.SetBindGroup(setIndex, native);
     } else if (group) {
-        auto native =
-            CreateNativeBindGroup(&group->desc, pipeline->layouts[setIndex], {}, &pipeline->usedBindings[setIndex]);
-        if (native)
-            context.pass.SetBindGroup(setIndex, native);
+        context.pass.SetBindGroup(setIndex, group->group);
     }
 }
 
@@ -1066,6 +1030,43 @@ void WebGpuRhiDevice::Draw(void *raw, uint32_t vertexCount, uint32_t instanceCou
                            uint32_t firstInstance)
 {
     static_cast<WebGpuGraphicsCommandContext *>(raw)->pass.Draw(vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+void WebGpuRhiDevice::BindVertexBuffer(void *raw, uint32_t slot, rhi::BufferHandle handle, uint64_t offset,
+                                       uint64_t byteSize)
+{
+    auto &context = *static_cast<WebGpuGraphicsCommandContext *>(raw);
+    const auto *buffer = context.device->Resolve(context.device->m_buffers, handle);
+    assert(buffer);
+    context.pass.SetVertexBuffer(slot, buffer->buffer, offset, byteSize ? byteSize : buffer->byteSize - offset);
+}
+
+void WebGpuRhiDevice::BindIndexBuffer(void *raw, rhi::BufferHandle handle, rhi::IndexFormat format, uint64_t offset,
+                                      uint64_t byteSize)
+{
+    auto &context = *static_cast<WebGpuGraphicsCommandContext *>(raw);
+    const auto *buffer = context.device->Resolve(context.device->m_buffers, handle);
+    assert(buffer);
+    context.pass.SetIndexBuffer(
+        buffer->buffer, format == rhi::IndexFormat::Uint16 ? wgpu::IndexFormat::Uint16 : wgpu::IndexFormat::Uint32,
+        offset, byteSize ? byteSize : buffer->byteSize - offset);
+}
+
+void WebGpuRhiDevice::DrawIndexed(void *raw, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
+                                  int32_t baseVertex, uint32_t firstInstance)
+{
+    static_cast<WebGpuGraphicsCommandContext *>(raw)->pass.DrawIndexed(indexCount, instanceCount, firstIndex,
+                                                                       baseVertex, firstInstance);
+}
+
+void WebGpuRhiDevice::DrawIndexedIndirect(void *raw, rhi::BufferHandle arguments, uint64_t offset, uint32_t drawCount,
+                                          uint32_t stride)
+{
+    auto &context = *static_cast<WebGpuGraphicsCommandContext *>(raw);
+    const auto *buffer = context.device->Resolve(context.device->m_buffers, arguments);
+    assert(buffer);
+    for (uint32_t index = 0; index < drawCount; ++index)
+        context.pass.DrawIndexedIndirect(buffer->buffer, offset + static_cast<uint64_t>(index) * stride);
 }
 
 void WebGpuRhiDevice::DrawIndirect(void *raw, rhi::BufferHandle arguments, uint64_t offset, uint32_t drawCount,
@@ -1160,6 +1161,71 @@ bool WebGpuRhiDevice::UpdateBuffer(void *raw, rhi::BufferHandle destination, uin
     context.encoder.CopyBufferToBuffer(snapshot, 0, target->buffer, offset, byteSize);
     // The encoded copy retains its own reference. Do not Destroy the buffer
     // while that command may still execute.
+    return true;
+}
+
+bool WebGpuRhiDevice::FillBuffer(void *raw, rhi::BufferHandle destination, uint64_t offset, uint64_t byteSize,
+                                 uint32_t value)
+{
+    auto &context = *static_cast<WebGpuTransferCommandContext *>(raw);
+    const auto *buffer = context.device->Resolve(context.device->m_buffers, destination);
+    if (!buffer || offset > buffer->byteSize || byteSize > buffer->byteSize - offset)
+        return false;
+    if (value == 0) {
+        context.encoder.ClearBuffer(buffer->buffer, offset, byteSize);
+        return true;
+    }
+    // WebGPU exposes only zero clears. A nonzero fill is an explicit upload
+    // snapshot; common activation/gradient clears stay on the device.
+    const std::vector<uint32_t> values(static_cast<size_t>(byteSize / 4), value);
+    return UpdateBuffer(raw, destination, offset, values.data(), byteSize);
+}
+
+bool WebGpuRhiDevice::CopyTextureToBuffer(void *raw, rhi::TextureHandle source, rhi::BufferHandle destination,
+                                          const rhi::TextureBufferCopyRegion &region)
+{
+    return CopyTextureBuffer(raw, source, destination, region, true);
+}
+
+bool WebGpuRhiDevice::CopyBufferToTexture(void *raw, rhi::BufferHandle source, rhi::TextureHandle destination,
+                                          const rhi::TextureBufferCopyRegion &region)
+{
+    return CopyTextureBuffer(raw, destination, source, region, false);
+}
+
+bool WebGpuRhiDevice::CopyTextureBuffer(void *raw, rhi::TextureHandle texture, rhi::BufferHandle handle,
+                                        const rhi::TextureBufferCopyRegion &region, bool toBuffer)
+{
+    auto &context = *static_cast<WebGpuTransferCommandContext *>(raw);
+    const auto *image = context.device->Resolve(context.device->m_textures, texture);
+    const auto *buffer = context.device->Resolve(context.device->m_buffers, handle);
+    if (!image || !buffer || region.bufferOffset > buffer->byteSize ||
+        !region.Fits(image->desc.format, buffer->byteSize - region.bufferOffset)) {
+        context.device->SetError("invalid WebGPU texture-buffer copy region");
+        return false;
+    }
+    const auto rowBytes = region.bytesPerRow
+                              ? region.bytesPerRow
+                              : region.width * rhi::TextureBufferCopyRegion::TexelBytes(image->desc.format);
+    if ((region.height > 1 || region.bytesPerRow) && rowBytes % 256 != 0) {
+        context.device->SetError("WebGPU command texture copies require a 256-byte row stride");
+        return false;
+    }
+    wgpu::TexelCopyBufferInfo copyBuffer;
+    copyBuffer.buffer = buffer->buffer;
+    copyBuffer.layout.offset = region.bufferOffset;
+    if (region.height > 1 || region.bytesPerRow)
+        copyBuffer.layout.bytesPerRow = rowBytes;
+    wgpu::TexelCopyTextureInfo copyTexture;
+    copyTexture.texture = image->texture;
+    copyTexture.mipLevel = region.textureMip;
+    copyTexture.origin = {0, 0, region.textureLayer};
+    copyTexture.aspect = ToWebAspect(region.aspect);
+    wgpu::Extent3D size{region.width, region.height, 1};
+    if (toBuffer)
+        context.encoder.CopyTextureToBuffer(&copyTexture, &copyBuffer, &size);
+    else
+        context.encoder.CopyBufferToTexture(&copyBuffer, &copyTexture, &size);
     return true;
 }
 

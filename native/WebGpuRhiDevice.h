@@ -96,6 +96,7 @@ class WebGpuRhiDevice final : public rhi::Device
     /// Narrow bridge for browser-native render passes that consume buffers
     /// produced by backend-neutral compute systems.
     [[nodiscard]] wgpu::Buffer GetNativeBuffer(rhi::BufferHandle handle) const noexcept;
+    [[nodiscard]] wgpu::TextureView GetNativeTextureView(rhi::TextureViewHandle handle) const noexcept;
     [[nodiscard]] wgpu::Device NativeDevice() const noexcept
     {
         return m_device;
@@ -134,7 +135,6 @@ class WebGpuRhiDevice final : public rhi::Device
     struct ShaderModulePayload final
     {
         wgpu::ShaderModule module;
-        std::string source;
     };
 
     struct BindingLayoutPayload final
@@ -161,7 +161,6 @@ class WebGpuRhiDevice final : public rhi::Device
     {
         wgpu::ComputePipeline pipeline;
         std::array<wgpu::BindGroupLayout, rhi::ComputePipelineDesc::MaxBindingLayouts> layouts{};
-        std::array<std::vector<uint32_t>, rhi::ComputePipelineDesc::MaxBindingLayouts> usedBindings{};
         uint32_t layoutCount = 0;
         uint32_t pushConstantBytes = 0;
     };
@@ -184,11 +183,9 @@ class WebGpuRhiDevice final : public rhi::Device
     [[nodiscard]] const Payload *Resolve(const std::vector<Slot<Payload>> &slots, HandleType handle) const noexcept;
 
     [[nodiscard]] wgpu::BindGroupLayout CreateNativeBindingLayout(const rhi::BindingLayoutDesc &desc,
-                                                                  bool includePushConstant,
-                                                                  const std::vector<uint32_t> *usedBindings = nullptr);
+                                                                  bool includePushConstant);
     [[nodiscard]] wgpu::BindGroup CreateNativeBindGroup(const rhi::BindGroupDesc *desc, wgpu::BindGroupLayout layout,
-                                                        wgpu::Buffer pushConstantBuffer,
-                                                        const std::vector<uint32_t> *usedBindings = nullptr);
+                                                        wgpu::Buffer pushConstantBuffer);
     [[nodiscard]] wgpu::Buffer CreatePushConstantBuffer(uint32_t byteSize, const void *data);
     void BindGraphicsGroup(WebGpuGraphicsCommandContext &context, uint32_t setIndex);
     void BindComputeGroup(WebGpuComputeCommandContext &context, uint32_t setIndex);
@@ -203,6 +200,14 @@ class WebGpuRhiDevice final : public rhi::Device
                      uint32_t firstInstance);
     static void DrawIndirect(void *context, rhi::BufferHandle arguments, uint64_t offset, uint32_t drawCount,
                              uint32_t stride);
+    static void BindVertexBuffer(void *context, uint32_t slot, rhi::BufferHandle buffer, uint64_t offset,
+                                 uint64_t byteSize);
+    static void BindIndexBuffer(void *context, rhi::BufferHandle buffer, rhi::IndexFormat format, uint64_t offset,
+                                uint64_t byteSize);
+    static void DrawIndexed(void *context, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
+                            int32_t baseVertex, uint32_t firstInstance);
+    static void DrawIndexedIndirect(void *context, rhi::BufferHandle arguments, uint64_t offset, uint32_t drawCount,
+                                    uint32_t stride);
 
     static void BindComputePipeline(void *context, rhi::ComputePipelineHandle pipeline);
     static void BindComputeGroup(void *context, rhi::ComputePipelineHandle pipeline, uint32_t setIndex,
@@ -216,6 +221,14 @@ class WebGpuRhiDevice final : public rhi::Device
                            const rhi::BufferCopyRegion &region);
     static bool UpdateBuffer(void *context, rhi::BufferHandle destination, uint64_t offset, const void *data,
                              uint64_t byteSize);
+    static bool FillBuffer(void *context, rhi::BufferHandle destination, uint64_t offset, uint64_t byteSize,
+                           uint32_t value);
+    static bool CopyTextureToBuffer(void *context, rhi::TextureHandle source, rhi::BufferHandle destination,
+                                    const rhi::TextureBufferCopyRegion &region);
+    static bool CopyBufferToTexture(void *context, rhi::BufferHandle source, rhi::TextureHandle destination,
+                                    const rhi::TextureBufferCopyRegion &region);
+    static bool CopyTextureBuffer(void *context, rhi::TextureHandle texture, rhi::BufferHandle buffer,
+                                  const rhi::TextureBufferCopyRegion &region, bool toBuffer);
     static void CopyTexture(void *context, rhi::TextureHandle source, rhi::TextureHandle destination,
                             const rhi::TextureCopyRegion &region);
     static void ResolveTexture(void *context, rhi::TextureHandle source, rhi::TextureHandle destination,
