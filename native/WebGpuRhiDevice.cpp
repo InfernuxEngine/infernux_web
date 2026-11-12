@@ -1,5 +1,7 @@
 #include "WebGpuRhiDevice.h"
 
+#include <emscripten.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -268,7 +270,7 @@ const rhi::GraphicsCommandEncoder::Dispatch WebGpuRhiDevice::s_graphicsDispatch 
 const rhi::ComputeCommandEncoder::DispatchTable WebGpuRhiDevice::s_computeDispatch = {
     &WebGpuRhiDevice::BindComputePipeline,  &WebGpuRhiDevice::BindComputeGroup,
     &WebGpuRhiDevice::PushComputeConstants, &WebGpuRhiDevice::Dispatch,
-    &WebGpuRhiDevice::DispatchIndirect,
+    &WebGpuRhiDevice::DispatchIndirect,     &WebGpuRhiDevice::CanRecordCompute,
 };
 
 const rhi::TransferCommandEncoder::DispatchTable WebGpuRhiDevice::s_transferDispatch = {
@@ -864,6 +866,7 @@ rhi::ComputePipelineHandle WebGpuRhiDevice::CreateComputePipeline(const rhi::Com
         return {};
     }
     ComputePipelinePayload payload;
+    payload.resourceLayout = desc.bindingLayouts[0];
     payload.layoutCount = desc.bindingLayoutCount;
     payload.pushConstantBytes = desc.pushConstantBytes;
     for (uint32_t index = 0; index < desc.bindingLayoutCount; ++index) {
@@ -907,10 +910,40 @@ bool WebGpuRhiDevice::WriteBuffer(rhi::BufferHandle handle, uint64_t offset, con
     return true;
 }
 
-bool WebGpuRhiDevice::ReadBuffer(rhi::BufferHandle, uint64_t, void *, uint64_t)
+bool WebGpuRhiDevice::ReadBuffer(rhi::BufferHandle handle, uint64_t offset, void *data, uint64_t byteSize)
 {
-    SetError("WebGPU buffer readback is asynchronous and is not exposed by the synchronous RHI contract");
-    return false;
+    const auto *payload = Resolve(m_buffers, handle);
+    if (!payload || !data || !byteSize || offset % 4 || byteSize % 4 || offset > payload->byteSize ||
+        byteSize > payload->byteSize - offset || !(payload->buffer.GetUsage() & wgpu::BufferUsage::MapRead)) {
+        SetError("invalid WebGPU readback buffer range");
+        return false;
+    }
+    // Keep the native buffer, not a pointer into the resource table, across
+    // the browser event-loop yield. Mapping has an eight-byte offset alignment.
+    const auto buffer = payload->buffer;
+    const auto mapOffset = offset & ~uint64_t{7};
+    const auto mapBytes = byteSize + offset - mapOffset;
+    wgpu::MapAsyncStatus status = wgpu::MapAsyncStatus::Error;
+    bool ready = false;
+    buffer.MapAsync(wgpu::MapMode::Read, mapOffset, mapBytes, wgpu::CallbackMode::AllowSpontaneous,
+                    [&](wgpu::MapAsyncStatus value, wgpu::StringView) {
+                        status = value;
+                        ready = true;
+                    });
+    while (!ready)
+        emscripten_sleep(0);
+    if (status != wgpu::MapAsyncStatus::Success) {
+        SetError("WebGPU readback mapping failed");
+        return false;
+    }
+    const auto *mapped = static_cast<const uint8_t *>(buffer.GetConstMappedRange(mapOffset, mapBytes));
+    const bool copied = mapped != nullptr;
+    if (copied)
+        std::memcpy(data, mapped + offset - mapOffset, static_cast<size_t>(byteSize));
+    buffer.Unmap();
+    if (!copied)
+        SetError("WebGPU mapped readback copy failed");
+    return copied;
 }
 
 #define INFERNUX_WEB_RELEASE(Type, member, freeMember)                                                                 \
@@ -1118,6 +1151,16 @@ void WebGpuRhiDevice::BindComputePipeline(void *raw, rhi::ComputePipelineHandle 
         context.device->BindComputeGroup(context, index);
 }
 
+bool WebGpuRhiDevice::CanRecordCompute(void *raw, rhi::ComputePipelineHandle pipeline, rhi::BindGroupHandle group)
+{
+    const auto &context = *static_cast<WebGpuComputeCommandContext *>(raw);
+    if (!context.device || !context.pass)
+        return false;
+    const auto *program = context.device->Resolve(context.device->m_computePipelines, pipeline);
+    const auto *bindings = context.device->Resolve(context.device->m_bindGroups, group);
+    return program && bindings && program->resourceLayout == bindings->desc.layout;
+}
+
 void WebGpuRhiDevice::BindComputeGroup(void *raw, rhi::ComputePipelineHandle pipeline, uint32_t setIndex,
                                        rhi::BindGroupHandle group)
 {
@@ -1185,6 +1228,8 @@ bool WebGpuRhiDevice::UpdateBuffer(void *raw, rhi::BufferHandle destination, uin
     std::memcpy(mapped, data, static_cast<size_t>(byteSize));
     snapshot.Unmap();
     context.encoder.CopyBufferToBuffer(snapshot, 0, target->buffer, offset, byteSize);
+    context.uploadStagingBytes += byteSize;
+    ++context.uploadAllocations;
     // The encoded copy retains its own reference. Do not Destroy the buffer
     // while that command may still execute.
     return true;

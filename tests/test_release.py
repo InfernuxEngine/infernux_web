@@ -1,8 +1,10 @@
 """Packaging tests run without installing Infernux or a platform SDK."""
 
 import json
+from io import BytesIO
 import shutil
 from pathlib import Path
+from runpy import run_path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -43,6 +45,25 @@ def _python_runtime_manifest():
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_native_build_reuses_its_pinned_webgpu_port(self):
+        source = Path(__file__).resolve().parents[1]
+        build = run_path(str(source / "native/build.py"))
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            request = patch.dict(build["_prepare_webgpu_port"].__globals__, {
+                "urlopen": lambda url, timeout: BytesIO(url.encode("utf-8")),
+            })
+            with request:
+                port = build["_prepare_webgpu_port"](directory)
+            self.assertEqual(port.name, f"emdawnwebgpu-{build['WEBGPU_RELEASE']}.remoteport.py")
+            self.assertEqual(
+                port.read_text(encoding="utf-8"),
+                f"https://github.com/google/dawn/releases/download/{build['WEBGPU_RELEASE']}/{port.name}",
+            )
+            with patch.dict(build["_prepare_webgpu_port"].__globals__, {"urlopen": None}):
+                self.assertEqual(build["_prepare_webgpu_port"](directory), port)
+            self.assertEqual(tuple(port.parent.iterdir()), (port,))
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

@@ -48,6 +48,8 @@ struct WebGpuTransferCommandContext final
 {
     WebGpuRhiDevice *device = nullptr;
     wgpu::CommandEncoder encoder;
+    uint64_t uploadStagingBytes = 0;
+    uint64_t uploadAllocations = 0;
 };
 
 class WebGpuRhiDevice final : public rhi::Device
@@ -168,6 +170,7 @@ class WebGpuRhiDevice final : public rhi::Device
         std::array<wgpu::BindGroupLayout, rhi::ComputePipelineDesc::MaxBindingLayouts> layouts{};
         uint32_t layoutCount = 0;
         uint32_t pushConstantBytes = 0;
+        rhi::BindingLayoutHandle resourceLayout;
     };
 
     template <typename Payload> struct Slot final
@@ -215,6 +218,7 @@ class WebGpuRhiDevice final : public rhi::Device
                                     uint32_t stride);
 
     static void BindComputePipeline(void *context, rhi::ComputePipelineHandle pipeline);
+    static bool CanRecordCompute(void *context, rhi::ComputePipelineHandle pipeline, rhi::BindGroupHandle group);
     static void BindComputeGroup(void *context, rhi::ComputePipelineHandle pipeline, uint32_t setIndex,
                                  rhi::BindGroupHandle group);
     static void PushComputeConstants(void *context, rhi::ComputePipelineHandle pipeline, uint32_t byteSize,

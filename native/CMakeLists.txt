@@ -16,6 +16,12 @@ set(INFERNUX_WEB_NUMPY_PAYLOAD_ROOT "" CACHE PATH
     "Exact NumPy static archives, registration source, and preload tree")
 set(INFERNUX_WEB_HOST_PYTHON "" CACHE FILEPATH
     "Absolute host Python used by Web configure/build tools")
+set(INFERNUX_WEBGPU_PORT "" CACHE FILEPATH
+    "Pinned Emdawnwebgpu port prepared by native/build.py")
+if(NOT EXISTS "${INFERNUX_WEBGPU_PORT}")
+    message(FATAL_ERROR "Build through native/build.py or provide INFERNUX_WEBGPU_PORT")
+endif()
+set(_webgpu_port "--use-port=${INFERNUX_WEBGPU_PORT}")
 set(INFERNUX_WEB_PLAYER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/publish/player" CACHE PATH
     "Build-tree destination for the precompiled Web Player payload")
 set(INFERNUX_ENGINE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." CACHE PATH
@@ -193,6 +199,7 @@ add_executable(InfernuxWebPlayerHost
     "${_numpy_static_registry}"
     InfernuxWebHostModule.cpp
     WebGpuRhiDevice.cpp
+    WebGpuComputeQueue.cpp
     WebParticleRuntime.cpp
     WebPostProcessRenderer.cpp
     WebIndexPacking.cpp
@@ -500,7 +507,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
 endif()
 
 target_compile_options(InfernuxWebPlayerHost PRIVATE
-    "--use-port=emdawnwebgpu"
+    "${_webgpu_port}"
     "-sUSE_ZLIB=1"
     "-sUSE_BZIP2=1"
     "-sUSE_SQLITE3=1"
@@ -513,7 +520,7 @@ if(INFERNUX_WEB_LINK_ENGINE_RUNTIME)
     target_compile_options(InfernuxWebPlayerHost PRIVATE "-fwasm-exceptions")
 endif()
 target_link_options(InfernuxWebPlayerHost PRIVATE
-    "--use-port=emdawnwebgpu"
+    "${_webgpu_port}"
     "-sUSE_ZLIB=1"
     "-sUSE_BZIP2=1"
     "-sUSE_SQLITE3=1"
@@ -524,6 +531,8 @@ target_link_options(InfernuxWebPlayerHost PRIVATE
     "-sFORCE_FILESYSTEM=1"
     "-sENVIRONMENT=web"
     "-sEXIT_RUNTIME=0"
+    "-sJSPI=1"
+    "-sJSPI_EXPORTS=['infernux_web_start','infernux_web_frame']"
     $<$<BOOL:${INFERNUX_WEB_LINK_ENGINE_RUNTIME}>:-fwasm-exceptions>
     "-sEXPORTED_RUNTIME_METHODS=['ccall','FS','addRunDependency','removeRunDependency','abort']"
     "--preload-file=${_python_assets}@/usr/local"

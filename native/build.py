@@ -5,6 +5,25 @@ from __future__ import annotations
 import argparse
 import subprocess
 from pathlib import Path
+from urllib.request import urlopen
+
+
+WEBGPU_RELEASE = "v20260423.175430"
+
+
+def _prepare_webgpu_port(build_root: Path) -> Path:
+    """Use the same Dawn header/JS pair in local builds and release CI."""
+    port = build_root / "toolchain" / f"emdawnwebgpu-{WEBGPU_RELEASE}.remoteport.py"
+    if not port.is_file():
+        port.parent.mkdir(parents=True, exist_ok=True)
+        with urlopen(
+            f"https://github.com/google/dawn/releases/download/{WEBGPU_RELEASE}/{port.name}", timeout=30,
+        ) as response:
+            contents = response.read()
+        temporary = port.with_suffix(".tmp")
+        temporary.write_bytes(contents)
+        temporary.replace(port)
+    return port
 
 
 def main() -> None:
@@ -23,6 +42,7 @@ def main() -> None:
     args = parser.parse_args()
     source = Path(__file__).resolve().parent
     build_root = args.build_root.resolve()
+    webgpu_port = _prepare_webgpu_port(build_root)
     player_output = (
         args.player_output.resolve()
         if args.player_output is not None
@@ -37,6 +57,7 @@ def main() -> None:
         f"-DINFERNUX_WEB_PYTHON_RUNTIME_MANIFEST={args.python_runtime_manifest.resolve()}",
         f"-DINFERNUX_WEB_NUMPY_PAYLOAD_ROOT={args.numpy_payload_root.resolve()}",
         f"-DINFERNUX_WEB_HOST_PYTHON={args.host_python.resolve()}",
+        f"-DINFERNUX_WEBGPU_PORT={webgpu_port}",
         f"-DINFERNUX_WEB_PLAYER_OUTPUT_DIR={player_output}",
     ], check=True)
     subprocess.run(["cmake", "--build", str(build_root),

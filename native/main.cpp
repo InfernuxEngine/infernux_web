@@ -72,6 +72,22 @@ EM_JS(int, InfernuxWebFixedCanvasHeight, (), {
 // Use the Emscripten terminal error path so the host's onAbort handler ends
 // loading, and startup cannot continue after a failed runtime contract.
 EM_JS(void, InfernuxWebAbortStartup, (const char *reason), { abort(UTF8ToString(reason)); });
+
+EM_JS(void, InfernuxWebStartRuntime, (), {
+    // Only the suspended frame owns gameplay/rendering work. Schedule its
+    // successor after it returns, including an explicit GPU/IO wait.
+    const fail = error => abort(error instanceof Error ? error.message : String(error));
+    const frame = async () => {
+        try {
+            await Module.ccall("infernux_web_frame", null, [], [], {async: true});
+            requestAnimationFrame(frame);
+        } catch (error) { fail(error); }
+    };
+    Promise.resolve()
+        .then(() => Module.ccall("infernux_web_start", null, [], [], {async: true}))
+        .then(() => requestAnimationFrame(frame))
+        .catch(fail);
+});
 // clang-format on
 
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
@@ -111,6 +127,7 @@ std::array<double, 32> g_gamepadTimestamps{};
 std::unordered_map<int, std::pair<float, float>> g_pointerPositions;
 double g_lastFrameTimeMilliseconds = 0.0;
 bool g_runtimeFrameFailed = false;
+bool g_viewportDirty = false;
 bool g_splashActive = false;
 double g_safeAreaLeft = 0.0;
 double g_safeAreaTop = 0.0;
@@ -509,7 +526,7 @@ void ResizeCanvas()
 
 extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebResizeCanvas()
 {
-    ResizeCanvas();
+    g_viewportDirty = true;
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebSetRenderDiagnostic(int feature, int enabled)
@@ -546,7 +563,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebViewportChanged(double safeLeft,
     g_safeAreaBottom = std::max(0.0, safeBottom);
     g_keyboardInsetKnown = keyboardInsetKnown != 0;
     g_keyboardInset = g_keyboardInsetKnown ? std::max(0.0, keyboardInset) : 0.0;
-    ResizeCanvas();
+    g_viewportDirty = true;
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebPageLifecycle(int active)
@@ -568,7 +585,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebPageLifecycle(int active)
 
 EM_BOOL OnResize(int, const EmscriptenUiEvent *, void *)
 {
-    ResizeCanvas();
+    g_viewportDirty = true;
     return EM_TRUE;
 }
 
@@ -931,6 +948,10 @@ bool InitializePython()
 
 void Frame()
 {
+    if (g_viewportDirty) {
+        g_viewportDirty = false;
+        ResizeCanvas();
+    }
     const double frameTimeMilliseconds = emscripten_get_now();
     const double wallDeltaSeconds =
         g_lastFrameTimeMilliseconds > 0.0 ? (frameTimeMilliseconds - g_lastFrameTimeMilliseconds) / 1000.0 : 0.0;
@@ -1264,10 +1285,19 @@ void StartSurface()
     std::printf("INFERNUX_WEBGPU_DEVICE_READY format=%d\n", static_cast<int>(g_surfaceFormat));
     g_lastFrameTimeMilliseconds = emscripten_get_now();
     infernux::InputManager::Instance().BeginFrame();
-    emscripten_set_main_loop(Frame, 0, false);
 }
 
 } // namespace
+
+extern "C" EMSCRIPTEN_KEEPALIVE void infernux_web_start()
+{
+    StartSurface();
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void infernux_web_frame()
+{
+    Frame();
+}
 
 int main()
 {
@@ -1342,7 +1372,7 @@ int main()
                         return;
                     }
                     g_device = std::move(device);
-                    StartSurface();
+                    InfernuxWebStartRuntime();
                 });
         });
     return 0;

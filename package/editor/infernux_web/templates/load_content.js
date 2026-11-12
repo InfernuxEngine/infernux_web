@@ -1,5 +1,8 @@
 Module.infernuxPresentation = @INFERNUX_WEB_PRESENTATION@;
 Module.preRun = [...(Module.preRun || []), function () {
+  if (typeof WebAssembly.Suspending !== 'function' || typeof WebAssembly.promising !== 'function') {
+    Module.abort('This game requires a browser with WebAssembly Promise Integration. Please update your browser.');
+  }
   Module.addRunDependency('infernux-project-content');
   fetch('infernux-player.@INFERNUX_WEB_ASSET_REVISION@.inxpkg')
     .then(response => {
