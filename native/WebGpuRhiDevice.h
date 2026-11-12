@@ -56,6 +56,11 @@ class WebGpuRhiDevice final : public rhi::Device
     WebGpuRhiDevice(wgpu::Device device, wgpu::Queue queue, uint32_t maxStorageBuffersPerStage);
     ~WebGpuRhiDevice() override;
 
+    [[nodiscard]] rhi::ShaderSourceLanguage GetShaderSourceLanguage() const noexcept override
+    {
+        return rhi::ShaderSourceLanguage::Wgsl;
+    }
+
     WebGpuRhiDevice(const WebGpuRhiDevice &) = delete;
     WebGpuRhiDevice &operator=(const WebGpuRhiDevice &) = delete;
 
