@@ -55,7 +55,6 @@ _RUNTIME_PACKAGE_FIELDS = frozenset(
 # Browser/WASM does not ship the native Numba/LLVM payload.  Set the explicit
 # compatibility profile before project modules are imported.
 os.environ.setdefault("INFERNUX_WEB_RUNTIME", "1")
-os.environ.setdefault("INFERNUX_WEB_CPU_COMPUTE", "1")
 if os.path.isdir(_player_python) and _player_python not in sys.path:
     sys.path.insert(0, _player_python)
 if os.path.isdir(_player_root):
@@ -642,7 +641,8 @@ def _prepare_player_runtime() -> None:
     # create retained text geometry. The browser has no desktop GUI bootstrap.
     host.screen_ui_set_default_font(engine_font_path)
 
-    session = PlayerRuntimeSession(asset_database=_player_asset_database)
+    session = PlayerRuntimeSession(asset_database=_player_asset_database, frame_work=host.frame_work())
+    session._infernux_compute_host = host.acquire_compute_host()
     from infernux.application import Application
     from infernux.core.assets import AssetManager
 
@@ -1682,6 +1682,11 @@ def infernux_web_tick(delta_time: float) -> bool:
     _complete_pending_audio_activation()
     if not _player_activated:
         return False
+    from infernux.compute import _collect_commands
+
+    compute_host = _player_session._infernux_compute_host
+    if compute_host is not None:
+        _collect_commands(compute_host)
     _player_session.tick(float(delta_time))
     _process_screen_ui_events(delta_time)
     # UI listeners may replace scenes. Dispatch after hit-test traversal and

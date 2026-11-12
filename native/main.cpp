@@ -5,6 +5,7 @@
 
 #include <function/renderer/rhi/RhiDescriptors.h>
 
+#include <core/threading/FrameWorkOwner.h>
 #include <core/threading/JobSystem.h>
 #include <function/audio/AudioEngine.h>
 #include <function/renderer/FullscreenRenderer.h>
@@ -20,12 +21,14 @@
 
 #include "InfernuxWebHostModule.h"
 #include "WebFullscreenShaderContract.h"
+#include "WebGpuComputeQueue.h"
 #include "WebGpuRhiDevice.h"
 #include "WebKeyboard.h"
 #include "WebParticleRuntime.h"
 #include "WebPostProcessRenderer.h"
 #include "WebSceneRenderer.h"
 #include "WebScreenUIRenderer.h"
+#include <function/renderer/rhi/RhiComputeHost.h>
 
 #include <algorithm>
 #include <array>
@@ -103,6 +106,10 @@ wgpu::Device g_device;
 wgpu::Queue g_queue;
 wgpu::Surface g_surface;
 std::unique_ptr<infernux::web::WebGpuRhiDevice> g_rhi;
+std::shared_ptr<infernux::rhi::ComputeHostServices> g_computeServices;
+std::unique_ptr<infernux::web::WebGpuComputeQueue> g_computeQueue;
+std::unique_ptr<infernux::rhi::ComputeHost> g_computeHost;
+infernux::FrameWorkOwner g_frameWork;
 infernux::FullscreenRenderer g_fullscreenRenderer;
 infernux::FullscreenPipelineKey g_fullscreenPipelineKey;
 infernux::web::WebSceneRenderer g_sceneRenderer;
@@ -849,6 +856,12 @@ bool CreateRhiPipeline()
         return false;
 
     g_rhi = std::make_unique<infernux::web::WebGpuRhiDevice>(g_device, g_queue, g_webGpuStorageBufferLimit);
+    g_computeServices = std::make_shared<infernux::rhi::ComputeHostServices>();
+    g_computeServices->alive = true;
+    g_computeQueue = std::make_unique<infernux::web::WebGpuComputeQueue>(*g_rhi);
+    g_computeHost = std::make_unique<infernux::rhi::ComputeHost>(*g_rhi, *g_computeQueue, g_computeServices);
+    InfernuxWebSetComputeHost(g_computeHost.get());
+    InfernuxWebSetFrameWork(&g_frameWork);
     g_fullscreenRenderer.Initialize(std::make_shared<WebFullscreenRendererHost>(*g_rhi));
     g_fullscreenPipelineKey.shaderName = "Web Host";
     g_fullscreenPipelineKey.colorFormat = infernux::rhi::PixelFormat::RGBA16SFloat;
@@ -948,6 +961,8 @@ bool InitializePython()
 
 void Frame()
 {
+    g_frameWork.BeginOpportunity();
+    g_computeQueue->Collect();
     if (g_viewportDirty) {
         g_viewportDirty = false;
         ResizeCanvas();
@@ -984,6 +999,7 @@ void Frame()
         }
     }
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+    g_frameWork.AdvanceEarly();
     if (!g_runtimeFrameFailed && !g_acceptancePaused && !g_splashActive) {
         auto &sceneManager = infernux::SceneManager::Instance();
         // SceneManager applies the project's maximum delta and time scale.
@@ -1012,6 +1028,7 @@ void Frame()
     }
     wgpu::SurfaceTexture surfaceTexture;
     g_surface.GetCurrentTexture(&surfaceTexture);
+    bool foregroundSubmitted = false;
     if (surfaceTexture.texture) {
         wgpu::TextureView view = surfaceTexture.texture.CreateView();
         wgpu::RenderPassColorAttachment colorAttachment;
@@ -1143,10 +1160,18 @@ void Frame()
         presentPass.End();
         wgpu::CommandBuffer commands = encoder.Finish();
         g_queue.Submit(1, &commands);
+        foregroundSubmitted = true;
         if (g_particleRuntimeReady)
             g_particleRuntime.NotifySubmission();
     }
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+    g_frameWork.AdvanceLate([foregroundSubmitted] {
+        if (!foregroundSubmitted)
+            return infernux::FrameGpuAvailability::ForegroundDeferred;
+        g_computeQueue->Collect();
+        return g_computeQueue->GetPendingSubmissionCount() ? infernux::FrameGpuAvailability::BackgroundPending
+                                                           : infernux::FrameGpuAvailability::Ready;
+    });
     if (pauseAcceptanceAfterRender) {
         auto &sceneManager = infernux::SceneManager::Instance();
         sceneManager.Pause();
@@ -1296,7 +1321,13 @@ extern "C" EMSCRIPTEN_KEEPALIVE void infernux_web_start()
 
 extern "C" EMSCRIPTEN_KEEPALIVE void infernux_web_frame()
 {
-    Frame();
+    try {
+        Frame();
+        g_frameWork.EndOpportunity();
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "INFERNUX_WEB_FRAME_FAILED %s\n", error.what());
+        InfernuxWebAbortStartup(error.what());
+    }
 }
 
 int main()

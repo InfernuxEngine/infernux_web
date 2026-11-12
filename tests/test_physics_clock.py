@@ -79,12 +79,16 @@ def test_physics_configuration_preserves_simulation_clock(monkeypatch, tmp_path,
 
 
 def test_player_session_receives_unscaled_browser_elapsed_time(monkeypatch):
+    compute = types.ModuleType("infernux.compute")
+    collected = []
+    compute._collect_commands = collected.append
+    monkeypatch.setitem(sys.modules, "infernux.compute", compute)
     events = types.ModuleType("infernux.engine.runtime_event_queue")
     events.drain = lambda: None
     monkeypatch.setitem(sys.modules, "infernux.engine.runtime_event_queue", events)
     ticks = []
     tick = _function("infernux_web_tick", {
-        "_player_session": types.SimpleNamespace(tick=ticks.append),
+        "_player_session": types.SimpleNamespace(tick=ticks.append, _infernux_compute_host=17),
         "_web_splash": None, "_player_activated": True, "_frame_count": 0,
         "_complete_pending_audio_activation": lambda: None,
         "_process_screen_ui_events": lambda delta: None,
@@ -92,3 +96,4 @@ def test_player_session_receives_unscaled_browser_elapsed_time(monkeypatch):
     })
     assert tick(0.4) is False
     assert ticks == [0.4]
+    assert collected == [17]

@@ -5,7 +5,9 @@
 #include "WebParticleRuntime.h"
 #include "WebScreenUIRenderer.h"
 
+#include <core/threading/FrameWorkOwner.h>
 #include <function/renderer/gui/InxTextLayout.h>
+#include <function/renderer/rhi/RhiComputeHost.h>
 #include <function/resources/InxTexture/InxTexture.h>
 #include <platform/filesystem/InxPack.h>
 #include <platform/input/InputManager.h>
@@ -40,6 +42,7 @@
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,9 +54,29 @@ std::mutex g_shaderMutex;
 std::unordered_map<std::string, std::string> g_shaderSources;
 infernux::web::WebParticleRuntime *g_particleRuntime = nullptr;
 infernux::web::WebScreenUIRenderer *g_screenUIRenderer = nullptr;
+infernux::rhi::ComputeHost *g_computeHost = nullptr;
+infernux::FrameWorkOwner *g_frameWork = nullptr;
 bool g_textInputActive = false;
 
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+PyObject *AcquireComputeHost(PyObject *, PyObject *)
+{
+    try {
+        if (g_computeHost == nullptr)
+            throw std::runtime_error("WebGPU compute is not initialized");
+        g_computeHost->RequireAlive();
+        return pybind11::cast(std::make_unique<infernux::rhi::ComputeHost>(*g_computeHost)).release().ptr();
+    } catch (const std::exception &error) {
+        PyErr_SetString(PyExc_RuntimeError, error.what());
+        return nullptr;
+    }
+}
+
+PyObject *GetFrameWork(PyObject *, PyObject *)
+{
+    return pybind11::cast(g_frameWork, pybind11::return_value_policy::reference).release().ptr();
+}
+
 struct ScreenUITextureLoad
 {
     infernux::web::WebTextureAssetLoad load;
@@ -822,6 +845,10 @@ PyObject *ScreenUIReleaseTexture(PyObject *, PyObject *arguments)
 }
 
 PyMethodDef kMethods[] = {
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+    {"acquire_compute_host", AcquireComputeHost, METH_NOARGS, "Borrow the renderer's WebGPU compute services."},
+    {"frame_work", GetFrameWork, METH_NOARGS, "Borrow the browser frame's native work owner."},
+#endif
     {"read_entry", ReadPackageEntry, METH_VARARGS,
      "Read and validate one entry from the native Infernux Player container."},
     {"extract_package", ExtractPackage, METH_VARARGS, "Validate and extract one native Infernux Player container."},
@@ -896,6 +923,16 @@ void InfernuxWebSetParticleRuntime(infernux::web::WebParticleRuntime *runtime) n
 void InfernuxWebSetScreenUIRenderer(infernux::web::WebScreenUIRenderer *renderer) noexcept
 {
     g_screenUIRenderer = renderer;
+}
+
+void InfernuxWebSetComputeHost(infernux::rhi::ComputeHost *host) noexcept
+{
+    g_computeHost = host;
+}
+
+void InfernuxWebSetFrameWork(infernux::FrameWorkOwner *owner) noexcept
+{
+    g_frameWork = owner;
 }
 
 void InfernuxWebEndTextInput() noexcept
