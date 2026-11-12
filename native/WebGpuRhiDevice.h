@@ -14,8 +14,8 @@ namespace infernux::web
 {
 
 inline constexpr uint32_t WebSamplerBindingBase = 500;
-inline constexpr uint32_t WebPushConstantGroup = 0;
-inline constexpr uint32_t WebPushConstantBinding = 999;
+inline constexpr uint32_t WebPushConstantGroup = rhi::RootConstantGroup;
+inline constexpr uint32_t WebPushConstantBinding = rhi::RootConstantBinding;
 
 [[nodiscard]] constexpr uint32_t WebSamplerBinding(uint32_t textureBinding) noexcept
 {
