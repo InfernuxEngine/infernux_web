@@ -1,4 +1,5 @@
 #include "WebSceneRenderer.h"
+#include "WebGpuRhiDevice.h"
 #include "WebTextureUpload.h"
 
 #include <core/types/ColorSpace.h>
@@ -6,6 +7,7 @@
 #include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/resources/InxMaterial/InxMaterial.h>
 #include <function/resources/InxTexture/InxTexture.h>
+#include <function/resources/ShaderAsset/SlangSceneBoundsModule.h>
 #include <function/resources/ShaderAsset/SlangSceneModule.h>
 #include <function/scene/Camera.h>
 #include <function/scene/GameObject.h>
@@ -14,7 +16,6 @@
 #include <function/scene/SceneManager.h>
 #include <function/scene/Transform.h>
 
-#include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
@@ -22,9 +23,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
-#include <cstring>
+#include <iterator>
 #include <limits>
-#include <optional>
 #include <stdexcept>
 
 namespace infernux::web
@@ -34,6 +34,12 @@ namespace
 
 constexpr uint32_t kLineVertexMarker = 0x4C494E45u;
 constexpr uint32_t kMaxPunctualLights = 8u;
+
+template <typename Cache> void RetireUnused(Cache &cache, uint64_t frame)
+{
+    for (auto entry = cache.begin(); entry != cache.end();)
+        entry = entry->second.lastFrame == frame ? std::next(entry) : cache.erase(entry);
+}
 
 const MaterialProperty *ResolvedMaterialProperty(const std::shared_ptr<InxMaterial> &material,
                                                  const std::shared_ptr<const RendererParameterBlock> &parameters,
@@ -176,23 +182,6 @@ bool Finite(const glm::vec3 &value)
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
 
-glm::mat4 SkinMatrix(const Vertex &vertex, const std::vector<glm::mat4> *palette)
-{
-    if (!palette)
-        return glm::mat4(1.0f);
-    glm::mat4 result(0.0f);
-    float totalWeight = 0.0f;
-    for (uint32_t slot = 0; slot < 4; ++slot) {
-        const float weight = vertex.boneWeights[slot];
-        const uint32_t bone = vertex.boneIndices[slot];
-        if (!(weight > 0.0f) || bone >= palette->size())
-            continue;
-        result += (*palette)[bone] * weight;
-        totalWeight += weight;
-    }
-    return totalWeight > 0.0f ? result : glm::mat4(1.0f);
-}
-
 uint64_t GrowCapacity(uint64_t required)
 {
     uint64_t capacity = 4096;
@@ -214,34 +203,51 @@ glm::mat4 ToWebClipSpace(const glm::mat4 &vulkanViewProjection)
 
 } // namespace
 
-bool WebSceneRenderer::Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::TextureFormat colorFormat,
-                                  uint32_t sceneSampleCount)
+bool WebSceneRenderer::Initialize(WebGpuRhiDevice &device, wgpu::TextureFormat colorFormat, uint32_t sceneSampleCount)
 {
+    static_assert(sizeof(Vertex) == 100);
+    static_assert(sizeof(WebDrawData) == 160);
+    static_assert(sizeof(WorldBounds) == 32);
+    static_assert(sizeof(CameraData) == 880);
     m_shaders.clear();
-    m_device = std::move(device);
-    m_queue = std::move(queue);
+    m_geometry.clear();
+    m_geometryBindings.clear();
+    m_drawRanges.clear();
+    m_rhi = &device;
+    m_device = device.NativeDevice();
+    m_queue = device.NativeQueue();
     m_colorFormat = colorFormat;
     m_sceneSampleCount = sceneSampleCount;
     if (!m_device || !m_queue || colorFormat == wgpu::TextureFormat::Undefined ||
         (sceneSampleCount != 1 && sceneSampleCount != 4))
         return false;
 
-    wgpu::BufferDescriptor cameraBufferDescriptor;
-    cameraBufferDescriptor.size = sizeof(CameraData);
-    cameraBufferDescriptor.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
-    m_cameraBuffer = m_device.CreateBuffer(&cameraBufferDescriptor);
-    if (!m_cameraBuffer)
+    auto buffer = [&](uint64_t bytes, wgpu::BufferUsage usage) {
+        wgpu::BufferDescriptor descriptor;
+        descriptor.size = bytes;
+        descriptor.usage = usage | wgpu::BufferUsage::CopyDst;
+        return m_device.CreateBuffer(&descriptor);
+    };
+    m_cameraBuffer = buffer(sizeof(CameraData), wgpu::BufferUsage::Uniform);
+    m_shadowMatrixBuffer = buffer(sizeof(glm::mat4), wgpu::BufferUsage::Storage);
+    m_shadowFitParametersBuffer = buffer(sizeof(ShadowFitParameters), wgpu::BufferUsage::Uniform);
+    const glm::mat4 identity(1.0f);
+    m_queue.WriteBuffer(m_shadowMatrixBuffer, 0, &identity, sizeof(identity));
+    m_drawDataCapacity = m_modelCapacity = m_boneCapacity = m_boundsCapacity = m_boundsTilesCapacity = 0;
+    m_drawDataBuffer = {};
+    m_modelBuffer = {};
+    m_boneBuffer = {};
+    m_boundsBuffer = {};
+    m_boundsTilesBuffer = {};
+    if (!m_cameraBuffer || !m_shadowMatrixBuffer || !m_shadowFitParametersBuffer ||
+        !EnsureBuffer(m_drawDataBuffer, m_drawDataCapacity, sizeof(WebDrawData), wgpu::BufferUsage::Storage) ||
+        !EnsureBuffer(m_modelBuffer, m_modelCapacity, sizeof(glm::mat4), wgpu::BufferUsage::Storage) ||
+        !EnsureBuffer(m_boneBuffer, m_boneCapacity, sizeof(glm::mat4), wgpu::BufferUsage::Storage) ||
+        !EnsureBuffer(m_boundsBuffer, m_boundsCapacity, sizeof(WorldBounds), wgpu::BufferUsage::Storage) ||
+        !EnsureBuffer(m_boundsTilesBuffer, m_boundsTilesCapacity, sizeof(WorldBounds), wgpu::BufferUsage::Storage))
         return false;
 
-    m_drawDataCapacity = sizeof(WebDrawData);
-    wgpu::BufferDescriptor drawDataBufferDescriptor;
-    drawDataBufferDescriptor.size = m_drawDataCapacity;
-    drawDataBufferDescriptor.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
-    m_drawDataBuffer = m_device.CreateBuffer(&drawDataBufferDescriptor);
-    if (!m_drawDataBuffer)
-        return false;
-
-    std::array<wgpu::BindGroupLayoutEntry, 4> cameraEntries{};
+    std::array<wgpu::BindGroupLayoutEntry, 6> cameraEntries{};
     cameraEntries[0].binding = 0;
     cameraEntries[0].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
     cameraEntries[0].buffer.type = wgpu::BufferBindingType::Uniform;
@@ -253,69 +259,72 @@ bool WebSceneRenderer::Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::
     cameraEntries[2].binding = 2;
     cameraEntries[2].visibility = wgpu::ShaderStage::Fragment;
     cameraEntries[2].sampler.type = wgpu::SamplerBindingType::Comparison;
-    cameraEntries[3].binding = 3;
-    cameraEntries[3].visibility = wgpu::ShaderStage::Vertex;
-    cameraEntries[3].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+    for (size_t i = 3; i < cameraEntries.size(); ++i) {
+        cameraEntries[i].binding = static_cast<uint32_t>(i);
+        cameraEntries[i].visibility = wgpu::ShaderStage::Vertex;
+        cameraEntries[i].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+    }
+    cameraEntries[3].visibility |= wgpu::ShaderStage::Fragment;
     cameraEntries[3].buffer.minBindingSize = sizeof(WebDrawData);
-    wgpu::BindGroupLayoutDescriptor cameraLayoutDescriptor;
-    cameraLayoutDescriptor.entryCount = cameraEntries.size();
-    cameraLayoutDescriptor.entries = cameraEntries.data();
-    m_cameraLayout = m_device.CreateBindGroupLayout(&cameraLayoutDescriptor);
+    cameraEntries[4].buffer.minBindingSize = sizeof(glm::mat4);
+    cameraEntries[5].buffer.minBindingSize = sizeof(WorldBounds);
+    wgpu::BindGroupLayoutDescriptor layoutDescriptor;
+    layoutDescriptor.entryCount = cameraEntries.size();
+    layoutDescriptor.entries = cameraEntries.data();
+    m_cameraLayout = m_device.CreateBindGroupLayout(&layoutDescriptor);
 
-    if (!m_cameraLayout || !CreateShadowResources() || !CreateMaterialTextureResources())
-        return false;
+    std::array<wgpu::BindGroupLayoutEntry, 4> shadowEntries{cameraEntries[0], cameraEntries[3], cameraEntries[4],
+                                                            cameraEntries[5]};
+    for (auto &entry : shadowEntries)
+        entry.visibility = wgpu::ShaderStage::Vertex;
+    layoutDescriptor.entryCount = shadowEntries.size();
+    layoutDescriptor.entries = shadowEntries.data();
+    m_shadowCameraLayout = m_device.CreateBindGroupLayout(&layoutDescriptor);
 
-    std::array<wgpu::BindGroupLayoutEntry, 2> shadowCameraEntries{};
-    shadowCameraEntries[0].binding = 0;
-    shadowCameraEntries[0].visibility = wgpu::ShaderStage::Vertex;
-    shadowCameraEntries[0].buffer.type = wgpu::BufferBindingType::Uniform;
-    shadowCameraEntries[0].buffer.minBindingSize = sizeof(CameraData);
-    shadowCameraEntries[1].binding = 3;
-    shadowCameraEntries[1].visibility = wgpu::ShaderStage::Vertex;
-    shadowCameraEntries[1].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
-    shadowCameraEntries[1].buffer.minBindingSize = sizeof(WebDrawData);
-    wgpu::BindGroupLayoutDescriptor shadowCameraLayoutDescriptor;
-    shadowCameraLayoutDescriptor.entryCount = shadowCameraEntries.size();
-    shadowCameraLayoutDescriptor.entries = shadowCameraEntries.data();
-    m_shadowCameraLayout = m_device.CreateBindGroupLayout(&shadowCameraLayoutDescriptor);
-    return m_shadowCameraLayout && CreateCameraBindGroups() && CreatePipelines();
+    std::array<wgpu::BindGroupLayoutEntry, 2> geometryEntries{};
+    for (size_t i = 0; i < geometryEntries.size(); ++i) {
+        geometryEntries[i].binding = static_cast<uint32_t>(i);
+        geometryEntries[i].visibility = wgpu::ShaderStage::Vertex;
+        geometryEntries[i].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+        geometryEntries[i].buffer.minBindingSize = sizeof(glm::mat4);
+    }
+    layoutDescriptor.entryCount = geometryEntries.size();
+    layoutDescriptor.entries = geometryEntries.data();
+    m_geometryLayout = m_device.CreateBindGroupLayout(&layoutDescriptor);
+    return m_cameraLayout && m_shadowCameraLayout && m_geometryLayout && CreateShadowResources() &&
+           CreateMaterialTextureResources() && CreateCameraBindGroups() && CreateShadowFitPipeline() &&
+           CreatePipelines();
 }
 
 bool WebSceneRenderer::CreateCameraBindGroups()
 {
-    if (!m_cameraLayout || !m_shadowCameraLayout || !m_cameraBuffer || !m_drawDataBuffer || !m_shadowView ||
-        !m_shadowSampler)
-        return false;
-
-    std::array<wgpu::BindGroupEntry, 4> cameraBindings{};
-    cameraBindings[0].binding = 0;
-    cameraBindings[0].buffer = m_cameraBuffer;
-    cameraBindings[0].size = sizeof(CameraData);
-    cameraBindings[1].binding = 1;
-    cameraBindings[1].textureView = m_shadowView;
-    cameraBindings[2].binding = 2;
-    cameraBindings[2].sampler = m_shadowSampler;
-    cameraBindings[3].binding = 3;
-    cameraBindings[3].buffer = m_drawDataBuffer;
-    cameraBindings[3].size = m_drawDataCapacity;
-    wgpu::BindGroupDescriptor cameraGroupDescriptor;
-    cameraGroupDescriptor.layout = m_cameraLayout;
-    cameraGroupDescriptor.entryCount = cameraBindings.size();
-    cameraGroupDescriptor.entries = cameraBindings.data();
-    m_cameraGroup = m_device.CreateBindGroup(&cameraGroupDescriptor);
-
-    std::array<wgpu::BindGroupEntry, 2> shadowCameraBindings{};
-    shadowCameraBindings[0].binding = 0;
-    shadowCameraBindings[0].buffer = m_cameraBuffer;
-    shadowCameraBindings[0].size = sizeof(CameraData);
-    shadowCameraBindings[1].binding = 3;
-    shadowCameraBindings[1].buffer = m_drawDataBuffer;
-    shadowCameraBindings[1].size = m_drawDataCapacity;
-    wgpu::BindGroupDescriptor shadowCameraGroupDescriptor;
-    shadowCameraGroupDescriptor.layout = m_shadowCameraLayout;
-    shadowCameraGroupDescriptor.entryCount = shadowCameraBindings.size();
-    shadowCameraGroupDescriptor.entries = shadowCameraBindings.data();
-    m_shadowCameraGroup = m_device.CreateBindGroup(&shadowCameraGroupDescriptor);
+    std::array<wgpu::BindGroupEntry, 6> bindings{};
+    bindings[0].binding = 0;
+    bindings[0].buffer = m_cameraBuffer;
+    bindings[0].size = sizeof(CameraData);
+    bindings[1].binding = 1;
+    bindings[1].textureView = m_shadowView;
+    bindings[2].binding = 2;
+    bindings[2].sampler = m_shadowSampler;
+    bindings[3].binding = 3;
+    bindings[3].buffer = m_drawDataBuffer;
+    bindings[3].size = m_drawDataCapacity;
+    bindings[4].binding = 4;
+    bindings[4].buffer = m_shadowMatrixBuffer;
+    bindings[4].size = sizeof(glm::mat4);
+    bindings[5].binding = 5;
+    bindings[5].buffer = m_boundsBuffer;
+    bindings[5].size = m_boundsCapacity;
+    wgpu::BindGroupDescriptor descriptor;
+    descriptor.layout = m_cameraLayout;
+    descriptor.entryCount = bindings.size();
+    descriptor.entries = bindings.data();
+    m_cameraGroup = m_device.CreateBindGroup(&descriptor);
+    const std::array<wgpu::BindGroupEntry, 4> shadowBindings{bindings[0], bindings[3], bindings[4], bindings[5]};
+    descriptor.layout = m_shadowCameraLayout;
+    descriptor.entryCount = shadowBindings.size();
+    descriptor.entries = shadowBindings.data();
+    m_shadowCameraGroup = m_device.CreateBindGroup(&descriptor);
     return m_cameraGroup && m_shadowCameraGroup;
 }
 
@@ -600,51 +609,22 @@ bool WebSceneRenderer::CreatePipelines()
         }
     }
 
-    std::array<wgpu::VertexAttribute, 14> attributes{};
-    attributes[0].format = wgpu::VertexFormat::Float32x3;
-    attributes[0].offset = offsetof(WebVertex, position);
-    attributes[0].shaderLocation = 0;
-    attributes[1].format = wgpu::VertexFormat::Float32x3;
-    attributes[1].offset = offsetof(WebVertex, normal);
-    attributes[1].shaderLocation = 1;
-    attributes[2].format = wgpu::VertexFormat::Float32x2;
-    attributes[2].offset = offsetof(WebVertex, uv);
-    attributes[2].shaderLocation = 2;
-    attributes[3].format = wgpu::VertexFormat::Float32x4;
-    attributes[3].offset = offsetof(WebVertex, color);
-    attributes[3].shaderLocation = 3;
-    attributes[4].format = wgpu::VertexFormat::Float32x4;
-    attributes[4].offset = offsetof(WebVertex, emission);
-    attributes[4].shaderLocation = 4;
-    attributes[5].format = wgpu::VertexFormat::Float32x4;
-    attributes[5].offset = offsetof(WebVertex, material);
-    attributes[5].shaderLocation = 5;
-    attributes[6].format = wgpu::VertexFormat::Float32x4;
-    attributes[6].offset = offsetof(WebVertex, surface);
-    attributes[6].shaderLocation = 6;
-    attributes[7].format = wgpu::VertexFormat::Float32x4;
-    attributes[7].offset = offsetof(WebVertex, tangent);
-    attributes[7].shaderLocation = 7;
-    attributes[8].format = wgpu::VertexFormat::Float32x2;
-    attributes[8].offset = offsetof(WebVertex, uv1);
-    attributes[8].shaderLocation = 8;
-    attributes[9].format = wgpu::VertexFormat::Float32x4;
-    attributes[9].offset = offsetof(WebVertex, textureUvSets0);
-    attributes[9].shaderLocation = 9;
-    attributes[10].format = wgpu::VertexFormat::Float32x2;
-    attributes[10].offset = offsetof(WebVertex, textureUvSets1);
-    attributes[10].shaderLocation = 10;
-    attributes[11].format = wgpu::VertexFormat::Float32x4;
-    attributes[11].offset = offsetof(WebVertex, metallicChannels);
-    attributes[11].shaderLocation = 11;
-    attributes[12].format = wgpu::VertexFormat::Float32x4;
-    attributes[12].offset = offsetof(WebVertex, smoothnessChannels);
-    attributes[12].shaderLocation = 12;
-    attributes[13].format = wgpu::VertexFormat::Float32x2;
-    attributes[13].offset = offsetof(WebVertex, materialSampling);
-    attributes[13].shaderLocation = 13;
+    std::array<wgpu::VertexAttribute, 8> attributes{};
+    const std::array<wgpu::VertexFormat, 8> formats = {wgpu::VertexFormat::Float32x3, wgpu::VertexFormat::Float32x3,
+                                                       wgpu::VertexFormat::Float32x4, wgpu::VertexFormat::Float32x3,
+                                                       wgpu::VertexFormat::Float32x2, wgpu::VertexFormat::Uint32x4,
+                                                       wgpu::VertexFormat::Float32x4, wgpu::VertexFormat::Float32x2};
+    const std::array<uint64_t, 8> offsets = {offsetof(Vertex, pos),         offsetof(Vertex, normal),
+                                             offsetof(Vertex, tangent),     offsetof(Vertex, color),
+                                             offsetof(Vertex, texCoord),    offsetof(Vertex, boneIndices),
+                                             offsetof(Vertex, boneWeights), offsetof(Vertex, texCoord1)};
+    for (size_t i = 0; i < attributes.size(); ++i) {
+        attributes[i].format = formats[i];
+        attributes[i].offset = offsets[i];
+        attributes[i].shaderLocation = static_cast<uint32_t>(i);
+    }
     wgpu::VertexBufferLayout vertexLayout;
-    vertexLayout.arrayStride = sizeof(WebVertex);
+    vertexLayout.arrayStride = sizeof(Vertex);
     vertexLayout.stepMode = wgpu::VertexStepMode::Vertex;
     vertexLayout.attributeCount = attributes.size();
     vertexLayout.attributes = attributes.data();
@@ -664,7 +644,8 @@ bool WebSceneRenderer::CreatePipelines()
     depth.depthCompare = wgpu::CompareFunction::GreaterEqual;
 
     wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor;
-    const std::array<wgpu::BindGroupLayout, 2> sceneLayouts = {m_cameraLayout, m_materialTextureLayout};
+    const std::array<wgpu::BindGroupLayout, 3> sceneLayouts = {m_cameraLayout, m_materialTextureLayout,
+                                                               m_geometryLayout};
     pipelineLayoutDescriptor.bindGroupLayoutCount = sceneLayouts.size();
     pipelineLayoutDescriptor.bindGroupLayouts = sceneLayouts.data();
 
@@ -709,7 +690,11 @@ bool WebSceneRenderer::CreatePipelines()
     skyFragment.targetCount = 1;
     skyFragment.targets = &colorTarget;
     wgpu::RenderPipelineDescriptor skyPipelineDescriptor;
-    skyPipelineDescriptor.layout = pipelineDescriptor.layout;
+    const std::array<wgpu::BindGroupLayout, 2> skyLayouts{m_cameraLayout, m_materialTextureLayout};
+    wgpu::PipelineLayoutDescriptor skyLayoutDescriptor;
+    skyLayoutDescriptor.bindGroupLayoutCount = skyLayouts.size();
+    skyLayoutDescriptor.bindGroupLayouts = skyLayouts.data();
+    skyPipelineDescriptor.layout = m_device.CreatePipelineLayout(&skyLayoutDescriptor);
     skyPipelineDescriptor.vertex.module = m_shaders.at("sky_vertex");
     skyPipelineDescriptor.vertex.entryPoint = "sky_vertex";
     skyPipelineDescriptor.fragment = &skyFragment;
@@ -730,8 +715,11 @@ bool WebSceneRenderer::CreatePipelines()
     shadowDepth.depthBias = -2;
     shadowDepth.depthBiasSlopeScale = -2.0f;
     wgpu::PipelineLayoutDescriptor shadowPipelineLayoutDescriptor;
-    shadowPipelineLayoutDescriptor.bindGroupLayoutCount = 1;
-    shadowPipelineLayoutDescriptor.bindGroupLayouts = &m_shadowCameraLayout;
+    const wgpu::BindGroupLayoutDescriptor emptyLayoutDescriptor{};
+    const std::array<wgpu::BindGroupLayout, 3> shadowLayouts = {
+        m_shadowCameraLayout, m_device.CreateBindGroupLayout(&emptyLayoutDescriptor), m_geometryLayout};
+    shadowPipelineLayoutDescriptor.bindGroupLayoutCount = shadowLayouts.size();
+    shadowPipelineLayoutDescriptor.bindGroupLayouts = shadowLayouts.data();
     wgpu::RenderPipelineDescriptor shadowPipelineDescriptor;
     shadowPipelineDescriptor.layout = m_device.CreatePipelineLayout(&shadowPipelineLayoutDescriptor);
     shadowPipelineDescriptor.vertex.module = m_shaders.at("shadow_vertex");
@@ -825,23 +813,184 @@ bool WebSceneRenderer::EnsureBuffer(wgpu::Buffer &buffer, uint64_t &capacity, ui
     return static_cast<bool>(buffer);
 }
 
-bool WebSceneRenderer::BindIndexStream(wgpu::RenderPassEncoder pass, MeshIndexFormat format) const
+bool WebSceneRenderer::CreateShadowFitPipeline()
 {
-    if (format == MeshIndexFormat::UInt16) {
-        if (!m_indexBuffer16)
-            return false;
-        pass.SetIndexBuffer(m_indexBuffer16, wgpu::IndexFormat::Uint16, 0,
-                            m_indexStreams.uint16Indices.size() * sizeof(uint16_t));
-        return true;
+    std::array<wgpu::BindGroupLayoutEntry, 4> entries{};
+    for (size_t i = 0; i < entries.size(); ++i) {
+        entries[i].binding = static_cast<uint32_t>(i);
+        entries[i].visibility = wgpu::ShaderStage::Compute;
+        entries[i].buffer.type = wgpu::BufferBindingType::Storage;
+        entries[i].buffer.minBindingSize = sizeof(WorldBounds);
     }
-    if (format == MeshIndexFormat::UInt32) {
-        if (!m_indexBuffer32)
-            return false;
-        pass.SetIndexBuffer(m_indexBuffer32, wgpu::IndexFormat::Uint32, 0,
-                            m_indexStreams.uint32Indices.size() * sizeof(uint32_t));
-        return true;
+    entries[0].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+    entries[2].buffer.minBindingSize = sizeof(glm::mat4);
+    entries[3].buffer.type = wgpu::BufferBindingType::Uniform;
+    entries[3].buffer.minBindingSize = sizeof(ShadowFitParameters);
+    wgpu::BindGroupLayoutDescriptor layout;
+    layout.entryCount = entries.size();
+    layout.entries = entries.data();
+    m_shadowFitLayout = m_device.CreateBindGroupLayout(&layout);
+    m_shadowFitGroup = {};
+    wgpu::PipelineLayoutDescriptor pipelineLayout;
+    pipelineLayout.bindGroupLayoutCount = 1;
+    pipelineLayout.bindGroupLayouts = &m_shadowFitLayout;
+    const auto nativeLayout = m_device.CreatePipelineLayout(&pipelineLayout);
+    auto compiled = SlangCompiler::Get().Compile(GetSlangSceneBoundsModule(), {}, {ShaderCodeTarget::Wgsl});
+    for (const auto &entry : compiled.targets.front().entries) {
+        wgpu::ShaderSourceWGSL source;
+        source.code = wgpu::StringView(entry.code.data(), entry.code.size());
+        wgpu::ShaderModuleDescriptor shader;
+        shader.nextInChain = &source;
+        wgpu::ComputePipelineDescriptor pipeline;
+        pipeline.layout = nativeLayout;
+        pipeline.compute.module = m_device.CreateShaderModule(&shader);
+        pipeline.compute.entryPoint = entry.name.c_str();
+        auto native = m_device.CreateComputePipeline(&pipeline);
+        if (entry.name == "reduce_bounds")
+            m_boundsPipeline = std::move(native);
+        else
+            m_shadowFitPipeline = std::move(native);
     }
-    return false;
+    return m_boundsPipeline && m_shadowFitPipeline;
+}
+
+WebSceneRenderer::GeometryResource &WebSceneRenderer::ResolveGeometry(const DrawCall &draw)
+{
+    auto [found, inserted] = m_geometry.try_emplace(draw.meshVertices);
+    auto &geometry = found->second;
+    const bool changed =
+        inserted || geometry.owner != draw.meshDataOwner || geometry.revision != draw.meshRuntimeVersion ||
+        geometry.sourceIndices != draw.meshIndices || geometry.sourceFormat != draw.meshIndexFormat ||
+        geometry.vertexCount != draw.meshVertices->size() || geometry.indexCount != draw.meshIndices->size() ||
+        (draw.forceBufferUpdate && geometry.lastFrame != m_frame);
+    if (changed) {
+        WebPackedIndexStreams streams;
+        const auto range = PackWebIndexRange(streams, draw.meshIndexFormat, 0, draw.meshVertices->size(),
+                                             *draw.meshIndices, 0, draw.meshIndices->size());
+        geometry = {};
+        geometry.owner = draw.meshDataOwner;
+        geometry.sourceIndices = draw.meshIndices;
+        geometry.revision = draw.meshRuntimeVersion;
+        geometry.format = range.format;
+        geometry.sourceFormat = draw.meshIndexFormat;
+        geometry.vertexCount = draw.meshVertices->size();
+        geometry.indexCount = draw.meshIndices->size();
+        geometry.line = std::any_of(draw.meshVertices->begin(), draw.meshVertices->end(),
+                                    [](const Vertex &v) { return v.boneIndices.w == kLineVertexMarker; });
+        wgpu::BufferDescriptor descriptor;
+        descriptor.label = "Scene canonical indices";
+        descriptor.usage = wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst;
+        descriptor.size = range.format == MeshIndexFormat::UInt16 ? streams.uint16Indices.size() * sizeof(uint16_t)
+                                                                  : streams.uint32Indices.size() * sizeof(uint32_t);
+        geometry.indices = m_device.CreateBuffer(&descriptor);
+        const void *indices = range.format == MeshIndexFormat::UInt16
+                                  ? static_cast<const void *>(streams.uint16Indices.data())
+                                  : static_cast<const void *>(streams.uint32Indices.data());
+        m_queue.WriteBuffer(geometry.indices, 0, indices, descriptor.size);
+    }
+    if (!draw.meshVertexBuffer && !geometry.vertices) {
+        wgpu::BufferDescriptor descriptor;
+        descriptor.label = "Scene canonical vertices";
+        descriptor.usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst;
+        descriptor.size = geometry.vertexCount * sizeof(Vertex);
+        geometry.vertices = m_device.CreateBuffer(&descriptor);
+        m_queue.WriteBuffer(geometry.vertices, 0, draw.meshVertices->data(), descriptor.size);
+    }
+    geometry.lastFrame = m_frame;
+    return geometry;
+}
+
+wgpu::Buffer WebSceneRenderer::CaptureBuffer(const std::shared_ptr<rhi::ComputeBuffer> &value) const
+{
+    if (!value->GetHost().IsAlive() || value->GetHost().GetDeviceId() != m_rhi->GetDeviceId() ||
+        !value->GetLastWriteSubmission().IsValid())
+        throw std::invalid_argument("Scene compute input must be an accepted value on the rendering device");
+    // The Web compute host and renderer submit to this exact native queue.
+    // Accepted producers are already enqueued; there is no CPU completion wait.
+    return m_rhi->GetNativeBuffer(value->GetBuffer());
+}
+
+wgpu::BindGroup WebSceneRenderer::ResolveGeometryBinding(wgpu::Buffer models)
+{
+    auto [found, inserted] = m_geometryBindings.try_emplace(models.Get());
+    auto &binding = found->second;
+    if (inserted) {
+        std::array<wgpu::BindGroupEntry, 2> entries{};
+        entries[0].binding = 0;
+        entries[0].buffer = models;
+        entries[0].size = models.GetSize();
+        entries[1].binding = 1;
+        entries[1].buffer = m_boneBuffer;
+        entries[1].size = m_boneCapacity;
+        wgpu::BindGroupDescriptor descriptor;
+        descriptor.layout = m_geometryLayout;
+        descriptor.entryCount = entries.size();
+        descriptor.entries = entries.data();
+        binding.group = m_device.CreateBindGroup(&descriptor);
+    }
+    binding.lastFrame = m_frame;
+    return binding.group;
+}
+
+bool WebSceneRenderer::PrepareGeometry()
+{
+    const auto drawCapacity = m_drawDataCapacity;
+    const auto boundsCapacity = m_boundsCapacity;
+    const auto tilesCapacity = m_boundsTilesCapacity;
+    const auto boneCapacity = m_boneCapacity;
+    if (!EnsureBuffer(m_drawDataBuffer, m_drawDataCapacity,
+                      std::max<size_t>(1, m_drawData.size()) * sizeof(WebDrawData), wgpu::BufferUsage::Storage) ||
+        !EnsureBuffer(m_modelBuffer, m_modelCapacity, m_models.size() * sizeof(glm::mat4),
+                      wgpu::BufferUsage::Storage) ||
+        !EnsureBuffer(m_boneBuffer, m_boneCapacity, m_bones.size() * sizeof(glm::mat4), wgpu::BufferUsage::Storage) ||
+        !EnsureBuffer(m_boundsBuffer, m_boundsCapacity, std::max<size_t>(1, m_bounds.size()) * sizeof(WorldBounds),
+                      wgpu::BufferUsage::Storage) ||
+        !EnsureBuffer(m_boundsTilesBuffer, m_boundsTilesCapacity,
+                      std::max(1u, m_shadowFitParameters.counts.y) * sizeof(WorldBounds), wgpu::BufferUsage::Storage))
+        return false;
+    if ((drawCapacity != m_drawDataCapacity || boundsCapacity != m_boundsCapacity) && !CreateCameraBindGroups())
+        return false;
+    if (boneCapacity != m_boneCapacity)
+        m_geometryBindings.clear();
+    if (!m_shadowFitGroup || boundsCapacity != m_boundsCapacity || tilesCapacity != m_boundsTilesCapacity) {
+        std::array<wgpu::BindGroupEntry, 4> entries{};
+        const std::array<wgpu::Buffer, 4> buffers{m_boundsBuffer, m_boundsTilesBuffer, m_shadowMatrixBuffer,
+                                                  m_shadowFitParametersBuffer};
+        const std::array<uint64_t, 4> sizes{m_boundsCapacity, m_boundsTilesCapacity, sizeof(glm::mat4),
+                                            sizeof(ShadowFitParameters)};
+        for (size_t i = 0; i < entries.size(); ++i) {
+            entries[i].binding = static_cast<uint32_t>(i);
+            entries[i].buffer = buffers[i];
+            entries[i].size = sizes[i];
+        }
+        wgpu::BindGroupDescriptor descriptor;
+        descriptor.layout = m_shadowFitLayout;
+        descriptor.entryCount = entries.size();
+        descriptor.entries = entries.data();
+        m_shadowFitGroup = m_device.CreateBindGroup(&descriptor);
+    }
+    for (auto &range : m_drawRanges)
+        range.geometryGroup =
+            ResolveGeometryBinding(range.poseValue ? CaptureBuffer(range.poseValue->models) : m_modelBuffer);
+    RetireUnused(m_geometryBindings, m_frame);
+    m_queue.WriteBuffer(m_modelBuffer, 0, m_models.data(), m_models.size() * sizeof(glm::mat4));
+    m_queue.WriteBuffer(m_boneBuffer, 0, m_bones.data(), m_bones.size() * sizeof(glm::mat4));
+    if (!m_drawData.empty()) {
+        m_queue.WriteBuffer(m_drawDataBuffer, 0, m_drawData.data(), m_drawData.size() * sizeof(WebDrawData));
+        m_queue.WriteBuffer(m_boundsBuffer, 0, m_bounds.data(), m_bounds.size() * sizeof(WorldBounds));
+        m_queue.WriteBuffer(m_shadowFitParametersBuffer, 0, &m_shadowFitParameters, sizeof(m_shadowFitParameters));
+    }
+    return true;
+}
+
+void WebSceneRenderer::BindGeometry(wgpu::RenderPassEncoder pass, const WebDrawRange &range) const
+{
+    pass.SetVertexBuffer(0, range.vertexBuffer, 0, range.vertexBytes);
+    pass.SetIndexBuffer(range.indexBuffer,
+                        range.indices.format == MeshIndexFormat::UInt16 ? wgpu::IndexFormat::Uint16
+                                                                        : wgpu::IndexFormat::Uint32,
+                        0, range.indexBytes);
+    pass.SetBindGroup(2, range.geometryGroup);
 }
 
 bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camera)
@@ -865,7 +1014,7 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
     const glm::vec4 background = inx::color::SrgbToLinear(camera->GetBackgroundColor());
     m_clearColor = {background.r, background.g, background.b, background.a};
     camera->SetAspectRatio(static_cast<float>(width) / static_cast<float>(std::max(1u, height)));
-    m_extractor.ExtractCameraFrame(m_world, camera);
+    (void)m_extractor.ExtractCameraFrame(m_world, camera);
     const auto frame = m_world.Acquire();
     if (!frame || !frame->PrimaryView().valid) {
         ReportFrameIssue("invalid-render-snapshot");
@@ -876,6 +1025,7 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
     m_cameraData = {};
     m_cameraData.viewProjection = ToWebClipSpace(frame->PrimaryView().viewProjection);
     m_cameraData.inverseViewProjection = glm::inverse(m_cameraData.viewProjection);
+    m_cameraData.view = frame->PrimaryView().view;
     m_cameraData.cameraPosition = glm::vec4(frame->PrimaryView().position, 1.0f);
     m_cameraData.skyTopExposure = glm::vec4(inx::color::SrgbToLinear(environment.skyTopColor), environment.skyExposure);
     m_cameraData.skyHorizon = glm::vec4(inx::color::SrgbToLinear(environment.skyHorizonColor), 0.0f);
@@ -939,14 +1089,13 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
         break;
     }
 
-    std::vector<WebVertex> vertices;
-    WebPackedIndexStreams indexStreams;
-    std::vector<WebDrawRange> drawRanges;
-    std::vector<WebDrawData> drawData;
-    const glm::mat4 cameraToWorld = glm::inverse(camera->GetViewMatrix());
-    const glm::vec3 cameraRight = glm::normalize(glm::vec3(cameraToWorld[0]));
-    const glm::vec3 cameraUp = glm::normalize(glm::vec3(cameraToWorld[1]));
-    const glm::vec3 viewFacing = glm::normalize(-glm::vec3(cameraToWorld[2]));
+    ++m_frame;
+    m_drawRanges.clear();
+    m_drawData.clear();
+    m_models.assign(1, glm::mat4(1.0f));
+    m_bones.assign(1, glm::mat4(1.0f));
+    m_bounds.clear();
+    m_vertexCount = 0;
     const auto &drawCalls = frame->DrawCalls().drawCalls;
     for (const DrawCall &draw : drawCalls) {
         if (!draw.frustumVisible || !(draw.layerMask & camera->GetCullingMask()) || !draw.meshVertices ||
@@ -961,7 +1110,6 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
             return false;
         }
         const size_t indexCount = draw.indexCount;
-        const size_t vertexBase = vertices.size();
         const glm::vec4 materialColor = inx::color::SrgbToLinear(MaterialColor(draw.material, draw.parameterBlock));
         const glm::vec4 emission = inx::color::SrgbToLinear(
             MaterialVector(draw.material, draw.parameterBlock, "emissionColor", glm::vec4(0.0f)));
@@ -1020,145 +1168,55 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
             range.transparent = materialColor.a < 0.999f;
             range.rasterPipeline = 5;
         }
-        try {
-            range.indices = PackWebIndexRange(indexStreams, draw.meshIndexFormat, vertexBase, sourceVertices.size(),
-                                              sourceIndices, draw.indexStart, indexCount);
-        } catch (const std::invalid_argument &) {
-            ReportFrameIssue("invalid-index-stream");
-            return false;
-        } catch (const std::overflow_error &) {
-            ReportFrameIssue("index-stream-overflow");
-            return false;
+        auto &geometry = ResolveGeometry(draw);
+        if (draw.indexCount > sourceIndices.size() - draw.indexStart)
+            throw std::invalid_argument("Scene draw exceeds its published index range");
+        range.indices = {geometry.format, draw.indexStart, draw.indexCount, draw.vertexStart};
+        range.vertexBuffer = geometry.vertices;
+        range.indexBuffer = geometry.indices;
+        range.vertexBytes = geometry.vertexCount * sizeof(Vertex);
+        range.indexBytes = geometry.format == MeshIndexFormat::UInt16 ? ((geometry.indexCount + 1) / 2) * 4
+                                                                      : geometry.indexCount * sizeof(uint32_t);
+        if (draw.meshVertexBuffer) {
+            range.vertexValue = draw.meshVertexBuffer->Freeze();
+            if (!range.vertexValue->HasInitializedRange(0, range.vertexBytes))
+                throw std::invalid_argument(
+                    "Scene resident vertex stream has no accepted value for its active vertices");
+            range.vertexBuffer = CaptureBuffer(range.vertexValue);
+            range.vertexBytes = range.vertexValue->GetByteSize();
         }
-        const glm::mat3 worldNormal = glm::inverseTranspose(glm::mat3(draw.worldMatrix));
-        const bool lineDraw =
-            std::any_of(range.indices.sourceVertices.begin(), range.indices.sourceVertices.end(),
-                        [&](uint32_t index) { return sourceVertices[index].boneIndices.w == kLineVertexMarker; });
-        range.line = lineDraw;
-
-        vertices.reserve(vertices.size() + range.indices.sourceVertices.size());
-        for (const uint32_t index : range.indices.sourceVertices) {
-            const Vertex &source = sourceVertices[index];
-            const bool lineVertex = source.boneIndices.w == kLineVertexMarker;
-            glm::vec3 renderPosition;
-            glm::vec3 renderNormalValue;
-            glm::vec4 renderTangentValue(1.0f, 0.0f, 0.0f, normalScale);
-            float vertexAlpha = 1.0f;
-            if (lineVertex) {
-                const glm::vec3 center = glm::vec3(draw.worldMatrix * glm::vec4(source.pos, 1.0f));
-                glm::vec3 tangent = glm::mat3(draw.worldMatrix) * glm::vec3(source.tangent);
-                tangent = Finite(tangent) && glm::dot(tangent, tangent) > 1.0e-10f ? glm::normalize(tangent)
-                                                                                   : glm::vec3(1.0f, 0.0f, 0.0f);
-                glm::vec3 facing = source.boneIndices.z == 0u ? viewFacing : worldNormal * source.normal;
-                facing = Finite(facing) && glm::dot(facing, facing) > 1.0e-10f ? glm::normalize(facing)
-                                                                               : glm::vec3(0.0f, 0.0f, 1.0f);
-                glm::vec3 fallbackSide = cameraRight - tangent * glm::dot(cameraRight, tangent);
-                if (glm::dot(fallbackSide, fallbackSide) < 1.0e-8f)
-                    fallbackSide = cameraUp - tangent * glm::dot(cameraUp, tangent);
-                if (glm::dot(fallbackSide, fallbackSide) < 1.0e-10f)
-                    fallbackSide = std::abs(tangent.x) < 0.9f ? glm::cross(tangent, glm::vec3(1.0f, 0.0f, 0.0f))
-                                                              : glm::cross(tangent, glm::vec3(0.0f, 1.0f, 0.0f));
-                fallbackSide = glm::normalize(fallbackSide);
-                glm::vec3 geometricSide = glm::cross(facing, tangent);
-                const float geometricLength = glm::length(geometricSide);
-                glm::vec3 side;
-                if (geometricLength > 0.20f) {
-                    side = geometricSide / geometricLength;
-                } else if (geometricLength > 1.0e-6f) {
-                    geometricSide /= geometricLength;
-                    if (glm::dot(fallbackSide, geometricSide) < 0.0f)
-                        fallbackSide = -fallbackSide;
-                    const float normalizedWeight = std::clamp((geometricLength - 0.025f) / 0.175f, 0.0f, 1.0f);
-                    const float geometricWeight =
-                        normalizedWeight * normalizedWeight * (3.0f - 2.0f * normalizedWeight);
-                    side = glm::normalize(glm::mix(fallbackSide, geometricSide, geometricWeight));
-                } else {
-                    side = fallbackSide;
-                }
-                renderPosition = center + side * source.boneWeights.x;
-                renderNormalValue = source.boneIndices.y != 0u ? facing : worldNormal * source.normal;
-                renderTangentValue = glm::vec4(tangent, normalScale);
-                vertexAlpha = std::clamp(source.boneWeights.y, 0.0f, 1.0f);
-            } else {
-                const glm::mat4 skin = SkinMatrix(source, draw.skinBoneMatrices.get());
-                const glm::vec3 localPosition = glm::vec3(skin * glm::vec4(source.pos, 1.0f));
-                renderPosition = localPosition;
-                const glm::vec3 localNormal = glm::mat3(skin) * source.normal;
-                renderNormalValue = localNormal;
-                const glm::mat3 tangentTransform = glm::mat3(skin);
-                glm::vec3 tangent = tangentTransform * glm::vec3(source.tangent);
-                const float skinSign = glm::determinant(tangentTransform) < 0.0f ? -1.0f : 1.0f;
-                const float worldSign = glm::determinant(glm::mat3(draw.worldMatrix)) < 0.0f ? -1.0f : 1.0f;
-                const float handedness = source.tangent.w < 0.0f ? -1.0f : 1.0f;
-                renderTangentValue = glm::vec4(tangent, handedness * skinSign * worldSign * normalScale);
-            }
-            if (!Finite(renderNormalValue) || glm::dot(renderNormalValue, renderNormalValue) < 1.0e-8f)
-                renderNormalValue = glm::vec3(0.0f, 1.0f, 0.0f);
-            else
-                renderNormalValue = glm::normalize(renderNormalValue);
-            glm::vec3 tangent = glm::vec3(renderTangentValue);
-            tangent -= renderNormalValue * glm::dot(renderNormalValue, tangent);
-            if (!Finite(tangent) || glm::dot(tangent, tangent) < 1.0e-8f) {
-                const glm::vec3 axis =
-                    std::abs(renderNormalValue.y) > 0.999f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
-                tangent = glm::normalize(glm::cross(axis, renderNormalValue));
-            } else {
-                tangent = glm::normalize(tangent);
-            }
-            renderTangentValue = glm::vec4(tangent, renderTangentValue.w);
-            const glm::vec4 color = glm::vec4(source.color, vertexAlpha) * materialColor;
-            range.transparent = range.transparent || color.a < 0.999f;
-            WebVertex vertex{};
-            std::memcpy(vertex.position, &renderPosition, sizeof(vertex.position));
-            std::memcpy(vertex.normal, &renderNormalValue, sizeof(vertex.normal));
-            std::memcpy(vertex.tangent, &renderTangentValue, sizeof(vertex.tangent));
-            std::memcpy(vertex.uv, &source.texCoord, sizeof(vertex.uv));
-            std::memcpy(vertex.uv1, &source.texCoord1, sizeof(vertex.uv1));
-            std::memcpy(vertex.color, &color, sizeof(vertex.color));
-            std::memcpy(vertex.emission, &emission, sizeof(vertex.emission));
-            std::memcpy(vertex.material, &materialParameters, sizeof(vertex.material));
-            std::memcpy(vertex.surface, &surfaceParameters, sizeof(vertex.surface));
-            std::memcpy(vertex.textureUvSets0, &textureUvSets0, sizeof(vertex.textureUvSets0));
-            std::memcpy(vertex.textureUvSets1, &textureUvSets1, sizeof(vertex.textureUvSets1));
-            std::memcpy(vertex.metallicChannels, &metallicChannels, sizeof(vertex.metallicChannels));
-            std::memcpy(vertex.smoothnessChannels, &smoothnessChannels, sizeof(vertex.smoothnessChannels));
-            std::memcpy(vertex.materialSampling, &materialSampling, sizeof(vertex.materialSampling));
-            vertices.push_back(vertex);
+        range.line = geometry.line;
+        range.transparent = range.transparent || range.line;
+        range.drawIndex = static_cast<uint32_t>(m_drawData.size());
+        WebDrawData objectData;
+        objectData.color = materialColor;
+        objectData.emission = emission;
+        objectData.material = materialParameters;
+        objectData.surface = surfaceParameters;
+        objectData.textureUvSets0 = textureUvSets0;
+        objectData.textureUvSets1 = glm::vec4(textureUvSets1, 0.0f, 0.0f);
+        objectData.metallicChannels = metallicChannels;
+        objectData.smoothnessChannels = smoothnessChannels;
+        objectData.materialSampling = glm::vec4(materialSampling, normalScale, draw.receivesShadows ? 1.0f : 0.0f);
+        objectData.geometry.y = range.drawIndex;
+        if (draw.devicePose.value) {
+            range.poseValue = draw.devicePose.value;
+            objectData.geometry.x = range.poseValue->firstModel + draw.devicePose.element;
+        } else {
+            objectData.geometry.x = static_cast<uint32_t>(m_models.size());
+            m_models.push_back(draw.worldMatrix);
         }
-        // LineRenderer alpha is carried per vertex rather than in the
-        // material base color.  It must therefore use the transparent pass
-        // even when the material itself is nominally opaque.
-        if (range.line)
-            range.transparent = true;
-
-        if (range.indices.indexCount > 0) {
-            WebDrawData objectData;
-            if (!range.line) {
-                objectData.model = draw.worldMatrix;
-                objectData.normal = glm::mat4(glm::inverseTranspose(glm::mat3(draw.worldMatrix)));
-            }
-            range.drawIndex = static_cast<uint32_t>(drawData.size());
-            drawData.push_back(objectData);
-            drawRanges.push_back(std::move(range));
+        if (draw.skinBoneMatrices && !draw.skinBoneMatrices->empty()) {
+            objectData.geometry.z = static_cast<uint32_t>(m_bones.size());
+            objectData.geometry.w = static_cast<uint32_t>(draw.skinBoneMatrices->size());
+            m_bones.insert(m_bones.end(), draw.skinBoneMatrices->begin(), draw.skinBoneMatrices->end());
         }
+        m_vertexCount += geometry.vertexCount;
+        m_bounds.push_back({glm::vec4(draw.worldBounds.min, 0.0f), glm::vec4(draw.worldBounds.max, 0.0f)});
+        m_drawData.push_back(objectData);
+        m_drawRanges.push_back(std::move(range));
     }
-
-    size_t totalIndexCount = 0;
-    for (const WebDrawRange &range : drawRanges)
-        totalIndexCount += range.indices.indexCount;
-    if (vertices.empty() || totalIndexCount == 0) {
-        m_shadowEnabled = false;
-        m_vertices.clear();
-        m_indexStreams.uint16Indices.clear();
-        m_indexStreams.uint32Indices.clear();
-        m_drawRanges.clear();
-        m_drawData.clear();
-        m_residentSceneCount = sceneManager.GetSceneCount() + (sceneManager.GetRuntimePersistentScene() ? 1U : 0U);
-        m_residentRendererCount = sceneManager.GetActiveMeshRenderers().size();
-        m_residentLightCount = sceneManager.GetActiveLights().size();
-        m_activeWorldId = scene->GetWorldId();
-        return true;
-    }
+    RetireUnused(m_geometry, m_frame);
 
     Light *directionalLight = nullptr;
     // Like desktop SceneLightCollector, Web lighting consumes the shared
@@ -1216,36 +1274,16 @@ bool WebSceneRenderer::BuildFrame(uint32_t width, uint32_t height, Camera *camer
     }
     m_cameraData.lightCounts.x = additionalLightCount;
 
-    glm::vec3 boundsMin(std::numeric_limits<float>::max());
-    glm::vec3 boundsMax(std::numeric_limits<float>::lowest());
-    for (const DrawCall &draw : drawCalls) {
-        if (!draw.frustumVisible || !draw.meshVertices || !draw.meshIndices || draw.indexCount == 0)
-            continue;
-        boundsMin = glm::min(boundsMin, draw.worldBounds.min);
-        boundsMax = glm::max(boundsMax, draw.worldBounds.max);
-    }
-    const glm::vec3 center = (boundsMin + boundsMax) * 0.5f;
-    const float radius = std::max(2.0f, glm::length(boundsMax - boundsMin) * 0.6f);
-    const glm::vec3 lightUp = std::abs(glm::dot(rayDirection, glm::vec3(0.0f, 1.0f, 0.0f))) > 0.95f
-                                  ? glm::vec3(1.0f, 0.0f, 0.0f)
-                                  : glm::vec3(0.0f, 1.0f, 0.0f);
-    const glm::vec3 lightPosition = center - rayDirection * (radius * 2.0f);
-    const glm::mat4 lightView = glm::lookAtRH(lightPosition, center, lightUp);
-    const glm::mat4 lightProjection = glm::orthoRH_ZO(-radius, radius, -radius, radius, radius * 4.5f, 0.1f);
-    m_cameraData.lightViewProjection = lightProjection * lightView;
-
-    m_vertices.swap(vertices);
-    m_indexStreams.uint16Indices.swap(indexStreams.uint16Indices);
-    m_indexStreams.uint32Indices.swap(indexStreams.uint32Indices);
-    m_drawRanges.swap(drawRanges);
-    m_drawData.swap(drawData);
+    m_shadowEnabled = m_shadowEnabled && !m_bounds.empty();
+    m_shadowFitParameters.rayDirection = glm::vec4(rayDirection, 0.0f);
+    m_shadowFitParameters.counts = glm::uvec4(m_bounds.size(), (m_bounds.size() + 63) / 64, 0, 0);
     m_residentSceneCount = sceneManager.GetSceneCount() + (sceneManager.GetRuntimePersistentScene() ? 1U : 0U);
     m_residentRendererCount = sceneManager.GetActiveMeshRenderers().size();
     m_residentLightCount = residentLights.size();
     m_activeWorldId = scene->GetWorldId();
     if (!m_lastFrameIssue.empty()) {
-        std::printf("INFERNUX_WEB_SCENE_RENDER_RECOVERED previous=%s vertices=%zu indices=%zu\n",
-                    m_lastFrameIssue.c_str(), m_vertices.size(), totalIndexCount);
+        std::printf("INFERNUX_WEB_SCENE_RENDER_RECOVERED previous=%s vertices=%zu draws=%zu\n",
+                    m_lastFrameIssue.c_str(), m_vertexCount, m_drawRanges.size());
         m_lastFrameIssue.clear();
     }
     return true;
@@ -1263,53 +1301,40 @@ bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uin
 {
     m_framePrepared = false;
     if (!m_opaquePipelines[5] || !m_transparentPipelines[5] || !m_shadowPipelines[5] || !encoder ||
-        !BuildFrame(width, height, camera))
+        !BuildFrame(width, height, camera) || !PrepareGeometry())
         return false;
-    const uint64_t vertexBytes = m_vertices.size() * sizeof(WebVertex);
-    const uint64_t indexBytes16 = m_indexStreams.uint16Indices.size() * sizeof(uint16_t);
-    const uint64_t indexBytes32 = m_indexStreams.uint32Indices.size() * sizeof(uint32_t);
-    const uint64_t drawDataBytes = m_drawData.size() * sizeof(WebDrawData);
-    const uint64_t previousDrawDataCapacity = m_drawDataCapacity;
-    if ((vertexBytes > 0 && !EnsureBuffer(m_vertexBuffer, m_vertexCapacity, vertexBytes, wgpu::BufferUsage::Vertex)) ||
-        (indexBytes16 > 0 &&
-         !EnsureBuffer(m_indexBuffer16, m_indexCapacity16, indexBytes16, wgpu::BufferUsage::Index)) ||
-        (indexBytes32 > 0 &&
-         !EnsureBuffer(m_indexBuffer32, m_indexCapacity32, indexBytes32, wgpu::BufferUsage::Index)) ||
-        (drawDataBytes > 0 &&
-         !EnsureBuffer(m_drawDataBuffer, m_drawDataCapacity, drawDataBytes, wgpu::BufferUsage::Storage)))
-        return false;
-    if (m_drawDataCapacity != previousDrawDataCapacity && !CreateCameraBindGroups())
-        return false;
-    if (vertexBytes > 0)
-        m_queue.WriteBuffer(m_vertexBuffer, 0, m_vertices.data(), vertexBytes);
-    if (indexBytes16 > 0)
-        m_queue.WriteBuffer(m_indexBuffer16, 0, m_indexStreams.uint16Indices.data(), indexBytes16);
-    if (indexBytes32 > 0)
-        m_queue.WriteBuffer(m_indexBuffer32, 0, m_indexStreams.uint32Indices.data(), indexBytes32);
-    if (drawDataBytes > 0)
-        m_queue.WriteBuffer(m_drawDataBuffer, 0, m_drawData.data(), drawDataBytes);
     m_queue.WriteBuffer(m_cameraBuffer, 0, &m_cameraData, sizeof(m_cameraData));
-
+    for (const auto &range : m_drawRanges) {
+        if (range.poseValue) {
+            const auto &pose = *range.poseValue;
+            const uint64_t element = m_drawData[range.drawIndex].geometry.x - pose.firstModel;
+            // Gather only the 32-byte bounds record required by this frame's
+            // culling and shadow reduction. Models and vertices stay in place.
+            encoder.CopyBufferToBuffer(CaptureBuffer(pose.bounds), (pose.firstBounds + element) * sizeof(WorldBounds),
+                                       m_boundsBuffer, range.drawIndex * sizeof(WorldBounds), sizeof(WorldBounds));
+        }
+    }
     if (m_shadowEnabled) {
+        auto fit = encoder.BeginComputePass();
+        fit.SetBindGroup(0, m_shadowFitGroup);
+        fit.SetPipeline(m_boundsPipeline);
+        fit.DispatchWorkgroups(m_shadowFitParameters.counts.y);
+        fit.SetPipeline(m_shadowFitPipeline);
+        fit.DispatchWorkgroups(1);
+        fit.End();
         wgpu::RenderPassDepthStencilAttachment depthAttachment;
         depthAttachment.view = m_shadowView;
         depthAttachment.depthLoadOp = wgpu::LoadOp::Clear;
         depthAttachment.depthStoreOp = wgpu::StoreOp::Store;
         depthAttachment.depthClearValue = 0.0f;
         wgpu::RenderPassDescriptor descriptor;
-        descriptor.colorAttachmentCount = 0;
-        descriptor.colorAttachments = nullptr;
         descriptor.depthStencilAttachment = &depthAttachment;
         wgpu::RenderPassEncoder shadowPass = encoder.BeginRenderPass(&descriptor);
         shadowPass.SetBindGroup(0, m_shadowCameraGroup);
-        shadowPass.SetVertexBuffer(0, m_vertexBuffer, 0, vertexBytes);
         for (const WebDrawRange &range : m_drawRanges) {
             if (range.castsShadows && !range.fullyCulled) {
                 shadowPass.SetPipeline(m_shadowPipelines[range.rasterPipeline]);
-                if (!BindIndexStream(shadowPass, range.indices.format)) {
-                    shadowPass.End();
-                    return false;
-                }
+                BindGeometry(shadowPass, range);
                 shadowPass.DrawIndexed(range.indices.indexCount, 1, range.indices.firstIndex, range.indices.baseVertex,
                                        range.drawIndex);
             }
@@ -1324,7 +1349,6 @@ bool WebSceneRenderer::RenderPrepared(wgpu::RenderPassEncoder pass)
 {
     if (!m_framePrepared || !pass)
         return false;
-    const uint64_t vertexBytes = m_vertices.size() * sizeof(WebVertex);
 
     if (m_drawSky && m_skyPipeline) {
         pass.SetPipeline(m_skyPipeline);
@@ -1335,11 +1359,10 @@ bool WebSceneRenderer::RenderPrepared(wgpu::RenderPassEncoder pass)
 
     // A camera plus World/Screen UI is a complete renderable scene.  Keep
     // the sky and UI pass alive even when the world has no mesh draw stream.
-    if (m_vertices.empty() || m_drawRanges.empty())
+    if (m_drawRanges.empty())
         return true;
 
     pass.SetBindGroup(0, m_cameraGroup);
-    pass.SetVertexBuffer(0, m_vertexBuffer, 0, vertexBytes);
     size_t transparentCount = 0;
     size_t lineCount = 0;
     // Populate the complete opaque depth buffer first.  Interleaving opaque
@@ -1353,8 +1376,7 @@ bool WebSceneRenderer::RenderPrepared(wgpu::RenderPassEncoder pass)
             continue;
         pass.SetPipeline(m_opaquePipelines[range.rasterPipeline]);
         pass.SetBindGroup(1, range.materialTextureGroup ? range.materialTextureGroup : m_defaultMaterialTextureGroup);
-        if (!BindIndexStream(pass, range.indices.format))
-            return false;
+        BindGeometry(pass, range);
         pass.DrawIndexed(range.indices.indexCount, 1, range.indices.firstIndex, range.indices.baseVertex,
                          range.drawIndex);
     }
@@ -1363,8 +1385,7 @@ bool WebSceneRenderer::RenderPrepared(wgpu::RenderPassEncoder pass)
             continue;
         pass.SetPipeline(m_transparentPipelines[range.rasterPipeline]);
         pass.SetBindGroup(1, range.materialTextureGroup ? range.materialTextureGroup : m_defaultMaterialTextureGroup);
-        if (!BindIndexStream(pass, range.indices.format))
-            return false;
+        BindGeometry(pass, range);
         pass.DrawIndexed(range.indices.indexCount, 1, range.indices.firstIndex, range.indices.baseVertex,
                          range.drawIndex);
     }
@@ -1379,7 +1400,7 @@ bool WebSceneRenderer::RenderPrepared(wgpu::RenderPassEncoder pass)
         }
         std::printf("INFERNUX_WEB_SCENE_RENDER_READY vertices=%zu indices=%zu index16=%zu index32=%zu draws=%zu "
                     "transparent=%zu scenes=%zu renderers=%zu lights=%zu active_world=%llu material=pbr\n",
-                    m_vertices.size(), indexCount16 + indexCount32, indexCount16, indexCount32, m_drawRanges.size(),
+                    m_vertexCount, indexCount16 + indexCount32, indexCount16, indexCount32, m_drawRanges.size(),
                     transparentCount, m_residentSceneCount, m_residentRendererCount, m_residentLightCount,
                     static_cast<unsigned long long>(m_activeWorldId));
         if (m_drawSky)

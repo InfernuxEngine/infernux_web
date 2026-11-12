@@ -1237,7 +1237,7 @@ void StartSurface()
         return;
     }
     const auto sceneColorFormat = g_postProcessRenderer.SceneColorFormat();
-    if (!g_sceneRenderer.Initialize(g_device, g_queue, sceneColorFormat, sceneSampleCount)) {
+    if (!g_sceneRenderer.Initialize(*g_rhi, sceneColorFormat, sceneSampleCount)) {
         std::fprintf(stderr, "INFERNUX_WEBGPU_SCENE_PIPELINE_FAILED\n");
         InfernuxWebAbortStartup("Scene rendering initialization failed");
         return;
