@@ -7,6 +7,8 @@
 #include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/resources/InxMaterial/InxMaterial.h>
 #include <function/resources/InxTexture/InxTexture.h>
+#include <function/resources/ShaderAsset/SlangNativeModule.h>
+#include <function/resources/ShaderAsset/SlangUIModule.h>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <imgui_internal.h>
@@ -88,112 +90,20 @@ wgpu::SamplerDescriptor UISamplerDescriptor(const std::string &filterMode, const
     return descriptor;
 }
 
-constexpr const char *kScreenUIShader = R"(
-struct VertexInput {
-    @location(0) position: vec2<f32>,
-    @location(1) uv: vec2<f32>,
-    @location(2) color: vec4<f32>,
-};
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) uv: vec2<f32>,
-};
-struct ScreenConstants {
-    scale: vec2<f32>,
-    translate: vec2<f32>,
-    encode_sample: f32,
-    padding0: f32,
-    padding1: f32,
-    padding2: f32,
-    material_color: vec4<f32>,
-    alpha_clip_threshold: f32,
-    alpha_clip_enabled: f32,
-    tail_padding: vec2<f32>,
-};
-@group(0) @binding(0) var ui_texture: texture_2d<f32>;
-@group(0) @binding(500) var ui_sampler: sampler;
-@group(0) @binding(999) var<uniform> pc: ScreenConstants;
-
-@vertex fn vertex_main(input: VertexInput) -> VertexOutput {
-    var output: VertexOutput;
-    output.position = vec4<f32>(input.position * pc.scale + pc.translate, 0.0, 1.0);
-    output.uv = input.uv;
-    output.color = input.color;
-    return output;
-}
-
-@fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let color = input.color * textureSample(ui_texture, ui_sampler, input.uv) * pc.material_color;
-    if ((pc.alpha_clip_enabled > 0.5 && color.a < pc.alpha_clip_threshold) || color.a <= 0.0) {
-        discard;
+std::array<wgpu::ShaderModule, 2> CreateUIShaderModules(wgpu::Device device, const ShaderSourceModule &source)
+{
+    const auto compiled = CompileSlangNativeModule(source, ShaderCodeTarget::Wgsl);
+    std::array<wgpu::ShaderModule, 2> modules;
+    for (size_t index = 0; index < modules.size(); ++index) {
+        const auto &code = compiled.entries[index].code;
+        wgpu::ShaderSourceWGSL shaderSource;
+        shaderSource.code = wgpu::StringView(code.data(), code.size());
+        wgpu::ShaderModuleDescriptor descriptor;
+        descriptor.nextInChain = &shaderSource;
+        modules[index] = device.CreateShaderModule(&descriptor);
     }
-    return color;
+    return modules;
 }
-)";
-
-constexpr const char *kWorldUIShader = R"(
-struct VertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) uv: vec2<f32>,
-    @location(2) color: vec4<f32>,
-    @location(3) local_position: vec2<f32>,
-    @location(4) anchor: vec3<f32>,
-    @location(5) local_offset: vec3<f32>,
-    @location(6) policy: f32,
-};
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) uv: vec2<f32>,
-    @location(2) local_position: vec2<f32>,
-};
-struct WorldConstants {
-    view_projection: mat4x4<f32>,
-    material_color: vec4<f32>,
-    alpha_clip_threshold: f32,
-    alpha_clip_enabled: f32,
-    screen_scale: vec2<f32>,
-    camera_right: vec4<f32>,
-    camera_up: vec4<f32>,
-};
-@group(0) @binding(0) var ui_texture: texture_2d<f32>;
-@group(0) @binding(500) var ui_sampler: sampler;
-@group(0) @binding(999) var<uniform> pc: WorldConstants;
-
-@vertex fn vertex_main(input: VertexInput) -> VertexOutput {
-    var output: VertexOutput;
-    output.color = input.color;
-    output.uv = input.uv;
-    output.local_position = input.local_position;
-    var position = input.position;
-    let policy = u32(input.policy + 0.5);
-    if (policy != 0u) {
-        var offset = input.position - input.anchor;
-        if ((policy & 1u) != 0u) {
-            offset = pc.camera_right.xyz * input.local_offset.x
-                   + pc.camera_up.xyz * input.local_offset.y
-                   + cross(pc.camera_right.xyz, pc.camera_up.xyz) * input.local_offset.z;
-        }
-        if ((policy & 2u) != 0u) {
-            let clip_w = (pc.view_projection * vec4<f32>(input.anchor, 1.0)).w;
-            offset *= max(clip_w, 0.0) * pc.screen_scale.x * 100.0;
-        }
-        position = input.anchor + offset;
-    }
-    output.position = pc.view_projection * vec4<f32>(position, 1.0);
-    return output;
-}
-@fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let color = input.color * textureSample(ui_texture, ui_sampler, input.uv)
-                * pc.material_color;
-    if ((pc.alpha_clip_enabled > 0.5 && color.a < pc.alpha_clip_threshold)
-        || color.a <= 0.0) {
-        discard;
-    }
-    return color;
-}
-)";
 
 uint64_t GrowCapacity(uint64_t required)
 {
@@ -402,10 +312,10 @@ bool WebScreenUIRenderer::CreatePipelineAndFontAtlas()
     screenBindings[0].visibility = wgpu::ShaderStage::Fragment;
     screenBindings[0].texture.sampleType = wgpu::TextureSampleType::Float;
     screenBindings[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    screenBindings[1].binding = 500;
+    screenBindings[1].binding = 1;
     screenBindings[1].visibility = wgpu::ShaderStage::Fragment;
     screenBindings[1].sampler.type = wgpu::SamplerBindingType::Filtering;
-    screenBindings[2].binding = 999;
+    screenBindings[2].binding = rhi::RootConstantBinding;
     screenBindings[2].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
     screenBindings[2].buffer.type = wgpu::BufferBindingType::Uniform;
     screenBindings[2].buffer.hasDynamicOffset = true;
@@ -415,11 +325,7 @@ bool WebScreenUIRenderer::CreatePipelineAndFontAtlas()
     screenLayoutDescriptor.entries = screenBindings.data();
     m_screenLayout = m_device.CreateBindGroupLayout(&screenLayoutDescriptor);
 
-    wgpu::ShaderSourceWGSL shaderSource;
-    shaderSource.code = kScreenUIShader;
-    wgpu::ShaderModuleDescriptor shaderDescriptor;
-    shaderDescriptor.nextInChain = &shaderSource;
-    const wgpu::ShaderModule shader = m_device.CreateShaderModule(&shaderDescriptor);
+    const auto shaders = CreateUIShaderModules(m_device, GetSlangScreenUIModule());
 
     std::array<wgpu::VertexAttribute, 3> attributes{};
     attributes[0].format = wgpu::VertexFormat::Float32x2;
@@ -447,7 +353,7 @@ bool WebScreenUIRenderer::CreatePipelineAndFontAtlas()
     colorTarget.blend = &blend;
     colorTarget.writeMask = wgpu::ColorWriteMask::All;
     wgpu::FragmentState fragment;
-    fragment.module = shader;
+    fragment.module = shaders[1];
     fragment.entryPoint = "fragment_main";
     fragment.targetCount = 1;
     fragment.targets = &colorTarget;
@@ -456,7 +362,7 @@ bool WebScreenUIRenderer::CreatePipelineAndFontAtlas()
     pipelineLayoutDescriptor.bindGroupLayouts = &m_screenLayout;
     wgpu::RenderPipelineDescriptor descriptor;
     descriptor.layout = m_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
-    descriptor.vertex.module = shader;
+    descriptor.vertex.module = shaders[0];
     descriptor.vertex.entryPoint = "vertex_main";
     descriptor.vertex.bufferCount = 1;
     descriptor.vertex.buffers = &vertexLayout;
@@ -477,10 +383,10 @@ bool WebScreenUIRenderer::CreateWorldPipelines()
     bindings[0].visibility = wgpu::ShaderStage::Fragment;
     bindings[0].texture.sampleType = wgpu::TextureSampleType::Float;
     bindings[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    bindings[1].binding = 500;
+    bindings[1].binding = 1;
     bindings[1].visibility = wgpu::ShaderStage::Fragment;
     bindings[1].sampler.type = wgpu::SamplerBindingType::Filtering;
-    bindings[2].binding = 999;
+    bindings[2].binding = rhi::RootConstantBinding;
     bindings[2].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
     bindings[2].buffer.type = wgpu::BufferBindingType::Uniform;
     bindings[2].buffer.hasDynamicOffset = true;
@@ -490,11 +396,8 @@ bool WebScreenUIRenderer::CreateWorldPipelines()
     layoutDescriptor.entries = bindings.data();
     m_worldLayout = m_device.CreateBindGroupLayout(&layoutDescriptor);
 
-    wgpu::ShaderSourceWGSL shaderSource;
-    shaderSource.code = kWorldUIShader;
-    wgpu::ShaderModuleDescriptor shaderDescriptor;
-    shaderDescriptor.nextInChain = &shaderSource;
-    const wgpu::ShaderModule shader = m_device.CreateShaderModule(&shaderDescriptor);
+    if (!m_worldShaders[0])
+        m_worldShaders = CreateUIShaderModules(m_device, GetSlangWorldUIModule());
     std::array<wgpu::VertexAttribute, 7> attributes{};
     const auto attribute = [&](size_t index, wgpu::VertexFormat format, uint64_t offset) {
         attributes[index].format = format;
@@ -524,7 +427,7 @@ bool WebScreenUIRenderer::CreateWorldPipelines()
     colorTarget.blend = &blend;
     colorTarget.writeMask = wgpu::ColorWriteMask::All;
     wgpu::FragmentState fragment;
-    fragment.module = shader;
+    fragment.module = m_worldShaders[1];
     fragment.entryPoint = "fragment_main";
     fragment.targetCount = 1;
     fragment.targets = &colorTarget;
@@ -539,7 +442,7 @@ bool WebScreenUIRenderer::CreateWorldPipelines()
     depth.depthCompare = wgpu::CompareFunction::GreaterEqual;
     wgpu::RenderPipelineDescriptor descriptor;
     descriptor.layout = pipelineLayout;
-    descriptor.vertex.module = shader;
+    descriptor.vertex.module = m_worldShaders[0];
     descriptor.vertex.entryPoint = "vertex_main";
     descriptor.vertex.bufferCount = 1;
     descriptor.vertex.buffers = &vertexLayout;
@@ -969,6 +872,7 @@ uint64_t WebScreenUIRenderer::UploadTexture(const TextureCpuData &source, uint64
     gpu.wrapMode = wrapMode;
     gpu.anisoLevel = anisoLevel;
     gpu.mipLevels = descriptor.mipLevelCount;
+    gpu.srgb = TextureFormatIsSrgb(texture.format);
     gpu.texture = m_device.CreateTexture(&descriptor);
     gpu.view = gpu.texture ? gpu.texture.CreateView() : wgpu::TextureView{};
 
@@ -1093,11 +997,13 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
             continue;
         const uint64_t textureId = static_cast<uint64_t>(command.GetTexID());
         wgpu::TextureView textureView = m_fontView;
+        float encodeSample = 0.0f;
         if (textureId != kFontTextureId) {
             const auto texture = m_textures.find(textureId);
             if (texture == m_textures.end())
                 continue;
             textureView = texture->second.view;
+            encodeSample = list == 1 && texture->second.srgb ? 1.0f : 0.0f;
         }
         const auto [sampler, samplerKey] = ResolveMaterialSampler(binding, textureId);
         auto group = textureGroups.find(samplerKey);
@@ -1105,9 +1011,9 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
             std::array<wgpu::BindGroupEntry, 3> entries{};
             entries[0].binding = 0;
             entries[0].textureView = textureView;
-            entries[1].binding = 500;
+            entries[1].binding = 1;
             entries[1].sampler = sampler;
-            entries[2].binding = 999;
+            entries[2].binding = rhi::RootConstantBinding;
             entries[2].buffer = m_screenConstantsBuffer;
             entries[2].offset = 0;
             entries[2].size = sizeof(ScreenConstants);
@@ -1121,9 +1027,10 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
             return false;
         ScreenConstants constants;
         constants.scale[0] = 2.0f / static_cast<float>(width);
-        constants.scale[1] = -2.0f / static_cast<float>(height);
+        constants.scale[1] = 2.0f / static_cast<float>(height);
         constants.translate[0] = -1.0f;
-        constants.translate[1] = 1.0f;
+        constants.translate[1] = -1.0f;
+        constants.encodeSample = encodeSample;
         constants.materialColor = glm::make_vec4(binding.baseColor.data());
         constants.alphaClipEnabled = binding.alphaClipEnabled ? 1.0f : 0.0f;
         constants.alphaClipThreshold = binding.alphaClipThreshold;
@@ -1265,9 +1172,9 @@ bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, const glm::m
             std::array<wgpu::BindGroupEntry, 3> entries{};
             entries[0].binding = 0;
             entries[0].textureView = textureView;
-            entries[1].binding = 500;
+            entries[1].binding = 1;
             entries[1].sampler = sampler;
-            entries[2].binding = 999;
+            entries[2].binding = rhi::RootConstantBinding;
             entries[2].buffer = m_worldConstantsBuffer;
             entries[2].offset = 0;
             entries[2].size = sizeof(WorldConstants);

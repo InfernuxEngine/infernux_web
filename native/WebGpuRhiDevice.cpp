@@ -763,6 +763,8 @@ rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::G
             SetError("invalid WebGPU graphics binding layout");
             return {};
         }
+        if (index == WebPushConstantGroup)
+            payload.rootHasResources = layout->desc.entryCount != 0;
         payload.layouts[index] = index == WebPushConstantGroup && desc.pushConstantBytes > 0
                                      ? CreateNativeBindingLayout(layout->desc, true)
                                      : layout->layout;
@@ -875,6 +877,8 @@ rhi::ComputePipelineHandle WebGpuRhiDevice::CreateComputePipeline(const rhi::Com
             SetError("invalid WebGPU compute binding layout");
             return {};
         }
+        if (index == WebPushConstantGroup)
+            payload.rootHasResources = layout->desc.entryCount != 0;
         payload.layouts[index] = index == WebPushConstantGroup && desc.pushConstantBytes > 0
                                      ? CreateNativeBindingLayout(layout->desc, true)
                                      : layout->layout;
@@ -1022,7 +1026,7 @@ void WebGpuRhiDevice::BindGraphicsGroup(WebGpuGraphicsCommandContext &context, u
     const auto handle = context.groups[setIndex];
     const auto *group = Resolve(m_bindGroups, handle);
     if (setIndex == WebPushConstantGroup && pipeline->pushConstantBytes > 0) {
-        if (!context.pushConstantBuffer)
+        if (!context.pushConstantBuffer || (pipeline->rootHasResources && !group))
             return;
         auto native = CreateNativeBindGroup(group ? &group->desc : nullptr, pipeline->layouts[setIndex],
                                             context.pushConstantBuffer);
@@ -1040,7 +1044,7 @@ void WebGpuRhiDevice::BindComputeGroup(WebGpuComputeCommandContext &context, uin
         return;
     const auto *group = Resolve(m_bindGroups, context.groups[setIndex]);
     if (setIndex == WebPushConstantGroup && pipeline->pushConstantBytes > 0) {
-        if (!context.pushConstantBuffer)
+        if (!context.pushConstantBuffer || (pipeline->rootHasResources && !group))
             return;
         auto native = CreateNativeBindGroup(group ? &group->desc : nullptr, pipeline->layouts[setIndex],
                                             context.pushConstantBuffer);

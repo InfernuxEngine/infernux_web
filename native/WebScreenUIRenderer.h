@@ -159,6 +159,7 @@ class WebScreenUIRenderer final
         std::string wrapMode = "clamp";
         int anisoLevel = 1;
         uint32_t mipLevels = 1;
+        bool srgb = false;
     };
 
     ImDrawList *DrawList(int list) const;
@@ -173,6 +174,7 @@ class WebScreenUIRenderer final
     wgpu::Device m_device;
     wgpu::Queue m_queue;
     wgpu::TextureFormat m_colorFormat = wgpu::TextureFormat::Undefined;
+    std::array<wgpu::ShaderModule, 2> m_worldShaders;
     wgpu::RenderPipeline m_pipeline;
     wgpu::RenderPipeline m_worldDepthPipeline;
     wgpu::RenderPipeline m_worldTopPipeline;

@@ -1101,12 +1101,10 @@ void Frame()
                 pass = encoder.BeginRenderPass(&particlePass);
                 (void)g_particleRuntime.Render(pass, *camera, g_width, g_height);
             }
-            glm::mat4 webClip(1.0f);
-            webClip[1][1] = -1.0f;
             try {
-                (void)g_screenUIRenderer.RenderWorld(pass, webClip * camera->GetViewProjectionMatrix(),
-                                                     camera->GetViewMatrix(), camera->GetProjectionMatrix(),
-                                                     camera->GetCullingMask(), g_width, g_height);
+                (void)g_screenUIRenderer.RenderWorld(pass, camera->GetViewProjectionMatrix(), camera->GetViewMatrix(),
+                                                     camera->GetProjectionMatrix(), camera->GetCullingMask(), g_width,
+                                                     g_height);
             } catch (const std::exception &error) {
                 std::fprintf(stderr, "INFERNUX_WEB_WORLD_UI_RENDER_FAILED %s\n", error.what());
                 g_webGpuValidationFailed = true;

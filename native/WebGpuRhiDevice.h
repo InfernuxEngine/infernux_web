@@ -162,6 +162,7 @@ class WebGpuRhiDevice final : public rhi::Device
         std::array<wgpu::BindGroupLayout, rhi::GraphicsPipelineDesc::MaxBindingLayouts> layouts{};
         uint32_t layoutCount = 0;
         uint32_t pushConstantBytes = 0;
+        bool rootHasResources = false;
     };
 
     struct ComputePipelinePayload final
@@ -170,6 +171,7 @@ class WebGpuRhiDevice final : public rhi::Device
         std::array<wgpu::BindGroupLayout, rhi::ComputePipelineDesc::MaxBindingLayouts> layouts{};
         uint32_t layoutCount = 0;
         uint32_t pushConstantBytes = 0;
+        bool rootHasResources = false;
         rhi::BindingLayoutHandle resourceLayout;
     };
 
