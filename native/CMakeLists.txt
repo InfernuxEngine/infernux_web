@@ -369,6 +369,8 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
     add_library(InfernuxWebSceneRuntimeProbe OBJECT EXCLUDE_FROM_ALL
         ${_web_scene_runtime_sources}
     )
+    include("${INFERNUX_ENGINE_SOURCE_ROOT}/cmake/InfernuxPhysicsSources.cmake")
+    infernux_embed_physics_sources(InfernuxWebSceneRuntimeProbe)
     file(GLOB_RECURSE _web_resource_runtime_sources CONFIGURE_DEPENDS
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/core/*.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/resources/*.cpp"
