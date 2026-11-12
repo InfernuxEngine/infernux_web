@@ -6,6 +6,7 @@
 #include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/resources/InxMaterial/InxMaterial.h>
 #include <function/resources/InxTexture/InxTexture.h>
+#include <function/resources/ShaderAsset/SlangSceneModule.h>
 #include <function/scene/Camera.h>
 #include <function/scene/GameObject.h>
 #include <function/scene/Light.h>
@@ -33,575 +34,6 @@ namespace
 
 constexpr uint32_t kLineVertexMarker = 0x4C494E45u;
 constexpr uint32_t kMaxPunctualLights = 8u;
-
-constexpr char kSceneShader[] = R"wgsl(
-struct PunctualLightData {
-    position_range: vec4<f32>,
-    color_intensity: vec4<f32>,
-    direction_outer_cos: vec4<f32>,
-    parameters: vec4<f32>,
-};
-
-struct CameraData {
-    view_projection: mat4x4<f32>,
-    inverse_view_projection: mat4x4<f32>,
-    light_view_projection: mat4x4<f32>,
-    camera_position: vec4<f32>,
-    light_direction_strength: vec4<f32>,
-    light_color_intensity: vec4<f32>,
-    sky_top_exposure: vec4<f32>,
-    sky_horizon: vec4<f32>,
-    sky_ground: vec4<f32>,
-    ambient: vec4<f32>,
-    ambient_sky: vec4<f32>,
-    ambient_equator: vec4<f32>,
-    ambient_ground: vec4<f32>,
-    light_counts: vec4<u32>,
-    punctual_lights: array<PunctualLightData, 8>,
-};
-
-@group(0) @binding(0) var<uniform> camera: CameraData;
-@group(0) @binding(1) var shadow_map: texture_depth_2d;
-@group(0) @binding(2) var shadow_sampler: sampler_comparison;
-
-struct DrawData {
-    model: mat4x4<f32>,
-    normal: mat4x4<f32>,
-};
-@group(0) @binding(3) var<storage, read> draws: array<DrawData>;
-
-struct VertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) uv: vec2<f32>,
-    @location(3) color: vec4<f32>,
-    @location(4) emission: vec4<f32>,
-    @location(5) material: vec4<f32>,
-    @location(6) surface: vec4<f32>,
-    @location(7) tangent: vec4<f32>,
-    @location(8) uv1: vec2<f32>,
-    @location(9) texture_uv_sets0: vec4<f32>,
-    @location(10) texture_uv_sets1: vec2<f32>,
-    @location(11) metallic_channels: vec4<f32>,
-    @location(12) smoothness_channels: vec4<f32>,
-    @location(13) material_sampling: vec2<f32>,
-    @builtin(instance_index) draw_index: u32,
-};
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) normal: vec3<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) world_position: vec3<f32>,
-    @location(3) shadow_position: vec4<f32>,
-    @location(4) emission: vec4<f32>,
-    @location(5) material: vec4<f32>,
-    @location(6) surface: vec4<f32>,
-    @location(7) uv: vec2<f32>,
-    @location(8) tangent: vec4<f32>,
-    @location(9) uv1: vec2<f32>,
-    @location(10) texture_uv_sets0: vec4<f32>,
-    @location(11) texture_uv_sets1: vec2<f32>,
-    @location(12) metallic_channels: vec4<f32>,
-    @location(13) smoothness_channels: vec4<f32>,
-    @location(14) material_sampling: vec2<f32>,
-};
-
-@group(1) @binding(0) var material_base_color_sampler: sampler;
-@group(1) @binding(1) var material_base_color: texture_2d<f32>;
-@group(1) @binding(2) var material_metallic_sampler: sampler;
-@group(1) @binding(3) var material_metallic_map: texture_2d<f32>;
-@group(1) @binding(4) var material_smoothness_sampler: sampler;
-@group(1) @binding(5) var material_smoothness_map: texture_2d<f32>;
-@group(1) @binding(6) var material_ao_sampler: sampler;
-@group(1) @binding(7) var material_ao_map: texture_2d<f32>;
-@group(1) @binding(8) var material_normal_sampler: sampler;
-@group(1) @binding(9) var material_normal_map: texture_2d<f32>;
-@group(1) @binding(10) var material_emission_sampler: sampler;
-@group(1) @binding(11) var material_emission_map: texture_2d<f32>;
-
-@vertex
-fn vertex_main(input: VertexInput) -> VertexOutput {
-    var output: VertexOutput;
-    let draw = draws[input.draw_index];
-    let world_position = draw.model * vec4<f32>(input.position, 1.0);
-    output.position = camera.view_projection * world_position;
-    output.normal = normalize((draw.normal * vec4<f32>(input.normal, 0.0)).xyz);
-    output.color = input.color;
-    output.world_position = world_position.xyz;
-    output.shadow_position = camera.light_view_projection * world_position;
-    output.emission = input.emission;
-    output.material = input.material;
-    output.surface = input.surface;
-    output.uv = input.uv;
-    output.tangent = vec4<f32>(normalize((draw.model * vec4<f32>(input.tangent.xyz, 0.0)).xyz), input.tangent.w);
-    output.uv1 = input.uv1;
-    output.texture_uv_sets0 = input.texture_uv_sets0;
-    output.texture_uv_sets1 = input.texture_uv_sets1;
-    output.metallic_channels = input.metallic_channels;
-    output.smoothness_channels = input.smoothness_channels;
-    output.material_sampling = input.material_sampling;
-    return output;
-}
-
-const PI: f32 = 3.14159265358979323846;
-
-fn fresnel_schlick(f0: vec3<f32>, f90: f32, u: f32) -> vec3<f32> {
-    let x = 1.0 - u;
-    let x2 = x * x;
-    let x5 = x * x2 * x2;
-    return f0 * (1.0 - x5) + vec3<f32>(f90 * x5);
-}
-
-fn fresnel_schlick_roughness(f0: vec3<f32>, f90: f32, ndotv: f32,
-                             perceptual_roughness: f32) -> vec3<f32> {
-    // Match PBR.glsl F_SchlickRoughness exactly. f90 is part of the shared
-    // signature, but HDRP's roughness-aware indirect Fresnel uses a white
-    // grazing target attenuated by perceptual roughness rather than scaling
-    // that target by the material's direct-light f90.
-    let grazing = max(vec3<f32>(1.0 - perceptual_roughness), f0);
-    let x = 1.0 - ndotv;
-    let x2 = x * x;
-    let x5 = x * x2 * x2;
-    return f0 + (grazing - f0) * x5;
-}
-
-fn env_brdf_approx(perceptual_roughness: f32, ndotv: f32) -> vec2<f32> {
-    let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);
-    let c1 = vec4<f32>(1.0, 0.0425, 1.04, -0.04);
-    let r = perceptual_roughness * c0 + c1;
-    let a004 = min(r.x * r.x, exp2(-9.28 * ndotv)) * r.x + r.y;
-    return vec2<f32>(-1.04, 1.04) * a004 + r.zw;
-}
-
-fn sky_gradient(y: f32, sky: vec3<f32>, equator: vec3<f32>, ground: vec3<f32>) -> vec3<f32> {
-    let base = mix(ground, sky, smoothstep(-0.10, 0.45, y));
-    var horizon_mask = 0.0;
-    if (y < 0.0) {
-        let side = 1.0 - smoothstep(0.0, 0.10, -y);
-        horizon_mask = side * side;
-    } else {
-        horizon_mask = 1.0 - smoothstep(0.0, 0.45, y);
-    }
-    return mix(base, equator, horizon_mask * 0.35);
-}
-
-fn sample_ambient_probe(direction: vec3<f32>) -> vec3<f32> {
-    if (camera.ambient_equator.w < 0.5) {
-        return max(camera.ambient.rgb * camera.ambient.w, vec3<f32>(0.0));
-    }
-    return max(sky_gradient(direction.y, camera.ambient_sky.rgb,
-                            camera.ambient_equator.rgb, camera.ambient_ground.rgb),
-               vec3<f32>(0.0));
-}
-
-fn sample_ambient_irradiance(direction: vec3<f32>) -> vec3<f32> {
-    if (camera.ambient_equator.w < 0.5) {
-        return max(camera.ambient.rgb * camera.ambient.w, vec3<f32>(0.0));
-    }
-    let y = clamp(direction.y, -1.0, 1.0);
-    if (y >= 0.0) {
-        return max(mix(camera.ambient_equator.rgb, camera.ambient_sky.rgb, y), vec3<f32>(0.0));
-    }
-    return max(mix(camera.ambient_equator.rgb, camera.ambient_ground.rgb, -y), vec3<f32>(0.0));
-}
-
-fn specular_ambient_direction(normal: vec3<f32>, view_direction: vec3<f32>,
-                              perceptual_roughness: f32) -> vec3<f32> {
-    let reflection = reflect(-view_direction, normal);
-    let roughness = perceptual_roughness * perceptual_roughness;
-    let factor = (1.0 - roughness) * (sqrt(max(1.0 - roughness, 0.0)) + roughness);
-    return normalize(mix(normal, reflection, clamp(factor, 0.0, 1.0)));
-}
-
-fn specular_occlusion(ndotv: f32, occlusion: f32, perceptual_roughness: f32) -> f32 {
-    return clamp(pow(ndotv + occlusion, exp2(-16.0 * perceptual_roughness - 1.0))
-                 - 1.0 + occlusion, 0.0, 1.0);
-}
-
-fn geometric_specular_aa(world_normal: vec3<f32>, roughness: f32) -> f32 {
-    let du = dpdx(world_normal);
-    let dv = dpdy(world_normal);
-    let variance = 0.25 * (dot(du, du) + dot(dv, dv));
-    let kernel_roughness = min(variance, 0.18);
-    return max(roughness, sqrt(roughness * roughness + kernel_roughness));
-}
-
-fn horizon_occlusion(reflection_direction: vec3<f32>, geometric_normal: vec3<f32>) -> f32 {
-    let horizon = clamp(1.0 + dot(reflection_direction, geometric_normal), 0.0, 1.0);
-    return horizon * horizon;
-}
-
-fn disney_diffuse(ndotv: f32, ndotl: f32, ldotv: f32, perceptual_roughness: f32) -> f32 {
-    let fd90 = 0.5 + perceptual_roughness * (1.0 + ldotv);
-    let light_x = 1.0 - ndotl;
-    let view_x = 1.0 - ndotv;
-    let light_scatter = 1.0 + (fd90 - 1.0) * light_x * light_x * light_x * light_x * light_x;
-    let view_scatter = 1.0 + (fd90 - 1.0) * view_x * view_x * view_x * view_x * view_x;
-    return (1.0 / PI) * (1.0 / 1.03571) * light_scatter * view_scatter;
-}
-
-fn dv_smith_joint_ggx(ndoth: f32, ndotl: f32, ndotv: f32, roughness: f32) -> f32 {
-    let a2 = roughness * roughness;
-    let s = (ndoth * a2 - ndoth) * ndoth + 1.0;
-    let lambda_v = ndotl * sqrt(max((-ndotv * a2 + ndotv) * ndotv + a2, 1.0e-7));
-    let lambda_l = ndotv * sqrt(max((-ndotl * a2 + ndotl) * ndotl + a2, 1.0e-7));
-    return (1.0 / PI) * 0.5 * a2 / max(s * s * (lambda_v + lambda_l), 1.0e-7);
-}
-
-fn evaluate_pbr_light(normal: vec3<f32>, view_direction: vec3<f32>, light_direction: vec3<f32>,
-                      radiance: vec3<f32>, albedo: vec3<f32>, metallic: f32,
-                      perceptual_roughness: f32, roughness: f32, f0: vec3<f32>, f90: f32,
-                      energy_compensation: vec3<f32>, specular_highlights: f32) -> vec3<f32> {
-    let half_vector_sum = view_direction + light_direction;
-    var half_vector = normal;
-    if (dot(half_vector_sum, half_vector_sum) > 1.0e-8) {
-        half_vector = normalize(half_vector_sum);
-    }
-    let ndotl = max(dot(normal, light_direction), 0.0);
-    if (ndotl <= 0.0) {
-        return vec3<f32>(0.0);
-    }
-    let ndotv = max(dot(normal, view_direction), 0.0);
-    let ndoth = max(dot(normal, half_vector), 0.0);
-    let ldoth = max(dot(light_direction, half_vector), 0.0);
-    let ldotv = max(dot(light_direction, view_direction), 0.0);
-    let fresnel = fresnel_schlick(f0, f90, ldoth);
-    let specular = fresnel * dv_smith_joint_ggx(ndoth, ndotl, ndotv, roughness)
-                   * energy_compensation * clamp(specular_highlights, 0.0, 1.0);
-    let diffuse = albedo * (1.0 - metallic) *
-                  disney_diffuse(ndotv, ndotl, ldotv, perceptual_roughness);
-    return (diffuse + specular) * radiance * (ndotl * PI);
-}
-
-fn punctual_attenuation(distance_to_light: f32, range: f32) -> f32 {
-    let safe_range = max(range, 1.0e-4);
-    let distance_squared = distance_to_light * distance_to_light;
-    let ratio_squared = distance_squared / (safe_range * safe_range);
-    let factor = clamp(1.0 - ratio_squared * ratio_squared, 0.0, 1.0);
-    return factor * factor / (distance_squared + 1.0);
-}
-
-fn toon_step(value: f32, threshold: f32, softness: f32) -> f32 {
-    let width = max(softness, 0.0001);
-    return smoothstep(threshold - width, threshold + width, value);
-}
-
-fn evaluate_toon_light(normal: vec3<f32>, view_direction: vec3<f32>,
-                       light_direction: vec3<f32>, radiance: vec3<f32>,
-                       albedo: vec3<f32>, threshold: f32, softness: f32,
-                       smoothness: f32, specular_strength: f32) -> vec3<f32> {
-    let ndotl = max(dot(normal, light_direction), 0.0);
-    let diffuse_band = toon_step(ndotl, threshold, softness);
-    let half_sum = view_direction + light_direction;
-    var half_vector = normal;
-    if (dot(half_sum, half_sum) > 1.0e-8) {
-        half_vector = normalize(half_sum);
-    }
-    let exponent = mix(12.0, 256.0, clamp(smoothness, 0.0, 1.0));
-    let raw_specular = pow(max(dot(normal, half_vector), 0.0), exponent);
-    let specular_band = toon_step(raw_specular, 0.5, softness * 0.5);
-    let diffuse = albedo * mix(0.18, 1.0, diffuse_band);
-    let specular = vec3<f32>(specular_band * clamp(specular_strength, 0.0, 1.0));
-    return (diffuse + specular) * radiance * select(0.0, 1.0, ndotl >= 0.0001);
-}
-
-fn sample_shadow(position: vec4<f32>, normal: vec3<f32>) -> f32 {
-    if (camera.light_direction_strength.w <= 0.0 || position.w <= 0.0) {
-        return 1.0;
-    }
-    let ndc = position.xyz / position.w;
-    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    if (ndc.z <= 0.0 || ndc.z >= 1.0 || any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) {
-        return 1.0;
-    }
-    let toward_light = normalize(camera.light_direction_strength.xyz);
-    let normal_bias = 0.0015 * (1.0 - max(dot(normal, toward_light), 0.0));
-    let texel = 1.0 / vec2<f32>(textureDimensions(shadow_map));
-    var visibility = 0.0;
-    for (var y = -1; y <= 1; y = y + 1) {
-        for (var x = -1; x <= 1; x = x + 1) {
-            visibility += textureSampleCompareLevel(shadow_map, shadow_sampler,
-                                                     uv + vec2<f32>(f32(x), f32(y)) * texel,
-                                                     ndc.z + 0.0008 + normal_bias);
-        }
-    }
-    let filtered = visibility / 9.0;
-    return mix(1.0 - camera.light_direction_strength.w, 1.0, filtered);
-}
-
-fn material_uv(input: VertexOutput, selector: f32) -> vec2<f32> {
-    return select(input.uv, input.uv1, selector >= 0.5);
-}
-
-fn sample_material_normal(input: VertexOutput, geometric_normal: vec3<f32>) -> vec3<f32> {
-    var tangent = input.tangent.xyz - geometric_normal * dot(input.tangent.xyz, geometric_normal);
-    if (dot(tangent, tangent) <= 1.0e-8) {
-        let fallback = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0),
-                              abs(geometric_normal.y) > 0.999);
-        tangent = normalize(cross(fallback, geometric_normal));
-    } else {
-        tangent = normalize(tangent);
-    }
-    let handedness = select(-1.0, 1.0, input.tangent.w >= 0.0);
-    let bitangent = normalize(cross(geometric_normal, tangent)) * handedness;
-    let uv = material_uv(input, input.texture_uv_sets1.x);
-    var tangent_normal = textureSample(material_normal_map, material_normal_sampler, uv).rgb * 2.0 - 1.0;
-    tangent_normal.x *= abs(input.tangent.w);
-    tangent_normal.y *= abs(input.tangent.w);
-    tangent_normal = normalize(tangent_normal);
-    let authored_normal = normalize(tangent * tangent_normal.x + bitangent * tangent_normal.y +
-                                    geometric_normal * tangent_normal.z);
-
-    // Imported tangents are authored for UV0. Match the desktop Lit contract
-    // by reconstructing the UV1 basis from fragment derivatives. Derivatives
-    // stay outside control flow so WebGPU uniformity validation remains strict.
-    let position_dx = dpdx(input.world_position);
-    let position_dy = dpdy(input.world_position);
-    let uv_dx = dpdx(uv);
-    let uv_dy = dpdy(uv);
-    let dy_perpendicular = cross(position_dy, geometric_normal);
-    let dx_perpendicular = cross(geometric_normal, position_dx);
-    let derivative_tangent = dy_perpendicular * uv_dx.x + dx_perpendicular * uv_dy.x;
-    let derivative_bitangent = dy_perpendicular * uv_dx.y + dx_perpendicular * uv_dy.y;
-    let basis_length_sq = max(dot(derivative_tangent, derivative_tangent),
-                              dot(derivative_bitangent, derivative_bitangent));
-    let inverse_basis_length = inverseSqrt(max(basis_length_sq, 1.0e-12));
-    let derivative_normal = normalize(derivative_tangent * inverse_basis_length * tangent_normal.x +
-                                      derivative_bitangent * inverse_basis_length * tangent_normal.y +
-                                      geometric_normal * tangent_normal.z);
-    let use_derivative_basis = input.texture_uv_sets1.x >= 0.5 && basis_length_sq > 1.0e-12;
-    return select(authored_normal, derivative_normal, use_derivative_basis);
-}
-
-@fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let geometric_normal = normalize(input.normal);
-    let normal = sample_material_normal(input, geometric_normal);
-    let sampled_color = textureSample(material_base_color, material_base_color_sampler,
-                                      material_uv(input, input.texture_uv_sets0.x));
-    let surface_color = input.color * sampled_color;
-    if (input.surface.w >= 0.0 && surface_color.a < input.surface.w) {
-        discard;
-    }
-    let sampled_metallic_texel = textureSample(material_metallic_map, material_metallic_sampler,
-                                               material_uv(input, input.texture_uv_sets0.y));
-    let sampled_metallic = dot(sampled_metallic_texel, input.metallic_channels);
-    let sampled_smoothness_texel = textureSample(material_smoothness_map, material_smoothness_sampler,
-                                                 material_uv(input, input.texture_uv_sets0.z));
-    let sampled_smoothness_channel = dot(sampled_smoothness_texel, input.smoothness_channels);
-    let direct_smoothness = sampled_smoothness_channel * input.material.y;
-    let roughness_smoothness = 1.0 - sampled_smoothness_channel * (1.0 - input.material.y);
-    let sampled_smoothness = mix(direct_smoothness, roughness_smoothness,
-                                 clamp(input.material_sampling.x, 0.0, 1.0));
-    let sampled_occlusion = textureSample(material_ao_map, material_ao_sampler,
-                                          material_uv(input, input.texture_uv_sets0.w)).r;
-    let occlusion_strength = clamp(input.material_sampling.y, 0.0, 1.0);
-    let material_occlusion = mix(1.0, sampled_occlusion, occlusion_strength);
-    let sampled_emission = textureSample(material_emission_map, material_emission_sampler,
-                                         material_uv(input, input.texture_uv_sets1.y)).rgb;
-    let emission = sampled_emission * input.emission.rgb * input.emission.a;
-    var perceptual_roughness = clamp(1.0 - sampled_smoothness, 0.045, 1.0);
-    var roughness = perceptual_roughness * perceptual_roughness;
-    // Derivatives must execute in uniform fragment control flow on WebGPU.
-    // Evaluate geometric AA before the per-material unlit early return.
-    roughness = geometric_specular_aa(normal, roughness);
-    perceptual_roughness = max(perceptual_roughness, sqrt(roughness));
-    if (input.surface.x > 0.5 && input.surface.x < 1.5) {
-        return vec4<f32>(surface_color.rgb + emission, surface_color.a);
-    }
-    let view_direction = normalize(camera.camera_position.xyz - input.world_position);
-    if (input.surface.x >= 1.5) {
-        let toward_light = normalize(camera.light_direction_strength.xyz);
-        let shadow = sample_shadow(input.shadow_position, normal);
-        let radiance = camera.light_color_intensity.rgb * camera.light_color_intensity.w;
-        var direct = evaluate_toon_light(
-            normal, view_direction, toward_light, radiance, surface_color.rgb,
-            clamp(input.surface.y, 0.0, 1.0), clamp(input.surface.z, 0.0, 0.25),
-            input.material.y, input.material.w) * shadow;
-        for (var light_index = 0u; light_index < camera.light_counts.x; light_index = light_index + 1u) {
-            let light = camera.punctual_lights[light_index];
-            if (light.parameters.z > 0.5) {
-                direct += evaluate_toon_light(
-                    normal, view_direction, -normalize(light.direction_outer_cos.xyz),
-                    light.color_intensity.rgb * light.color_intensity.w,
-                    surface_color.rgb, clamp(input.surface.y, 0.0, 1.0),
-                    clamp(input.surface.z, 0.0, 0.25), input.material.y, input.material.w);
-                continue;
-            }
-            let to_light = light.position_range.xyz - input.world_position;
-            let distance_to_light = length(to_light);
-            if (distance_to_light <= 1.0e-5 || distance_to_light >= light.position_range.w) {
-                continue;
-            }
-            let local_direction = to_light / distance_to_light;
-            var cone = 1.0;
-            if (light.parameters.y > 0.5) {
-                let theta = dot(local_direction, -normalize(light.direction_outer_cos.xyz));
-                cone = clamp((theta - light.direction_outer_cos.w) /
-                             max(light.parameters.x - light.direction_outer_cos.w, 1.0e-4), 0.0, 1.0);
-            }
-            let attenuation = punctual_attenuation(distance_to_light, light.position_range.w) * cone;
-            direct += evaluate_toon_light(
-                normal, view_direction, local_direction,
-                light.color_intensity.rgb * light.color_intensity.w * attenuation,
-                surface_color.rgb, clamp(input.surface.y, 0.0, 1.0),
-                clamp(input.surface.z, 0.0, 0.25), input.material.y, input.material.w);
-        }
-        let ambient = sample_ambient_irradiance(normal) * surface_color.rgb
-                      * clamp(input.material.z * material_occlusion, 0.0, 1.0) * 0.65;
-        return vec4<f32>(ambient + direct + emission,
-                         surface_color.a);
-    }
-    let ndotv = max(dot(normal, view_direction), 0.0);
-    let metallic = clamp(input.material.x * sampled_metallic, 0.0, 1.0);
-    let occlusion = clamp(input.material.z * material_occlusion, 0.0, 1.0);
-    let specular_highlights = clamp(input.material.w, 0.0, 1.0);
-    let f0 = mix(vec3<f32>(0.04), surface_color.rgb, vec3<f32>(metallic));
-    let f90 = clamp(50.0 * dot(f0, vec3<f32>(0.33333)), 0.0, 1.0);
-    let env_brdf = env_brdf_approx(perceptual_roughness, ndotv);
-    let reflectivity = env_brdf.x + env_brdf.y;
-    let energy_compensation = vec3<f32>(1.0) + f0 * (1.0 / max(reflectivity, 0.001) - 1.0);
-    let toward_light = normalize(camera.light_direction_strength.xyz);
-    let shadow = sample_shadow(input.shadow_position, normal);
-    let radiance = camera.light_color_intensity.rgb * camera.light_color_intensity.w;
-    var direct = evaluate_pbr_light(normal, view_direction, toward_light, radiance, surface_color.rgb,
-                                    metallic, perceptual_roughness, roughness, f0, f90,
-                                    energy_compensation, specular_highlights) * shadow;
-
-    for (var light_index = 0u; light_index < camera.light_counts.x; light_index = light_index + 1u) {
-        let light = camera.punctual_lights[light_index];
-        if (light.parameters.z > 0.5) {
-            direct += evaluate_pbr_light(
-                normal, view_direction, -normalize(light.direction_outer_cos.xyz),
-                light.color_intensity.rgb * light.color_intensity.w, surface_color.rgb,
-                metallic, perceptual_roughness, roughness, f0, f90,
-                energy_compensation, specular_highlights);
-            continue;
-        }
-        let to_light = light.position_range.xyz - input.world_position;
-        let distance_to_light = length(to_light);
-        if (distance_to_light <= 1.0e-5 || distance_to_light >= light.position_range.w) {
-            continue;
-        }
-        let local_direction = to_light / distance_to_light;
-        var cone = 1.0;
-        if (light.parameters.y > 0.5) {
-            let theta = dot(local_direction, -normalize(light.direction_outer_cos.xyz));
-            cone = clamp((theta - light.direction_outer_cos.w) /
-                         max(light.parameters.x - light.direction_outer_cos.w, 1.0e-4), 0.0, 1.0);
-        }
-        let attenuation = punctual_attenuation(distance_to_light, light.position_range.w) * cone;
-        let local_radiance = light.color_intensity.rgb * light.color_intensity.w * attenuation;
-        direct += evaluate_pbr_light(normal, view_direction, local_direction, local_radiance,
-                                     surface_color.rgb, metallic, perceptual_roughness, roughness, f0, f90,
-                                     energy_compensation, specular_highlights);
-    }
-    let diffuse_irradiance = sample_ambient_irradiance(normal);
-    let reflection_direction = specular_ambient_direction(normal, view_direction, perceptual_roughness);
-    let prefilter = clamp(perceptual_roughness * (1.7 - 0.7 * perceptual_roughness), 0.0, 1.0);
-    let specular_irradiance = mix(sample_ambient_probe(reflection_direction),
-                                  sample_ambient_irradiance(reflection_direction), prefilter);
-    let environment_fresnel = fresnel_schlick_roughness(f0, f90, ndotv, perceptual_roughness);
-    let diffuse_weight = (vec3<f32>(1.0) - environment_fresnel) * (1.0 - metallic);
-    let ambient_diffuse = diffuse_weight * surface_color.rgb * diffuse_irradiance * occlusion;
-    let ambient_specular = specular_irradiance * (f0 * env_brdf.x + vec3<f32>(env_brdf.y))
-                           * energy_compensation
-                           * specular_occlusion(ndotv, occlusion, perceptual_roughness)
-                            * horizon_occlusion(reflection_direction, geometric_normal)
-                           * specular_highlights;
-    return vec4<f32>(ambient_diffuse + ambient_specular + direct + emission,
-                     surface_color.a);
-}
-)wgsl";
-
-constexpr char kSkyShader[] = R"wgsl(
-struct CameraData {
-    view_projection: mat4x4<f32>,
-    inverse_view_projection: mat4x4<f32>,
-    light_view_projection: mat4x4<f32>,
-    camera_position: vec4<f32>,
-    light_direction_strength: vec4<f32>,
-    light_color_intensity: vec4<f32>,
-    sky_top_exposure: vec4<f32>,
-    sky_horizon: vec4<f32>,
-    sky_ground: vec4<f32>,
-    ambient: vec4<f32>,
-};
-@group(0) @binding(0) var<uniform> camera: CameraData;
-@group(1) @binding(0) var sky_sampler: sampler;
-@group(1) @binding(1) var sky_texture: texture_2d<f32>;
-
-struct SkyOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) clip_position: vec2<f32>,
-};
-
-@vertex
-fn vertex_main(@builtin(vertex_index) index: u32) -> SkyOutput {
-    let positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
-    var output: SkyOutput;
-    output.position = vec4<f32>(positions[index], 0.0, 1.0);
-    output.clip_position = positions[index];
-    return output;
-}
-
-@fragment
-fn fragment_main(input: SkyOutput) -> @location(0) vec4<f32> {
-    let far_world = camera.inverse_view_projection * vec4<f32>(input.clip_position, 0.0, 1.0);
-    let direction = normalize(far_world.xyz / far_world.w - camera.camera_position.xyz);
-    if (camera.sky_horizon.w > 0.5) {
-        let uv = vec2<f32>(fract(atan2(direction.z, direction.x) / 6.28318530718 + 0.5
-                                 + camera.sky_ground.w / 360.0),
-                           acos(clamp(direction.y, -1.0, 1.0)) / 3.14159265359);
-        let color = textureSampleLevel(sky_texture, sky_sampler, uv, 0.0).rgb;
-        return vec4<f32>(color * camera.sky_top_exposure.rgb * camera.sky_top_exposure.w, 1.0);
-    }
-    let y = direction.y;
-    let base = mix(camera.sky_ground.rgb, camera.sky_top_exposure.rgb,
-                   smoothstep(-0.10, 0.45, y));
-    var horizon_mask = 0.0;
-    if (y < 0.0) {
-        let side = 1.0 - smoothstep(0.0, 0.10, -y);
-        horizon_mask = side * side;
-    } else {
-        horizon_mask = 1.0 - smoothstep(0.0, 0.45, y);
-    }
-    var color = mix(base, camera.sky_horizon.rgb, horizon_mask * 0.35);
-    let horizon_glow = pow(1.0 - abs(y), 8.0) * 0.15;
-    color += vec3<f32>(horizon_glow);
-    return vec4<f32>(color * camera.sky_top_exposure.w, 1.0);
-}
-)wgsl";
-
-constexpr char kShadowShader[] = R"wgsl(
-struct CameraData {
-    view_projection: mat4x4<f32>,
-    inverse_view_projection: mat4x4<f32>,
-    light_view_projection: mat4x4<f32>,
-    camera_position: vec4<f32>,
-    light_direction_strength: vec4<f32>,
-    light_color_intensity: vec4<f32>,
-    sky_top_exposure: vec4<f32>,
-    sky_horizon: vec4<f32>,
-    sky_ground: vec4<f32>,
-    ambient: vec4<f32>,
-};
-@group(0) @binding(0) var<uniform> camera: CameraData;
-
-struct DrawData {
-    model: mat4x4<f32>,
-    normal: mat4x4<f32>,
-};
-@group(0) @binding(1) var<storage, read> draws: array<DrawData>;
-
-@vertex
-fn vertex_main(@location(0) position: vec3<f32>,
-               @builtin(instance_index) draw_index: u32) -> @builtin(position) vec4<f32> {
-    return camera.light_view_projection * draws[draw_index].model * vec4<f32>(position, 1.0);
-}
-)wgsl";
 
 const MaterialProperty *ResolvedMaterialProperty(const std::shared_ptr<InxMaterial> &material,
                                                  const std::shared_ptr<const RendererParameterBlock> &parameters,
@@ -785,6 +217,7 @@ glm::mat4 ToWebClipSpace(const glm::mat4 &vulkanViewProjection)
 bool WebSceneRenderer::Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::TextureFormat colorFormat,
                                   uint32_t sceneSampleCount)
 {
+    m_shaders.clear();
     m_device = std::move(device);
     m_queue = std::move(queue);
     m_colorFormat = colorFormat;
@@ -837,7 +270,7 @@ bool WebSceneRenderer::Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::
     shadowCameraEntries[0].visibility = wgpu::ShaderStage::Vertex;
     shadowCameraEntries[0].buffer.type = wgpu::BufferBindingType::Uniform;
     shadowCameraEntries[0].buffer.minBindingSize = sizeof(CameraData);
-    shadowCameraEntries[1].binding = 1;
+    shadowCameraEntries[1].binding = 3;
     shadowCameraEntries[1].visibility = wgpu::ShaderStage::Vertex;
     shadowCameraEntries[1].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
     shadowCameraEntries[1].buffer.minBindingSize = sizeof(WebDrawData);
@@ -875,7 +308,7 @@ bool WebSceneRenderer::CreateCameraBindGroups()
     shadowCameraBindings[0].binding = 0;
     shadowCameraBindings[0].buffer = m_cameraBuffer;
     shadowCameraBindings[0].size = sizeof(CameraData);
-    shadowCameraBindings[1].binding = 1;
+    shadowCameraBindings[1].binding = 3;
     shadowCameraBindings[1].buffer = m_drawDataBuffer;
     shadowCameraBindings[1].size = m_drawDataCapacity;
     wgpu::BindGroupDescriptor shadowCameraGroupDescriptor;
@@ -1109,9 +542,11 @@ WebSceneRenderer::GPUTexture WebSceneRenderer::ResolveMaterialTexture(const std:
             if (gpu.view) {
                 state.gpu = std::move(gpu);
                 ++m_materialTextureGeneration;
-                std::printf("INFERNUX_WEB_MATERIAL_TEXTURE_READY guid=%s width=%u height=%u mips=%u filter=%s wrap=%s sampler=%s\n",
+                std::printf("INFERNUX_WEB_MATERIAL_TEXTURE_READY guid=%s width=%u height=%u mips=%u filter=%s wrap=%s "
+                            "sampler=%s\n",
                             guid.c_str(), texture.mipLevels.front().width, texture.mipLevels.front().height,
-                            state.gpu.mipLevels, data.filterMode.c_str(), data.wrapMode.c_str(), samplerIdentity.c_str());
+                            state.gpu.mipLevels, data.filterMode.c_str(), data.wrapMode.c_str(),
+                            samplerIdentity.c_str());
             } else {
                 std::fprintf(stderr, "INFERNUX_WEB_MATERIAL_TEXTURE_FAILED guid=%s format=%s\n", guid.c_str(),
                              TextureFormatName(texture.format));
@@ -1149,13 +584,21 @@ WebSceneRenderer::ResolveMaterialTextureSet(const std::shared_ptr<InxMaterial> &
 
 bool WebSceneRenderer::CreatePipelines()
 {
-    wgpu::ShaderSourceWGSL shaderSource;
-    shaderSource.code = kSceneShader;
-    wgpu::ShaderModuleDescriptor shaderDescriptor;
-    shaderDescriptor.nextInChain = &shaderSource;
-    const wgpu::ShaderModule shader = m_device.CreateShaderModule(&shaderDescriptor);
-    if (!shader)
-        return false;
+    if (m_shaders.empty()) {
+        try {
+            auto compiled = SlangCompiler::Get().Compile(GetSlangSceneModule(), {}, {ShaderCodeTarget::Wgsl});
+            for (const auto &entry : compiled.targets.front().entries) {
+                wgpu::ShaderSourceWGSL source;
+                source.code = wgpu::StringView(entry.code.data(), entry.code.size());
+                wgpu::ShaderModuleDescriptor descriptor;
+                descriptor.nextInChain = &source;
+                m_shaders.emplace(entry.name, m_device.CreateShaderModule(&descriptor));
+            }
+        } catch (const std::exception &error) {
+            std::fprintf(stderr, "INFERNUX_WEB_SCENE_SHADER_FAILED %s\n", error.what());
+            return false;
+        }
+    }
 
     std::array<wgpu::VertexAttribute, 14> attributes{};
     attributes[0].format = wgpu::VertexFormat::Float32x3;
@@ -1210,8 +653,8 @@ bool WebSceneRenderer::CreatePipelines()
     colorTarget.format = m_colorFormat;
     colorTarget.writeMask = wgpu::ColorWriteMask::All;
     wgpu::FragmentState fragment;
-    fragment.module = shader;
-    fragment.entryPoint = "fragment_main";
+    fragment.module = m_shaders.at("scene_fragment");
+    fragment.entryPoint = "scene_fragment";
     fragment.targetCount = 1;
     fragment.targets = &colorTarget;
 
@@ -1227,8 +670,8 @@ bool WebSceneRenderer::CreatePipelines()
 
     wgpu::RenderPipelineDescriptor pipelineDescriptor;
     pipelineDescriptor.layout = m_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
-    pipelineDescriptor.vertex.module = shader;
-    pipelineDescriptor.vertex.entryPoint = "vertex_main";
+    pipelineDescriptor.vertex.module = m_shaders.at("scene_vertex");
+    pipelineDescriptor.vertex.entryPoint = "scene_vertex";
     pipelineDescriptor.vertex.bufferCount = 1;
     pipelineDescriptor.vertex.buffers = &vertexLayout;
     pipelineDescriptor.fragment = &fragment;
@@ -1260,20 +703,15 @@ bool WebSceneRenderer::CreatePipelines()
         }
     }
 
-    wgpu::ShaderSourceWGSL skyShaderSource;
-    skyShaderSource.code = kSkyShader;
-    wgpu::ShaderModuleDescriptor skyShaderDescriptor;
-    skyShaderDescriptor.nextInChain = &skyShaderSource;
-    const wgpu::ShaderModule skyShader = m_device.CreateShaderModule(&skyShaderDescriptor);
     wgpu::FragmentState skyFragment;
-    skyFragment.module = skyShader;
-    skyFragment.entryPoint = "fragment_main";
+    skyFragment.module = m_shaders.at("sky_fragment");
+    skyFragment.entryPoint = "sky_fragment";
     skyFragment.targetCount = 1;
     skyFragment.targets = &colorTarget;
     wgpu::RenderPipelineDescriptor skyPipelineDescriptor;
     skyPipelineDescriptor.layout = pipelineDescriptor.layout;
-    skyPipelineDescriptor.vertex.module = skyShader;
-    skyPipelineDescriptor.vertex.entryPoint = "vertex_main";
+    skyPipelineDescriptor.vertex.module = m_shaders.at("sky_vertex");
+    skyPipelineDescriptor.vertex.entryPoint = "sky_vertex";
     skyPipelineDescriptor.fragment = &skyFragment;
     skyPipelineDescriptor.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
     skyPipelineDescriptor.primitive.cullMode = wgpu::CullMode::None;
@@ -1285,11 +723,6 @@ bool WebSceneRenderer::CreatePipelines()
     skyPipelineDescriptor.depthStencil = &skyDepth;
     m_skyPipeline = m_device.CreateRenderPipeline(&skyPipelineDescriptor);
 
-    wgpu::ShaderSourceWGSL shadowShaderSource;
-    shadowShaderSource.code = kShadowShader;
-    wgpu::ShaderModuleDescriptor shadowShaderDescriptor;
-    shadowShaderDescriptor.nextInChain = &shadowShaderSource;
-    const wgpu::ShaderModule shadowShader = m_device.CreateShaderModule(&shadowShaderDescriptor);
     wgpu::DepthStencilState shadowDepth;
     shadowDepth.format = wgpu::TextureFormat::Depth32Float;
     shadowDepth.depthWriteEnabled = wgpu::OptionalBool::True;
@@ -1301,8 +734,8 @@ bool WebSceneRenderer::CreatePipelines()
     shadowPipelineLayoutDescriptor.bindGroupLayouts = &m_shadowCameraLayout;
     wgpu::RenderPipelineDescriptor shadowPipelineDescriptor;
     shadowPipelineDescriptor.layout = m_device.CreatePipelineLayout(&shadowPipelineLayoutDescriptor);
-    shadowPipelineDescriptor.vertex.module = shadowShader;
-    shadowPipelineDescriptor.vertex.entryPoint = "vertex_main";
+    shadowPipelineDescriptor.vertex.module = m_shaders.at("shadow_vertex");
+    shadowPipelineDescriptor.vertex.entryPoint = "shadow_vertex";
     shadowPipelineDescriptor.vertex.bufferCount = 1;
     shadowPipelineDescriptor.vertex.buffers = &vertexLayout;
     shadowPipelineDescriptor.primitive.topology = wgpu::PrimitiveTopology::TriangleList;

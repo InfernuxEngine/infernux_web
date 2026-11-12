@@ -177,6 +177,7 @@ class WebSceneRenderer final
     bool BuildFrame(uint32_t width, uint32_t height, Camera *camera);
     void ReportFrameIssue(const char *issue);
 
+    std::unordered_map<std::string, wgpu::ShaderModule> m_shaders;
     wgpu::Device m_device;
     wgpu::Queue m_queue;
     wgpu::TextureFormat m_colorFormat = wgpu::TextureFormat::Undefined;
