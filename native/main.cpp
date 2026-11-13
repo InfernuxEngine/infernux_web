@@ -8,7 +8,6 @@
 #include <core/threading/FrameWorkOwner.h>
 #include <core/threading/JobSystem.h>
 #include <function/audio/AudioEngine.h>
-#include <function/renderer/FullscreenRenderer.h>
 #include <platform/filesystem/InxPack.h>
 #include <platform/input/InputManager.h>
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
@@ -20,7 +19,6 @@
 #endif
 
 #include "InfernuxWebHostModule.h"
-#include "WebFullscreenShaderContract.h"
 #include "WebGpuComputeQueue.h"
 #include "WebGpuRhiDevice.h"
 #include "WebKeyboard.h"
@@ -110,8 +108,6 @@ std::shared_ptr<infernux::rhi::ComputeHostServices> g_computeServices;
 std::unique_ptr<infernux::web::WebGpuComputeQueue> g_computeQueue;
 std::unique_ptr<infernux::rhi::ComputeHost> g_computeHost;
 infernux::FrameWorkOwner g_frameWork;
-infernux::FullscreenRenderer g_fullscreenRenderer;
-infernux::FullscreenPipelineKey g_fullscreenPipelineKey;
 infernux::web::WebSceneRenderer g_sceneRenderer;
 infernux::web::WebParticleRuntime g_particleRuntime;
 infernux::web::WebPostProcessRenderer g_postProcessRenderer;
@@ -184,79 +180,6 @@ int BrowserButtonToUnityButton(unsigned short button)
         return -1;
     }
 }
-
-class WebFullscreenRendererHost final : public infernux::FullscreenRendererHost
-{
-  public:
-    explicit WebFullscreenRendererHost(infernux::web::WebGpuRhiDevice &device) : m_device(device)
-    {
-    }
-
-    [[nodiscard]] infernux::rhi::Device &GetRhiDevice() noexcept override
-    {
-        return m_device;
-    }
-
-    [[nodiscard]] uint32_t GetFrameCount() const noexcept override
-    {
-        return 1;
-    }
-
-    [[nodiscard]] uint32_t GetCurrentFrame() const noexcept override
-    {
-        return 0;
-    }
-
-    [[nodiscard]] infernux::rhi::ShaderModuleHandle AcquireShaderModule(const std::string &name,
-                                                                        infernux::rhi::ShaderStage stage,
-                                                                        uint32_t inputCount,
-                                                                        uint32_t inputBufferMask) override
-    {
-        const char *stageName = nullptr;
-        if (stage == infernux::rhi::ShaderStage::Vertex)
-            stageName = "vertex";
-        else if (stage == infernux::rhi::ShaderStage::Fragment)
-            stageName = "fragment";
-        else if (stage == infernux::rhi::ShaderStage::Compute)
-            stageName = "compute";
-        if (stageName == nullptr)
-            return {};
-        std::string source;
-        if (!InfernuxWebFindShaderSource(name, stageName, source))
-            return {};
-        if (stage == infernux::rhi::ShaderStage::Fragment) {
-            std::string contractError;
-            if (!infernux::web::ValidateFullscreenShaderInputs(source, inputCount, inputBufferMask, contractError)) {
-                ReportError("Fullscreen shader '" + name + "': " + contractError);
-                return {};
-            }
-        }
-        return m_device.CreateShaderModule(infernux::rhi::ShaderModuleDesc::FromWgsl(source.data(), source.size()));
-    }
-
-    [[nodiscard]] infernux::rhi::BindingLayoutHandle GetPerViewLayout() const noexcept override
-    {
-        return {};
-    }
-
-    [[nodiscard]] infernux::rhi::BindingLayoutHandle GetGlobalsLayout() const noexcept override
-    {
-        return {};
-    }
-
-    void ReportError(const std::string &message) override
-    {
-        std::fprintf(stderr, "INFERNUX_WEB_RENDER_ERROR %s\n", message.c_str());
-    }
-
-    void ReportInfo(const std::string &message) override
-    {
-        std::printf("INFERNUX_WEB_RENDER_INFO %s\n", message.c_str());
-    }
-
-  private:
-    infernux::web::WebGpuRhiDevice &m_device;
-};
 
 void PrintPythonError(const char *context)
 {
@@ -850,7 +773,7 @@ infernux::rhi::PixelFormat ToRhiFormat(wgpu::TextureFormat format)
     }
 }
 
-bool CreateRhiPipeline()
+bool CreateRhiServices()
 {
     if (ToRhiFormat(g_surfaceFormat) == infernux::rhi::PixelFormat::Undefined)
         return false;
@@ -862,11 +785,7 @@ bool CreateRhiPipeline()
     g_computeHost = std::make_unique<infernux::rhi::ComputeHost>(*g_rhi, *g_computeQueue, g_computeServices);
     InfernuxWebSetComputeHost(g_computeHost.get());
     InfernuxWebSetFrameWork(&g_frameWork);
-    g_fullscreenRenderer.Initialize(std::make_shared<WebFullscreenRendererHost>(*g_rhi));
-    g_fullscreenPipelineKey.shaderName = "Web Host";
-    g_fullscreenPipelineKey.colorFormat = infernux::rhi::PixelFormat::RGBA16SFloat;
-    g_fullscreenPipelineKey.useDynamicRendering = true;
-    return g_fullscreenRenderer.EnsurePipeline(g_fullscreenPipelineKey).pipeline.IsValid();
+    return true;
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebTextInput(const char *text)
@@ -1203,7 +1122,7 @@ void StartSurface()
         return;
     }
     g_surfaceFormat = capabilities.formats[0];
-    if (!CreateRhiPipeline()) {
+    if (!CreateRhiServices()) {
         std::fprintf(stderr, "INFERNUX_WEBGPU_RHI_PIPELINE_FAILED %s\n",
                      g_rhi ? g_rhi->LastError().c_str() : "unsupported surface format");
         InfernuxWebAbortStartup("WebGPU render pipeline initialization failed");
