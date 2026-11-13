@@ -297,6 +297,8 @@ WebGpuRhiDevice::WebGpuRhiDevice(wgpu::Device device, wgpu::Queue queue, uint32_
     m_capabilities.limits.maxColorAttachments = limits.maxColorAttachments;
     // The plugin emulates push constants with an upload-backed uniform group.
     m_capabilities.limits.maxPushConstantBytes = 256;
+    // The sample_index fragment builtin is part of core WebGPU.
+    m_capabilities.features.sampleRateShading = true;
     m_capabilities.limits.maxBindingLayouts = limits.maxBindGroups;
     m_capabilities.limits.maxSampledTexturesPerStage = limits.maxSampledTexturesPerShaderStage;
     m_capabilities.limits.maxStorageBuffersPerStage = limits.maxStorageBuffersPerShaderStage;
