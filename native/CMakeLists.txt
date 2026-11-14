@@ -35,11 +35,6 @@ target_include_directories(InfernuxWebShaderCompiler PUBLIC "${INFERNUX_ENGINE_S
 target_link_libraries(InfernuxWebShaderCompiler PRIVATE ${INFERNUX_SLANG_TARGET})
 target_compile_features(InfernuxWebShaderCompiler PRIVATE cxx_std_17)
 target_compile_options(InfernuxWebShaderCompiler PRIVATE "-fwasm-exceptions")
-target_compile_definitions(InfernuxWebShaderCompiler PRIVATE
-    INFERNUX_SLANG_MODULE_NAME="${INFERNUX_SLANG_MODULE_NAME}")
-if(INFERNUX_SLANG_MODULE_TARGETS)
-    add_dependencies(InfernuxWebShaderCompiler ${INFERNUX_SLANG_MODULE_TARGETS})
-endif()
 option(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE
     "Compile the existing Infernux Python binding surface for wasm without linking it"
     OFF
@@ -543,7 +538,6 @@ target_link_options(InfernuxWebPlayerHost PRIVATE
     "--preload-file=${_python_assets}@/usr/local"
     "--preload-file=${_numpy_site_packages}@/usr/local/lib/python3.13/site-packages"
     "--preload-file=${CMAKE_CURRENT_SOURCE_DIR}/bootstrap.py@/infernux/bootstrap.py"
-    "--preload-file=${INFERNUX_SLANG_MODULE_DIR}@/infernux/${INFERNUX_SLANG_MODULE_NAME}"
 )
 
 # Keep generated Player payloads outside the source tree. Release packaging
