@@ -634,12 +634,12 @@ def _prepare_player_runtime() -> None:
     from infernux.engine.player_runtime import PlayerRuntimeSession
     from infernux.lib import SceneManager
     from infernux.plugins import PluginManager
-    from infernux.resources import engine_font_path
+    from infernux.resources import engine_font_cjk_path, engine_font_path
     import _InfernuxWebHost as host
 
     # Install the bundled face before scene loading or user lifecycle hooks can
     # create retained text geometry. The browser has no desktop GUI bootstrap.
-    host.screen_ui_set_default_font(engine_font_path)
+    host.screen_ui_set_default_font(engine_font_path, engine_font_cjk_path)
 
     session = PlayerRuntimeSession(asset_database=_player_asset_database, frame_work=host.frame_work())
     session._infernux_compute_host = host.acquire_compute_host()

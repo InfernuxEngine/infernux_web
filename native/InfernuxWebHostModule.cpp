@@ -698,9 +698,10 @@ PyObject *ScreenUIAddTextGeometry(PyObject *, PyObject *arguments)
 PyObject *ScreenUISetDefaultFont(PyObject *, PyObject *arguments)
 {
     const char *path = nullptr;
-    if (!PyArg_ParseTuple(arguments, "s:screen_ui_set_default_font", &path))
+    const char *cjkPath = nullptr;
+    if (!PyArg_ParseTuple(arguments, "ss:screen_ui_set_default_font", &path, &cjkPath))
         return nullptr;
-    ImFont *font = infernux::textlayout::ResolveFont(path);
+    ImFont *font = infernux::textlayout::LoadEngineFont(path, {cjkPath}, 18.0f);
     if (!font) {
         PyErr_SetString(PyExc_RuntimeError, "Web Player bundled font could not be loaded");
         return nullptr;
