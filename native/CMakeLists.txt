@@ -415,7 +415,6 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
             "${INFERNUX_ENGINE_SOURCE_ROOT}/external"
             "${INFERNUX_ENGINE_SOURCE_ROOT}/external/assimp/include"
             "${INFERNUX_ENGINE_SOURCE_ROOT}/external/glm"
-            "${INFERNUX_ENGINE_SOURCE_ROOT}/external/glslang"
             "${INFERNUX_ENGINE_SOURCE_ROOT}/external/imgui_for_infernux"
             "${INFERNUX_ENGINE_SOURCE_ROOT}/external/joltphysics_for_infernux"
             "${INFERNUX_ENGINE_SOURCE_ROOT}/external/nlohmann/single_include"

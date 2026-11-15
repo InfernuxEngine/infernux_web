@@ -1,4 +1,4 @@
-"""The platform plugin's precompiled browser and host-tool layout."""
+"""The platform plugin's precompiled browser runtime layout."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import re
 from pathlib import Path
 
 PLAYER_FILES = ("infernux-runtime.js", "infernux-runtime.wasm", "infernux-runtime.data")
-HOSTS = ("windows-x64", "linux-x64")
 WEB_CPYTHON_VERSION = "3.13.15"
 WEB_PYTHON_ABI = "cp313"
 WEB_EMSCRIPTEN_VERSION = "4.0.10"
@@ -274,18 +273,6 @@ def inspect_player_payload(root: Path, *, engine: str, engine_release: str | Non
         if not (root / name).is_file():
             raise FileNotFoundError(f"Web platform plugin is missing {root / name}")
     return manifest
-
-
-def inspect_shader_tools(root: Path, *, host: str) -> dict[str, str]:
-    if host not in HOSTS:
-        raise ValueError(f"Unsupported Web shader tool host: {host}")
-    suffix = ".exe" if host == "windows-x64" else ""
-    tools = {"glslang": root / host / f"glslangValidator{suffix}",
-             "tint": root / host / f"tint{suffix}"}
-    for path in tools.values():
-        if not path.is_file():
-            raise FileNotFoundError(f"Web platform plugin is missing {path}")
-    return {name: str(path) for name, path in tools.items()}
 
 
 def _main() -> None:

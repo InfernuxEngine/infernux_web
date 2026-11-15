@@ -21,7 +21,6 @@ class WebScreenUIRenderer;
 
 PyMODINIT_FUNC PyInit__InfernuxWebHost();
 
-[[nodiscard]] bool InfernuxWebFindShaderSource(const std::string &name, const char *stage, std::string &source);
 void InfernuxWebSetParticleRuntime(infernux::web::WebParticleRuntime *runtime) noexcept;
 void InfernuxWebSetScreenUIRenderer(infernux::web::WebScreenUIRenderer *renderer) noexcept;
 void InfernuxWebSetComputeHost(infernux::rhi::ComputeHost *host) noexcept;

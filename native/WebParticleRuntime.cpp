@@ -6,6 +6,7 @@
 
 #include <core/types/ColorSpace.h>
 #include <function/renderer/particle/ParticleGpuRuntime.h>
+#include <function/resources/ShaderAsset/SlangNativeModule.h>
 #include <function/scene/Camera.h>
 
 #include <glm/glm.hpp>
@@ -738,19 +739,46 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
 {
     if (!m_state->rhi || graphInstanceId == 0)
         return "WebGPU particle runtime is not initialized";
-    PyObject *programSequence = PySequence_Fast(programs, "particle programs must be a sequence");
-    PyObject *removeSequence = PySequence_Fast(removeIds, "particle remove_ids must be a sequence");
+    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> programOwner(
+        PySequence_Fast(programs, "particle programs must be a sequence"), &Py_DecRef);
+    PyObject *programSequence = programOwner.get();
+    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> removeOwner(
+        PySequence_Fast(removeIds, "particle remove_ids must be a sequence"), &Py_DecRef);
+    PyObject *removeSequence = removeOwner.get();
     if (!programSequence || !removeSequence) {
         PyErr_Clear();
-        Py_XDECREF(programSequence);
-        Py_XDECREF(removeSequence);
         return "WebGPU particle graph publication contains an invalid sequence";
+    }
+    // Compile the complete replacement before touching the accepted graph.
+    // The same frozen stages and root contract serve Vulkan and WebGPU.
+    const Py_ssize_t programCount = PySequence_Fast_GET_SIZE(programSequence);
+    std::vector<std::array<ShaderTargetCode, static_cast<size_t>(particle::GpuKernelStage::Count)>> compiled(
+        programCount);
+    try {
+        if (m_state->emissionSupported) {
+            for (Py_ssize_t index = 0; index < programCount; ++index) {
+                PyObject *program = PySequence_Fast_GET_ITEM(programSequence, index);
+                PyObject *sources = Field(program, "kernel_sources");
+                for (size_t stage = 0; stage < kStageNames.size(); ++stage) {
+                    if (static_cast<particle::GpuKernelStage>(stage) == particle::GpuKernelStage::UpdateRenderingFused)
+                        continue;
+                    PyObject *source = sources ? Field(sources, kStageNames[stage]) : nullptr;
+                    if (!source || !PyUnicode_Check(source))
+                        return std::string("WebGPU particle stage source is missing: ") + kStageNames[stage];
+                    const std::string path = std::string("Particle/") + kStageNames[stage] + ".slang";
+                    compiled[index][stage] =
+                        CompileSlangNativeModule({"particle_" + std::to_string(index) + "_" + kStageNames[stage], path,
+                                                  PyUnicode_AsUTF8(source)},
+                                                 ShaderCodeTarget::Wgsl);
+                }
+            }
+        }
+    } catch (const std::exception &error) {
+        return error.what();
     }
     for (Py_ssize_t index = 0; index < PySequence_Fast_GET_SIZE(removeSequence); ++index) {
         uint64_t id = 0;
         if (!ReadUnsigned(PySequence_Fast_GET_ITEM(removeSequence, index), id)) {
-            Py_DECREF(programSequence);
-            Py_DECREF(removeSequence);
             return "WebGPU particle remove_ids contains an invalid emitter id";
         }
         auto found = m_state->emitters.find(id);
@@ -761,11 +789,8 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
         m_state->capacityLimitedEmitterGraphs.erase(id);
         m_state->capacityLimitedEmitterRevisions.erase(id);
     }
-    Py_DECREF(removeSequence);
 
-    const Py_ssize_t programCount = PySequence_Fast_GET_SIZE(programSequence);
     if (programCount == 0) {
-        Py_DECREF(programSequence);
         auto graph = m_state->graphs.find(graphInstanceId);
         if (graph != m_state->graphs.end()) {
             m_state->ReleaseGraph(graph->second);
@@ -796,18 +821,15 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
         if (!ProgramUsesPortableSubset(program, error) || !ReadUnsigned(Field(program, "id"), id) || id == 0 ||
             !ReadUnsigned(Field(program, "graph_instance_id"), encodedGraph) || encodedGraph != graphInstanceId ||
             !ReadUnsigned(Field(program, "graph_emitter_index"), slot) || slot >= 1024) {
-            Py_DECREF(programSequence);
             return error.empty() ? "WebGPU particle program identity is invalid" : error;
         }
         std::vector<uint32_t> words;
         if (!ReadWordVector(Field(program, "parameter_words"), words)) {
-            Py_DECREF(programSequence);
             return "WebGPU particle parameter block is invalid";
         }
         if (parameters.empty())
             parameters = std::move(words);
         else if (parameters != words) {
-            Py_DECREF(programSequence);
             return "WebGPU particle emitters in one graph disagree on parameters";
         }
         slotCount = std::max(slotCount, slot + 1);
@@ -832,14 +854,12 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
             uint64_t artifactRevision = 0;
             if (!ReadUnsigned(Field(program, "id"), emitterId) || emitterId == 0 ||
                 !ReadUnsigned(Field(program, "artifact_revision"), artifactRevision) || artifactRevision == 0) {
-                Py_DECREF(programSequence);
                 return "WebGPU capacity-limited particle program identity is invalid";
             }
             m_state->capacityLimitedEmitterGraphs[emitterId] = graphInstanceId;
             m_state->capacityLimitedEmitterRevisions[emitterId] = artifactRevision;
         }
         m_state->capacityLimitedGraphs.insert(graphInstanceId);
-        Py_DECREF(programSequence);
         return {};
     }
 
@@ -872,7 +892,6 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
     if (!graph.burstRequests.IsValid() || !graph.spawnMetadata.IsValid() || !graph.parameters.IsValid() ||
         !graph.playingRequests.IsValid() || !graph.playingStates.IsValid()) {
         m_state->ReleaseGraph(graph);
-        Py_DECREF(programSequence);
         return "WebGPU particle graph buffers could not be created";
     }
     m_state->graphs.emplace(graphInstanceId, std::move(graph));
@@ -892,17 +911,14 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
             !ReadUnsigned(Field(program, "capacity"), capacity) || capacity == 0 || capacity > (1u << 24u) ||
             !ReadUnsigned(Field(program, "state_stride"), stateStride) || stateStride == 0 || stateStride % 16 != 0 ||
             !ReadUnsigned(Field(program, "event_type_count"), eventTypes)) {
-            Py_DECREF(programSequence);
             return "WebGPU particle program layout is invalid";
         }
         PyObject *hashObject = Field(program, "kernel_hash");
         if (!hashObject || !PyUnicode_Check(hashObject)) {
-            Py_DECREF(programSequence);
             return "WebGPU particle kernel hash is missing";
         }
         const char *kernelHash = PyUnicode_AsUTF8(hashObject);
         if (!kernelHash || std::strlen(kernelHash) != 64) {
-            Py_DECREF(programSequence);
             return "WebGPU particle kernel hash is invalid";
         }
         particle::GpuEmitterDesc desc;
@@ -913,21 +929,18 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
         // storage-buffer budget. Keep simulation and render export as distinct
         // GPU stages so each pipeline publishes only the resources it uses.
         desc.supportsFusedUpdateRendering = false;
-        std::array<std::string, static_cast<size_t>(particle::GpuKernelStage::Count)> sources;
-        for (size_t stage = 0; stage < sources.size(); ++stage) {
-            const std::string name = std::string("Particle/") + kernelHash + "/" + kStageNames[stage];
-            if (!InfernuxWebFindShaderSource(name, "compute", sources[stage])) {
-                Py_DECREF(programSequence);
-                return "WebGPU particle shader catalog is missing " + name;
-            }
-            desc.kernels[stage] = particle::ShaderBytecode::FromWgsl(sources[stage].data(), sources[stage].size());
+        for (size_t stage = 0; stage < kStageNames.size(); ++stage) {
+            if (static_cast<particle::GpuKernelStage>(stage) == particle::GpuKernelStage::UpdateRenderingFused)
+                continue;
+            const auto &entry = compiled[index][stage].entries.front();
+            desc.kernels[stage] =
+                particle::ShaderBytecode::FromWgsl(entry.code.data(), entry.code.size(), entry.name.c_str());
         }
         emitter->graphId = graphInstanceId;
         emitter->slot = slot;
         emitter->capacity = capacity;
         emitter->runtime = std::make_unique<particle::ParticleGpuRuntime>();
         if (!emitter->runtime->Create(*m_state->rhi, desc)) {
-            Py_DECREF(programSequence);
             return "WebGPU particle compute pipelines could not be created: " + m_state->rhi->LastError();
         }
         const particle::GpuParticleSimulationControl simulationControl{};
@@ -936,7 +949,6 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
         enabledControl.simulationAllowed = 1;
         if (!m_state->rhi->WriteBuffer(emitter->runtime->SimulationControlBuffer(), 0, &enabledControl,
                                        sizeof(enabledControl))) {
-            Py_DECREF(programSequence);
             return "WebGPU particle simulation control could not be initialized";
         }
         rhi::BindGroupDesc spawnGroupDesc;
@@ -959,7 +971,6 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
         ParticleOutputData outputData;
         if (!ReadOutputData(program, outputData, emitter->textureGuid)) {
             PyErr_Clear();
-            Py_DECREF(programSequence);
             return "WebGPU particle output material or flipbook layout is invalid";
         }
         wgpu::BufferDescriptor outputBufferDescriptor;
@@ -969,14 +980,12 @@ std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject 
         if (emitter->outputBuffer)
             m_state->queue.WriteBuffer(emitter->outputBuffer, 0, &outputData, sizeof(outputData));
         if (!emitter->spawnGroup.IsValid() || !emitter->outputBuffer || !instances || !indices) {
-            Py_DECREF(programSequence);
             return "WebGPU particle bind groups could not be created";
         }
         std::printf("INFERNUX_WEBGPU_PARTICLE_OUTPUT_READY tint=%.4f,%.4f,%.4f,%.4f hdr=1\n", outputData.tint.x,
                     outputData.tint.y, outputData.tint.z, outputData.tint.w);
         m_state->emitters.emplace(emitter->id, std::move(emitter));
     }
-    Py_DECREF(programSequence);
     return {};
 }
 

@@ -140,11 +140,6 @@ class WebPlatformExporter(PlatformExporter):
             request.target,
             (
                 BuildStep("cook", "Cook project content", "cook"),
-                BuildStep(
-                    "shaders",
-                    "Translate portable GLSL shaders to validated WGSL",
-                    "compile",
-                ),
                 BuildStep("imports", "Analyze browser Python imports", "analyze"),
                 BuildStep("runtime", "Stage precompiled WebGPU and CPython runtime", "package"),
                 BuildStep(
@@ -230,7 +225,6 @@ class WebPlatformExporter(PlatformExporter):
             )
             _stage_web_branding(player_assets, source_package, game_name)
             _stage_engine_python_package(request, player_assets, source_package)
-            _stage_web_shader_sources(request, staging, player_assets, source_package)
             capability_inventory = _stage_webgpu_capability_inventory(player_assets)
             logs = _assemble_web_host(
                 request,
@@ -560,7 +554,7 @@ def _prepare_web_staging(staging: Path) -> None:
     """Refresh generated project content and assembly output."""
 
     staging.mkdir(parents=True, exist_ok=True)
-    for name in (".infernux-player-cook", "player-assets", "shader-cook", "host-build"):
+    for name in (".infernux-player-cook", "player-assets", "host-build"):
         shutil.rmtree(staging / name, ignore_errors=True)
 
 
@@ -686,14 +680,6 @@ def _reject_unshipped_web_dependencies(
                     ))
                 record.pop("node", None)
                 checked.append(record)
-            from infernux.engine.build.compute_cpu import build_cpu_compute_source
-
-            try:
-                build_cpu_compute_source(source_path.read_text(encoding="utf-8"))
-            except (SyntaxError, ValueError) as error:
-                raise ValueError(
-                    f"Web CPU compute lowering failed for {source_path}: {error}"
-                ) from error
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 names = (alias.name.split(".", 1)[0] for alias in node.names)
@@ -1150,314 +1136,6 @@ def _validate_web_python_payload(site_packages: Path) -> None:
         )
 
 
-def _stage_web_shader_sources(
-    request: BuildRequest,
-    staging: Path,
-    player_assets: Path,
-    source_package: Path,
-) -> None:
-    """Generate the shared renderer's GLSL inputs before WGSL translation."""
-
-    from infernux.lib import _Infernux as native
-
-    vertex_path = (
-        source_package
-        / "resources"
-        / "shaders"
-        / "fullscreen_triangle.vert"
-    )
-    if not vertex_path.is_file():
-        raise ValueError(f"Infernux fullscreen shader is missing: {vertex_path}")
-    request.report("shaders", 0, 2, "Preparing shared fullscreen shader")
-    generated_vertex = native._prepare_authored_shader_glsl(
-        vertex_path.read_text(encoding="utf-8"),
-        str(vertex_path),
-    )
-    generated_fragment = """#version 450
-layout(location = 0) in vec2 inUV;
-layout(location = 0) out vec4 outColor;
-void main() {
-    outColor = vec4(inUV.x, inUV.y, 0.20 + 0.12 * inUV.x, 1.0);
-}
-"""
-    shader_root = staging / "shader-cook"
-    shader_root.mkdir(parents=True, exist_ok=True)
-    (shader_root / "fullscreen_triangle.vert").write_text(
-        generated_vertex,
-        encoding="utf-8",
-        newline="\n",
-    )
-    (shader_root / "web_host.frag").write_text(
-        generated_fragment,
-        encoding="utf-8",
-        newline="\n",
-    )
-    shader_entries = [
-        {
-            "name": "Fullscreen Triangle",
-            "stage": "vertex",
-            "source": "fullscreen_triangle.vert",
-        },
-        {
-            "name": "Web Host",
-            "stage": "fragment",
-            "source": "web_host.frag",
-        },
-    ]
-    particle_kernels: dict[str, dict[str, object]] = {}
-    data_roots = sorted(player_assets.glob("*_Data"))
-    if len(data_roots) != 1:
-        raise ValueError(
-            "Web Player shader cook requires exactly one staged *_Data directory"
-        )
-    _stage_web_ui_shader_sources(data_roots[0], shader_root, shader_entries, native)
-    # Particle AOT artifacts are build inputs, not loose Player files. The
-    # generic cooker seals runtime content into Content.inxpkg before Web
-    # shader translation runs, so consume the project's current artifact
-    # registry and stage only validated WGSL plus its compact catalog.
-    particle_root = (
-        Path(request.project_root).resolve()
-        / "Library"
-        / "Artifacts"
-        / "Particle"
-    )
-    if particle_root.is_dir():
-        for artifact_path in sorted(particle_root.glob("*.inxparticle")):
-            try:
-                artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                raise ValueError(
-                    f"Web Particle artifact is unreadable: {artifact_path.name}: {error}"
-                ) from error
-            emitters = artifact.get("gpu_glsl", {}).get("emitters")
-            if not isinstance(emitters, list):
-                raise ValueError(
-                    f"Web Particle artifact has no GLSL emitters: {artifact_path.name}"
-                )
-            for emitter in emitters:
-                if not isinstance(emitter, dict):
-                    raise ValueError("Web Particle emitter metadata must be an object")
-                kernel_hash = str(emitter.get("kernel_hash", ""))
-                stable_id = str(emitter.get("stable_id", ""))
-                stages = emitter.get("stages")
-                data_layout = emitter.get("data_interface_layout")
-                if (
-                    not re.fullmatch(r"[0-9a-f]{64}", kernel_hash)
-                    or not stable_id
-                    or not isinstance(stages, dict)
-                ):
-                    raise ValueError("Web Particle emitter identity is invalid")
-                if emitter.get("collision_enabled") or emitter.get("continuation") is not None:
-                    raise ValueError(
-                        f"WebGPU Particle emitter {stable_id} uses collision or continuation, "
-                        "which is not portable yet"
-                    )
-                if not isinstance(data_layout, dict) or any(
-                    data_layout.get(name)
-                    for name in (
-                        "mesh_interfaces",
-                        "texture2d_parameters",
-                        "volume_interfaces",
-                    )
-                ):
-                    raise ValueError(
-                        f"WebGPU Particle emitter {stable_id} uses a data interface "
-                        "which is not portable yet"
-                    )
-                expected_stages = {
-                    "bootstrap",
-                    "init",
-                    "update",
-                    "update_rendering_fused",
-                    "contact_prepare",
-                    "contact_solve",
-                    "contact_dispatch",
-                    "render_reset",
-                    "rendering",
-                }
-                if set(stages) != expected_stages or any(
-                    not isinstance(stages[name], str) or not stages[name]
-                    for name in expected_stages
-                ):
-                    raise ValueError(
-                        f"WebGPU Particle emitter {stable_id} has incomplete compute stages"
-                    )
-                existing = particle_kernels.get(kernel_hash)
-                kernel_record = {
-                    "kernel_hash": kernel_hash,
-                    "stable_ids": [stable_id],
-                    "state_stride": int(emitter.get("state_stride", 0)),
-                    "event_type_count": int(emitter.get("event_type_count", 0)),
-                    "update_render_fusion": emitter.get("update_render_fusion"),
-                    "stages": {},
-                }
-                if existing is not None:
-                    comparable = {
-                        key: value
-                        for key, value in existing.items()
-                        if key not in {"stable_ids", "stages"}
-                    }
-                    expected = {
-                        key: value
-                        for key, value in kernel_record.items()
-                        if key not in {"stable_ids", "stages"}
-                    }
-                    if comparable != expected:
-                        raise ValueError(
-                            f"Conflicting Web Particle kernel identity: {kernel_hash}"
-                        )
-                    stable_ids = existing["stable_ids"]
-                    if stable_id not in stable_ids:
-                        stable_ids.append(stable_id)
-                        stable_ids.sort()
-                    continue
-                for stage_name in sorted(expected_stages):
-                    source_name = f"particle-{kernel_hash}-{stage_name}.comp"
-                    (shader_root / source_name).write_text(
-                        stages[stage_name], encoding="utf-8", newline="\n"
-                    )
-                    shader_name = f"Particle/{kernel_hash}/{stage_name}"
-                    shader_entries.append(
-                        {
-                            "name": shader_name,
-                            "stage": "compute",
-                            "source": source_name,
-                        }
-                    )
-                    kernel_record["stages"][stage_name] = shader_name
-                particle_kernels[kernel_hash] = kernel_record
-
-    manifest = {
-        "$schema": "infernux.web_shader_cook",
-        "shaders": shader_entries,
-    }
-    (shader_root / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    particle_catalog = {
-        "$schema": "infernux.web_particle_catalog",
-        "kernels": sorted(
-            particle_kernels.values(), key=lambda item: str(item["kernel_hash"])
-        ),
-    }
-    (player_assets / "web-particles").mkdir(parents=True, exist_ok=True)
-    (player_assets / "web-particles" / "catalog.json").write_text(
-        json.dumps(
-            particle_catalog, ensure_ascii=False, indent=2, sort_keys=True
-        )
-        + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    request.report("shaders", 1, 2, "Shared fullscreen GLSL prepared")
-
-
-def _stage_web_ui_shader_sources(
-    data_root: Path,
-    shader_root: Path,
-    shader_entries: list[dict[str, str]],
-    native: object,
-) -> None:
-    """Translate exactly the UI shader/material closure sealed by content cook."""
-    from infernux.engine.player_package_native import read_entry
-    from infernux.engine.player_service_graph import PlayerRuntimeAssetCatalog
-
-    catalog = json.loads(read_entry(data_root / "AssetCatalog.inxcat", "RuntimeAssetCatalog.json"))
-    records_artifacts = [
-        item for item in catalog["artifacts"]
-        if item["runtime_path"] == "Library/RuntimeAssetRecords.json"
-    ]
-    if len(records_artifacts) != 1:
-        raise ValueError("Web UI shader cook requires one sealed runtime asset index")
-    records_artifact = records_artifacts[0]
-    records = json.loads(read_entry(
-        data_root.parent / records_artifact["package"], records_artifact["runtime_path"],
-    ))
-    runtime = PlayerRuntimeAssetCatalog.from_documents(str(data_root), catalog, records)
-    entries = sorted(records["entries"], key=lambda item: item["guid"])
-
-    def payload(entry):
-        artifact = runtime.artifact(entry["primary_runtime_artifact_id"])
-        return read_entry(data_root.parent / artifact["package"], artifact["runtime_path"])
-
-    shader_assets = {}
-    for entry in entries:
-        source_path = Path(entry["runtime_path"])
-        if source_path.suffix not in {".vert", ".frag"}:
-            continue
-        metadata = entry["metadata"]["metadata"]
-        guid = entry["guid"]
-        capabilities = json.loads(metadata["shader_capabilities"]["value"])
-        domains = set(capabilities) & {"ScreenUI", "WorldUI"}
-        if domains:
-            if len(domains) != 1:
-                raise ValueError(f"UI shader has ambiguous domains: {guid}")
-            has_properties = bool(json.loads(metadata["properties"]["value"]))
-            shader_assets[guid] = (
-                entry, str(metadata["shader_id"]["value"]), domains.pop(),
-                has_properties,
-            )
-
-    staged: dict[tuple[str, str], str] = {}
-    for entry in entries:
-        material_path = Path(entry["runtime_path"])
-        if material_path.suffix != ".mat":
-            continue
-        material_artifact = runtime.artifact(entry["primary_runtime_artifact_id"])
-        material_payload = payload(entry)
-        # Imported project/package materials are cooked documents; built-in
-        # resources retain their authored format in the platform resource pack.
-        material = (
-            native._decode_asset_document(material_payload)
-            if Path(material_artifact["runtime_path"]).suffix == ".inxdoc"
-            else json.loads(material_payload)
-        )
-        stages = material.get("shaders", {})
-        if not isinstance(stages, dict):
-            continue
-        stage_refs = (stages.get("vertex"), stages.get("fragment"))
-        if not all(isinstance(reference, dict) for reference in stage_refs):
-            continue
-        shader_guids = [str(reference.get("guid", "")) for reference in stage_refs]
-        if not any(guid in shader_assets for guid in shader_guids):
-            continue
-        if not all(guid in shader_assets for guid in shader_guids):
-            raise ValueError(f"UI material has an incomplete shader GUID pair: {material_path.name}")
-        if shader_assets[shader_guids[0]][2] != shader_assets[shader_guids[1]][2]:
-            raise ValueError(f"UI material shader domains disagree: {material_path.name}")
-        if any(shader_assets[guid][3] for guid in shader_guids):
-            raise ValueError(
-                "Web UI material shader properties require the material descriptor ABI: "
-                f"{material_path.name}"
-            )
-        for stage, reference, guid in zip(("vertex", "fragment"), stage_refs, shader_guids):
-            shader_entry, shader_id, _domain, _has_properties = shader_assets[guid]
-            source_path = Path(shader_entry["runtime_path"])
-            if source_path.suffix != (".vert" if stage == "vertex" else ".frag"):
-                raise ValueError(f"UI shader GUID has the wrong stage: {guid}")
-            if shader_id != str(reference.get("shader_id", "")):
-                raise ValueError(f"UI material shader identity changed: {guid}")
-            identity = (shader_id, stage)
-            previous = staged.get(identity)
-            if previous is not None:
-                if previous != guid:
-                    raise ValueError(f"Duplicate UI shader identity: {shader_id} ({stage})")
-                continue
-            source_name = f"ui-{guid}{source_path.suffix}"
-            prepared = native._prepare_authored_shader_glsl(
-                payload(shader_entry).decode("utf-8"), source_path.as_posix()
-            )
-            (shader_root / source_name).write_text(
-                prepared, encoding="utf-8", newline="\n"
-            )
-            shader_entries.append(
-                {"name": shader_id, "stage": stage, "source": source_name}
-            )
-            staged[identity] = guid
-
-
 def _assemble_web_host(
     request: BuildRequest,
     staging: Path,
@@ -1470,21 +1148,6 @@ def _assemble_web_host(
 ) -> tuple[str, ...]:
     """Assemble project content around the plugin's immutable native payload."""
     from infernux.engine.player_package_native import write_pack
-    from .shader_pipeline import compile_shader_manifest
-
-    # InxPack carries bytes, not POSIX modes. Restore execute permission only
-    # for the two declared native tools when consuming an installed package.
-    if os.name != "nt":
-        for name in ("glslang", "tint"):
-            tool = Path(str(details[name]))
-            tool.chmod(tool.stat().st_mode | 0o111)
-    compile_shader_manifest(
-        staging / "shader-cook" / "manifest.json",
-        player_assets / "web-shaders",
-        glslang=str(details["glslang"]),
-        tint=str(details["tint"]),
-    )
-    request.report("shaders", 2, 2, "Validated WGSL shader catalog ready")
     runtime = Path(str(details["player_root"]))
     revision = _web_asset_revision(
         staging, player_assets, runtime, presentation=presentation,
@@ -1563,7 +1226,6 @@ def _web_asset_revision(
         ("player", player_assets),
         ("runtime", host_template_source),
         ("templates", Path(__file__).parent / "templates"),
-        ("shaders", staging / "shader-cook"),
     ]
     if project_template_root is not None:
         roots.append(("project-template", project_template_root))

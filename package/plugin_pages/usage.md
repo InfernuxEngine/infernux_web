@@ -10,7 +10,7 @@ Infernux 0.4.3 on Windows x64 or Linux x64, and a WebGPU-capable browser. Ordina
 
 ## Included payload
 
-`editor/infernux_web/player/` contains the precompiled runtime and CPython data. `tools/windows-x64/` and `tools/linux-x64/` contain glslang and Tint. Installing this plugin supplies the Web build payload; no separate Web SDK download is required.
+`editor/infernux_web/player/` contains the runtime, resident Slang compiler and CPython data. The editor uses the engine compiler to prepare portable shader targets; this plugin carries no separate shader tools. Installing it supplies the Web build payload.
 
 Export cooks project content, translates GLSL to WGSL, writes an `.inxpkg` and assembles the web page. It does not rebuild the engine. Browser startup loads the binary package into memory instead of publishing Assets, Library or the project source tree as HTTP directories.
 

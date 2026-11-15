@@ -10,7 +10,7 @@ Infernux 0.4.3，Windows x64 或 Linux x64 编辑器，以及支持 WebGPU 的�
 
 ## 插件载荷
 
-`editor/infernux_web/player/` 存放预编译运行时和 CPython 数据；`tools/windows-x64/`、`tools/linux-x64/` 存放 glslang 和 Tint。安装插件即可使用，无需另外下载 Web SDK。
+`editor/infernux_web/player/` 存放运行时、常驻 Slang 编译器和 CPython 数据。编辑器直接使用引擎编译器制作目标程序，插件不再携带独立的着色器工具。安装插件即可使用。
 
 导出只处理项目内容、将 GLSL 转为 WGSL、封装 `.inxpkg` 并生成网页，不重新编译引擎。游戏内容进入二进制包，浏览器加载后在内存中挂载，HTTP 目录不暴露 Assets、Library 或项目源码树。
 

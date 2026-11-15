@@ -51,8 +51,6 @@
 namespace
 {
 
-std::mutex g_shaderMutex;
-std::unordered_map<std::string, std::string> g_shaderSources;
 infernux::web::WebParticleRuntime *g_particleRuntime = nullptr;
 infernux::web::WebScreenUIRenderer *g_screenUIRenderer = nullptr;
 infernux::rhi::ComputeHost *g_computeHost = nullptr;
@@ -85,11 +83,6 @@ struct ScreenUITextureLoad
 };
 std::unordered_map<std::string, ScreenUITextureLoad> g_screenUITextures;
 #endif
-
-std::string ShaderKey(const std::string &name, const char *stage)
-{
-    return name + '\0' + (stage != nullptr ? stage : "");
-}
 
 PyObject *ReadPackageEntry(PyObject *, PyObject *arguments)
 {
@@ -142,38 +135,6 @@ PyObject *ExtractPackage(PyObject *, PyObject *arguments)
         PyErr_SetString(PyExc_RuntimeError, error.what());
         return nullptr;
     }
-}
-
-PyObject *RegisterShader(PyObject *, PyObject *arguments)
-{
-    const char *name = nullptr;
-    const char *stage = nullptr;
-    PyObject *sourceObject = nullptr;
-    if (!PyArg_ParseTuple(arguments, "ssO:register_shader", &name, &stage, &sourceObject))
-        return nullptr;
-    if (name == nullptr || *name == '\0' ||
-        (std::string(stage) != "vertex" && std::string(stage) != "fragment" && std::string(stage) != "compute")) {
-        PyErr_SetString(PyExc_ValueError, "shader name and stage are invalid");
-        return nullptr;
-    }
-    Py_ssize_t sourceSize = 0;
-    const char *source = PyUnicode_AsUTF8AndSize(sourceObject, &sourceSize);
-    if (source == nullptr)
-        return nullptr;
-    if (sourceSize <= 0) {
-        PyErr_SetString(PyExc_ValueError, "shader source is empty");
-        return nullptr;
-    }
-    {
-        std::lock_guard lock(g_shaderMutex);
-        const auto [entry, inserted] =
-            g_shaderSources.emplace(ShaderKey(name, stage), std::string(source, static_cast<size_t>(sourceSize)));
-        if (!inserted) {
-            PyErr_SetString(PyExc_ValueError, "shader identity is already registered");
-            return nullptr;
-        }
-    }
-    Py_RETURN_NONE;
 }
 
 PyObject *InitializeRuntimeAssets(PyObject *, PyObject *arguments)
@@ -855,8 +816,6 @@ PyMethodDef kMethods[] = {
     {"read_entry", ReadPackageEntry, METH_VARARGS,
      "Read and validate one entry from the native Infernux Player container."},
     {"extract_package", ExtractPackage, METH_VARARGS, "Validate and extract one native Infernux Player container."},
-    {"register_shader", RegisterShader, METH_VARARGS,
-     "Register one validated WGSL shader in the browser runtime catalog."},
     {"initialize_runtime_assets", InitializeRuntimeAssets, METH_VARARGS,
      "Install the immutable cooked GUID catalog and runtime asset loaders."},
     {"configure_physics", ConfigurePhysics, METH_VARARGS,
@@ -906,16 +865,6 @@ PyModuleDef kModule = {
 PyMODINIT_FUNC PyInit__InfernuxWebHost()
 {
     return PyModule_Create(&kModule);
-}
-
-bool InfernuxWebFindShaderSource(const std::string &name, const char *stage, std::string &source)
-{
-    std::lock_guard lock(g_shaderMutex);
-    const auto found = g_shaderSources.find(ShaderKey(name, stage));
-    if (found == g_shaderSources.end())
-        return false;
-    source = found->second;
-    return true;
 }
 
 void InfernuxWebSetParticleRuntime(infernux::web::WebParticleRuntime *runtime) noexcept

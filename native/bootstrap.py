@@ -213,61 +213,6 @@ def infernux_web_configure_physics() -> bool:
     return True
 
 
-def _register_web_shaders() -> None:
-    """Load the deterministic WGSL catalog produced by the Web cook."""
-
-    shader_root = os.path.join(_player_root, "web-shaders")
-    catalog_path = os.path.join(shader_root, "catalog.json")
-    if not os.path.isfile(catalog_path):
-        raise RuntimeError("Web Player shader catalog is missing")
-    with open(catalog_path, encoding="utf-8") as stream:
-        catalog = json.load(stream)
-    if (
-        not isinstance(catalog, dict)
-        or set(catalog) != {"$schema", "shaders"}
-        or catalog.get("$schema") != "infernux.web_shader_catalog"
-        or not isinstance(catalog.get("shaders"), list)
-        or not catalog["shaders"]
-    ):
-        raise RuntimeError("Web Player shader catalog is invalid")
-
-    from _InfernuxWebHost import register_shader
-
-    identities: set[tuple[str, str]] = set()
-    for entry in catalog["shaders"]:
-        if not isinstance(entry, dict) or set(entry) != {"name", "stage", "path"}:
-            raise RuntimeError("Web Player shader catalog entry is invalid")
-        name = str(entry.get("name", ""))
-        stage = str(entry.get("stage", ""))
-        relative = str(entry.get("path", ""))
-        identity = (name, stage)
-        normalized = os.path.normpath(relative).replace("\\", "/")
-        if (
-            not name
-            or stage not in {"vertex", "fragment", "compute"}
-            or identity in identities
-            or not relative
-            or normalized.startswith("../")
-            or os.path.isabs(relative)
-        ):
-            raise RuntimeError("Web Player shader catalog identity is invalid")
-        identities.add(identity)
-        shader_path = os.path.join(shader_root, *normalized.split("/"))
-        with open(shader_path, "rb") as stream:
-            payload = stream.read()
-        try:
-            source = payload.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise RuntimeError(
-                f"Web Player shader is not UTF-8 WGSL: {name} ({stage})"
-            ) from error
-        register_shader(name, stage, source)
-    print(f"INFERNUX_WEB_SHADER_CATALOG_READY shaders={len(identities)}")
-
-
-_register_web_shaders()
-
-
 def _read_json(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as stream:
         document = json.load(stream)
