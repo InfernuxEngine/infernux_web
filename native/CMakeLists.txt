@@ -267,6 +267,7 @@ target_link_libraries(InfernuxWebPlayerHost PRIVATE
     m
 )
 target_compile_definitions(InfernuxWebPlayerHost PRIVATE
+    IMGUI_DISABLE_DEFAULT_FONT=1
     GLM_FORCE_DEPTH_ZERO_TO_ONE
     GLM_FORCE_LEFT_HANDED
     INFERNUX_DISABLE_VULKAN_MATERIAL_RUNTIME=1
