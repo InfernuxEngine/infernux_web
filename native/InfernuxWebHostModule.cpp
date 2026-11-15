@@ -30,6 +30,7 @@
 #include <function/resources/InxTexture/InxTexture.h>
 #include <function/resources/InxTexture/TextureLoader.h>
 #include <function/resources/PhysicMaterial/PhysicMaterialLoader.h>
+#include <function/resources/ShaderAsset/ShaderLoader.h>
 #include <function/scene/SceneManager.h>
 #include <pybind11/pybind11.h>
 #endif
@@ -196,6 +197,7 @@ PyObject *InitializeRuntimeAssets(PyObject *, PyObject *arguments)
         database->InstallRuntimeAssetCatalog(recordsPath, true);
         const auto assetCount = database->GetAssetCount();
         registry.Initialize(std::move(database));
+        registry.RegisterLoader(infernux::ResourceType::Shader, std::make_unique<infernux::ShaderLoader>());
         registry.RegisterLoader(infernux::ResourceType::Material, std::make_unique<infernux::MaterialLoader>());
         registry.RegisterLoader(infernux::ResourceType::PhysicMaterial,
                                 std::make_unique<infernux::PhysicMaterialLoader>());

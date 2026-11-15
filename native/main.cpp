@@ -129,6 +129,8 @@ double g_cssHeight = 1.0;
 std::array<double, 32> g_gamepadTimestamps{};
 std::unordered_map<int, std::pair<float, float>> g_pointerPositions;
 double g_lastFrameTimeMilliseconds = 0.0;
+float g_shaderTimeSeconds = 0.0f;
+uint64_t g_shaderFrameIndex = 0;
 bool g_runtimeFrameFailed = false;
 bool g_viewportDirty = false;
 bool g_splashActive = false;
@@ -894,6 +896,10 @@ void Frame()
     const double deltaSeconds =
         acceptanceClockEnabled ? (g_acceptancePaused ? 0.0 : g_acceptanceFixedDeltaSeconds) : wallDeltaSeconds;
     bool pauseAcceptanceAfterRender = false;
+    g_shaderTimeSeconds += float(deltaSeconds);
+    const auto shaderFrame = infernux::BuildEngineFrameGlobals(g_shaderTimeSeconds, float(deltaSeconds),
+                                                               float(deltaSeconds), g_shaderFrameIndex++);
+    g_screenUIRenderer.StageFrame(shaderFrame, g_width, g_height);
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
     auto &registry = infernux::AssetRegistry::Instance();
     if (registry.IsInitialized())
@@ -1021,9 +1027,7 @@ void Frame()
                 (void)g_particleRuntime.Render(pass, *camera, g_width, g_height);
             }
             try {
-                (void)g_screenUIRenderer.RenderWorld(pass, camera->GetViewProjectionMatrix(), camera->GetViewMatrix(),
-                                                     camera->GetProjectionMatrix(), camera->GetCullingMask(), g_width,
-                                                     g_height);
+                (void)g_screenUIRenderer.RenderWorld(pass, *camera, g_width, g_height);
             } catch (const std::exception &error) {
                 std::fprintf(stderr, "INFERNUX_WEB_WORLD_UI_RENDER_FAILED %s\n", error.what());
                 g_webGpuValidationFailed = true;
@@ -1075,6 +1079,7 @@ void Frame()
             }
         }
         presentPass.End();
+        g_screenUIRenderer.PruneUnusedMaterials();
         wgpu::CommandBuffer commands = encoder.Finish();
         g_queue.Submit(1, &commands);
         foregroundSubmitted = true;
@@ -1159,7 +1164,8 @@ void StartSurface()
         InfernuxWebAbortStartup("Scene rendering initialization failed");
         return;
     }
-    if (!g_screenUIRenderer.Initialize(g_device, g_queue, g_surfaceFormat, sceneColorFormat, sceneSampleCount)) {
+    if (!g_screenUIRenderer.Initialize(g_device, g_queue, g_surfaceFormat, sceneColorFormat, sceneSampleCount,
+                                       g_sceneRenderer)) {
         std::fprintf(stderr, "INFERNUX_WEB_SCREEN_UI_INITIALIZATION_FAILED\n");
         InfernuxWebAbortStartup("Screen UI initialization failed");
         return;

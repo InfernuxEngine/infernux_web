@@ -31,7 +31,9 @@ include("${INFERNUX_ENGINE_SOURCE_ROOT}/cmake/InfernuxSlang.cmake")
 add_library(InfernuxWebShaderCompiler STATIC
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/resources/ShaderAsset/SlangCompiler.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/resources/ShaderAsset/SlangLayout.cpp")
-target_include_directories(InfernuxWebShaderCompiler PUBLIC "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux")
+target_include_directories(InfernuxWebShaderCompiler
+    PUBLIC "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux"
+    PRIVATE "${INFERNUX_EXTERNAL_ROOT}")
 target_link_libraries(InfernuxWebShaderCompiler PRIVATE ${INFERNUX_SLANG_TARGET})
 target_compile_features(InfernuxWebShaderCompiler PRIVATE cxx_std_17)
 target_compile_options(InfernuxWebShaderCompiler PRIVATE "-fwasm-exceptions")
@@ -201,6 +203,7 @@ add_executable(InfernuxWebPlayerHost
     WebTextureUpload.cpp
     WebSceneRenderer.cpp
     WebScreenUIRenderer.cpp
+    WebUIMaterialCache.cpp
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/gui/InxTextLayout.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/gui/InxTextGeometry.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/particle/ParticleGpuContactRuntime.cpp"

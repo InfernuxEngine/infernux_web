@@ -1,5 +1,7 @@
 #include "WebScreenUIRenderer.h"
+#include "WebSceneRenderer.h"
 #include "WebTextureUpload.h"
+#include <function/scene/Camera.h>
 
 #include "InfernuxWebHostModule.h"
 #include <function/renderer/gui/InxTextGeometry.h>
@@ -90,21 +92,6 @@ wgpu::SamplerDescriptor UISamplerDescriptor(const std::string &filterMode, const
     return descriptor;
 }
 
-std::array<wgpu::ShaderModule, 2> CreateUIShaderModules(wgpu::Device device, const ShaderSourceModule &source)
-{
-    const auto compiled = CompileSlangNativeModule(source, ShaderCodeTarget::Wgsl);
-    std::array<wgpu::ShaderModule, 2> modules;
-    for (size_t index = 0; index < modules.size(); ++index) {
-        const auto &code = compiled.entries[index].code;
-        wgpu::ShaderSourceWGSL shaderSource;
-        shaderSource.code = wgpu::StringView(code.data(), code.size());
-        wgpu::ShaderModuleDescriptor descriptor;
-        descriptor.nextInChain = &shaderSource;
-        modules[index] = device.CreateShaderModule(&descriptor);
-    }
-    return modules;
-}
-
 uint64_t GrowCapacity(uint64_t required)
 {
     uint64_t capacity = 4096;
@@ -142,6 +129,8 @@ void TransformVertices(ImDrawList &drawList, int firstVertex, float minX, float 
 }
 } // namespace
 
+WebScreenUIRenderer::WebScreenUIRenderer() = default;
+
 WebScreenUIRenderer::~WebScreenUIRenderer()
 {
     if (m_context)
@@ -160,13 +149,20 @@ WebScreenUIRenderer::~WebScreenUIRenderer()
 }
 
 bool WebScreenUIRenderer::Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::TextureFormat colorFormat,
-                                     wgpu::TextureFormat worldColorFormat, uint32_t worldSampleCount)
+                                     wgpu::TextureFormat worldColorFormat, uint32_t worldSampleCount,
+                                     WebSceneRenderer &scene)
 {
     m_device = device;
     m_queue = queue;
     m_colorFormat = colorFormat;
     m_worldColorFormat = worldColorFormat;
     m_worldSampleCount = worldSampleCount;
+    m_materials = std::make_unique<WebUIMaterialCache>();
+    m_materials->Initialize(device, queue, colorFormat, worldColorFormat, worldSampleCount,
+                            [&scene](const std::string &guid, const MaterialTextureSampler *sampler) {
+                                const auto texture = scene.ResolveSampledTexture(guid, sampler);
+                                return WebUIMaterialCache::Texture{texture.view, texture.sampler};
+                            });
     m_context = ImGui::GetCurrentContext();
     if (!m_context) {
         m_context = ImGui::CreateContext();
@@ -214,7 +210,7 @@ bool WebScreenUIRenderer::Initialize(wgpu::Device device, wgpu::Queue queue, wgp
     samplerDescriptor.minFilter = wgpu::FilterMode::Linear;
     samplerDescriptor.magFilter = wgpu::FilterMode::Linear;
     m_fontSampler = m_device.CreateSampler(&samplerDescriptor);
-    return m_fontTexture && m_fontView && m_fontSampler && CreatePipelineAndFontAtlas() && CreateWorldPipelines();
+    return m_fontTexture && m_fontView && m_fontSampler && CreatePipelineAndFontAtlas();
 }
 
 bool WebScreenUIRenderer::ConfigureSampleCount(uint32_t sampleCount)
@@ -224,8 +220,8 @@ bool WebScreenUIRenderer::ConfigureSampleCount(uint32_t sampleCount)
     if (sampleCount == m_worldSampleCount)
         return true;
     m_worldSampleCount = sampleCount;
-    m_customWorldPipelines.clear();
-    return CreateWorldPipelines();
+    m_materials->ConfigureSampleCount(sampleCount);
+    return true;
 }
 
 bool WebScreenUIRenderer::RefreshFontAtlas()
@@ -268,9 +264,9 @@ bool WebScreenUIRenderer::RefreshFontAtlas()
 
     std::array<wgpu::BindGroupEntry, 2> groupEntries{};
     groupEntries[0].binding = 0;
-    groupEntries[0].sampler = m_fontSampler;
+    groupEntries[0].textureView = m_fontView;
     groupEntries[1].binding = 1;
-    groupEntries[1].textureView = m_fontView;
+    groupEntries[1].sampler = m_fontSampler;
     wgpu::BindGroupDescriptor groupDescriptor;
     groupDescriptor.layout = m_textureLayout;
     groupDescriptor.entryCount = groupEntries.size();
@@ -283,279 +279,23 @@ bool WebScreenUIRenderer::RefreshFontAtlas()
 
 bool WebScreenUIRenderer::CreatePipelineAndFontAtlas()
 {
-    std::array<wgpu::BindGroupLayoutEntry, 2> layoutEntries{};
-    layoutEntries[0].binding = 0;
-    layoutEntries[0].visibility = wgpu::ShaderStage::Fragment;
-    layoutEntries[0].sampler.type = wgpu::SamplerBindingType::Filtering;
-    layoutEntries[1].binding = 1;
-    layoutEntries[1].visibility = wgpu::ShaderStage::Fragment;
-    layoutEntries[1].texture.sampleType = wgpu::TextureSampleType::Float;
-    layoutEntries[1].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    wgpu::BindGroupLayoutDescriptor layoutDescriptor;
-    layoutDescriptor.entryCount = layoutEntries.size();
-    layoutDescriptor.entries = layoutEntries.data();
-    m_textureLayout = m_device.CreateBindGroupLayout(&layoutDescriptor);
-
-    std::array<wgpu::BindGroupEntry, 2> groupEntries{};
-    groupEntries[0].binding = 0;
-    groupEntries[0].sampler = m_fontSampler;
-    groupEntries[1].binding = 1;
-    groupEntries[1].textureView = m_fontView;
-    wgpu::BindGroupDescriptor groupDescriptor;
-    groupDescriptor.layout = m_textureLayout;
-    groupDescriptor.entryCount = groupEntries.size();
-    groupDescriptor.entries = groupEntries.data();
-    m_fontGroup = m_device.CreateBindGroup(&groupDescriptor);
-
-    std::array<wgpu::BindGroupLayoutEntry, 3> screenBindings{};
-    screenBindings[0].binding = 0;
-    screenBindings[0].visibility = wgpu::ShaderStage::Fragment;
-    screenBindings[0].texture.sampleType = wgpu::TextureSampleType::Float;
-    screenBindings[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    screenBindings[1].binding = 1;
-    screenBindings[1].visibility = wgpu::ShaderStage::Fragment;
-    screenBindings[1].sampler.type = wgpu::SamplerBindingType::Filtering;
-    screenBindings[2].binding = rhi::RootConstantBinding;
-    screenBindings[2].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
-    screenBindings[2].buffer.type = wgpu::BufferBindingType::Uniform;
-    screenBindings[2].buffer.hasDynamicOffset = true;
-    screenBindings[2].buffer.minBindingSize = sizeof(ScreenConstants);
-    wgpu::BindGroupLayoutDescriptor screenLayoutDescriptor;
-    screenLayoutDescriptor.entryCount = screenBindings.size();
-    screenLayoutDescriptor.entries = screenBindings.data();
-    m_screenLayout = m_device.CreateBindGroupLayout(&screenLayoutDescriptor);
-
-    const auto shaders = CreateUIShaderModules(m_device, GetSlangScreenUIModule());
-
-    std::array<wgpu::VertexAttribute, 3> attributes{};
-    attributes[0].format = wgpu::VertexFormat::Float32x2;
-    attributes[0].offset = offsetof(GPUVertex, position);
-    attributes[0].shaderLocation = 0;
-    attributes[1].format = wgpu::VertexFormat::Float32x2;
-    attributes[1].offset = offsetof(GPUVertex, uv);
-    attributes[1].shaderLocation = 1;
-    attributes[2].format = wgpu::VertexFormat::Float32x4;
-    attributes[2].offset = offsetof(GPUVertex, color);
-    attributes[2].shaderLocation = 2;
-    wgpu::VertexBufferLayout vertexLayout;
-    vertexLayout.arrayStride = sizeof(GPUVertex);
-    vertexLayout.stepMode = wgpu::VertexStepMode::Vertex;
-    vertexLayout.attributeCount = attributes.size();
-    vertexLayout.attributes = attributes.data();
-
-    wgpu::BlendState blend;
-    blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
-    blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    blend.alpha.srcFactor = wgpu::BlendFactor::One;
-    blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    wgpu::ColorTargetState colorTarget;
-    colorTarget.format = m_colorFormat;
-    colorTarget.blend = &blend;
-    colorTarget.writeMask = wgpu::ColorWriteMask::All;
-    wgpu::FragmentState fragment;
-    fragment.module = shaders[1];
-    fragment.entryPoint = "fragment_main";
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
-    wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor;
-    pipelineLayoutDescriptor.bindGroupLayoutCount = 1;
-    pipelineLayoutDescriptor.bindGroupLayouts = &m_screenLayout;
-    wgpu::RenderPipelineDescriptor descriptor;
-    descriptor.layout = m_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
-    descriptor.vertex.module = shaders[0];
-    descriptor.vertex.entryPoint = "vertex_main";
-    descriptor.vertex.bufferCount = 1;
-    descriptor.vertex.buffers = &vertexLayout;
-    descriptor.fragment = &fragment;
-    descriptor.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    descriptor.primitive.cullMode = wgpu::CullMode::None;
-    descriptor.multisample.count = 1;
-    m_pipeline = m_device.CreateRenderPipeline(&descriptor);
-    return m_textureLayout && m_screenLayout && m_fontGroup && m_pipeline;
+    m_textureLayout = m_materials->GetTextureLayout();
+    std::array<wgpu::BindGroupEntry, 2> entries{};
+    entries[0].binding = 0;
+    entries[0].textureView = m_fontView;
+    entries[1].binding = 1;
+    entries[1].sampler = m_fontSampler;
+    wgpu::BindGroupDescriptor descriptor;
+    descriptor.layout = m_textureLayout;
+    descriptor.entryCount = entries.size();
+    descriptor.entries = entries.data();
+    m_fontGroup = m_device.CreateBindGroup(&descriptor);
+    return static_cast<bool>(m_fontGroup);
 }
 
-bool WebScreenUIRenderer::CreateWorldPipelines()
+void WebScreenUIRenderer::StageFrame(const EngineGlobalsUBO &frame, uint32_t width, uint32_t height)
 {
-    if (m_worldColorFormat == wgpu::TextureFormat::Undefined || (m_worldSampleCount != 1 && m_worldSampleCount != 4))
-        return false;
-    std::array<wgpu::BindGroupLayoutEntry, 3> bindings{};
-    bindings[0].binding = 0;
-    bindings[0].visibility = wgpu::ShaderStage::Fragment;
-    bindings[0].texture.sampleType = wgpu::TextureSampleType::Float;
-    bindings[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    bindings[1].binding = 1;
-    bindings[1].visibility = wgpu::ShaderStage::Fragment;
-    bindings[1].sampler.type = wgpu::SamplerBindingType::Filtering;
-    bindings[2].binding = rhi::RootConstantBinding;
-    bindings[2].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
-    bindings[2].buffer.type = wgpu::BufferBindingType::Uniform;
-    bindings[2].buffer.hasDynamicOffset = true;
-    bindings[2].buffer.minBindingSize = sizeof(WorldConstants);
-    wgpu::BindGroupLayoutDescriptor layoutDescriptor;
-    layoutDescriptor.entryCount = bindings.size();
-    layoutDescriptor.entries = bindings.data();
-    m_worldLayout = m_device.CreateBindGroupLayout(&layoutDescriptor);
-
-    if (!m_worldShaders[0])
-        m_worldShaders = CreateUIShaderModules(m_device, GetSlangWorldUIModule());
-    std::array<wgpu::VertexAttribute, 7> attributes{};
-    const auto attribute = [&](size_t index, wgpu::VertexFormat format, uint64_t offset) {
-        attributes[index].format = format;
-        attributes[index].offset = offset;
-        attributes[index].shaderLocation = static_cast<uint32_t>(index);
-    };
-    attribute(0, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, position));
-    attribute(1, wgpu::VertexFormat::Float32x2, offsetof(WorldVertex, uv));
-    attribute(2, wgpu::VertexFormat::Float32x4, offsetof(WorldVertex, color));
-    attribute(3, wgpu::VertexFormat::Float32x2, offsetof(WorldVertex, localPosition));
-    attribute(4, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, anchor));
-    attribute(5, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, localOffset));
-    attribute(6, wgpu::VertexFormat::Float32, offsetof(WorldVertex, policy));
-    wgpu::VertexBufferLayout vertexLayout;
-    vertexLayout.arrayStride = sizeof(WorldVertex);
-    vertexLayout.stepMode = wgpu::VertexStepMode::Vertex;
-    vertexLayout.attributeCount = attributes.size();
-    vertexLayout.attributes = attributes.data();
-
-    wgpu::BlendState blend;
-    blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
-    blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    blend.alpha.srcFactor = wgpu::BlendFactor::One;
-    blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    wgpu::ColorTargetState colorTarget;
-    colorTarget.format = m_worldColorFormat;
-    colorTarget.blend = &blend;
-    colorTarget.writeMask = wgpu::ColorWriteMask::All;
-    wgpu::FragmentState fragment;
-    fragment.module = m_worldShaders[1];
-    fragment.entryPoint = "fragment_main";
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
-
-    wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor;
-    pipelineLayoutDescriptor.bindGroupLayoutCount = 1;
-    pipelineLayoutDescriptor.bindGroupLayouts = &m_worldLayout;
-    const wgpu::PipelineLayout pipelineLayout = m_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
-    wgpu::DepthStencilState depth;
-    depth.format = wgpu::TextureFormat::Depth32Float;
-    depth.depthWriteEnabled = wgpu::OptionalBool::False;
-    depth.depthCompare = wgpu::CompareFunction::GreaterEqual;
-    wgpu::RenderPipelineDescriptor descriptor;
-    descriptor.layout = pipelineLayout;
-    descriptor.vertex.module = m_worldShaders[0];
-    descriptor.vertex.entryPoint = "vertex_main";
-    descriptor.vertex.bufferCount = 1;
-    descriptor.vertex.buffers = &vertexLayout;
-    descriptor.fragment = &fragment;
-    descriptor.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    descriptor.primitive.cullMode = wgpu::CullMode::None;
-    descriptor.multisample.count = m_worldSampleCount;
-    descriptor.depthStencil = &depth;
-    m_worldDepthPipeline = m_device.CreateRenderPipeline(&descriptor);
-    depth.depthCompare = wgpu::CompareFunction::Always;
-    m_worldTopPipeline = m_device.CreateRenderPipeline(&descriptor);
-    return m_worldLayout && m_worldDepthPipeline && m_worldTopPipeline;
-}
-
-wgpu::RenderPipeline WebScreenUIRenderer::ResolveMaterialPipeline(const MaterialBinding &binding, bool world,
-                                                                  bool alwaysOnTop)
-{
-    if (binding.guid.empty())
-        return world ? (alwaysOnTop ? m_worldTopPipeline : m_worldDepthPipeline) : m_pipeline;
-    const auto material = AssetRegistry::Instance().GetAsset<InxMaterial>(binding.guid);
-    if (!material || material->IsDeleted() || material->GetVersion() != binding.generation)
-        throw std::runtime_error("UI material GUID is missing or its generation changed: " + binding.guid);
-    const auto &vertex = material->GetVertShaderReference();
-    const auto &fragment = material->GetFragShaderReference();
-    if (vertex.guid.empty() && fragment.guid.empty())
-        return world ? (alwaysOnTop ? m_worldTopPipeline : m_worldDepthPipeline) : m_pipeline;
-    if (vertex.guid.empty() || fragment.guid.empty())
-        throw std::runtime_error("UI material has an incomplete shader GUID pair: " + binding.guid);
-    const std::string key = binding.guid + ':' + std::to_string(binding.generation) + ':' +
-                            std::to_string(binding.pipelineKey.size()) + ':' + binding.pipelineKey +
-                            (alwaysOnTop ? ":top" : ":depth");
-    auto &cache = world ? m_customWorldPipelines : m_customScreenPipelines;
-    if (const auto cached = cache.find(key); cached != cache.end())
-        return cached->second;
-    std::string vertexSource;
-    std::string fragmentSource;
-    if (!InfernuxWebFindShaderSource(vertex.shaderId, "vertex", vertexSource) ||
-        !InfernuxWebFindShaderSource(fragment.shaderId, "fragment", fragmentSource))
-        throw std::runtime_error("UI material shader is absent from the Web catalog: " + binding.guid);
-    wgpu::ShaderSourceWGSL vertexWGSL;
-    vertexWGSL.code = vertexSource.c_str();
-    wgpu::ShaderModuleDescriptor vertexDescriptor;
-    vertexDescriptor.nextInChain = &vertexWGSL;
-    const wgpu::ShaderModule vertexModule = m_device.CreateShaderModule(&vertexDescriptor);
-    wgpu::ShaderSourceWGSL fragmentWGSL;
-    fragmentWGSL.code = fragmentSource.c_str();
-    wgpu::ShaderModuleDescriptor fragmentDescriptor;
-    fragmentDescriptor.nextInChain = &fragmentWGSL;
-    const wgpu::ShaderModule fragmentModule = m_device.CreateShaderModule(&fragmentDescriptor);
-    if (!vertexModule || !fragmentModule)
-        throw std::runtime_error("WebGPU rejected UI material shader modules: " + binding.guid);
-    std::array<wgpu::VertexAttribute, 7> attributes{};
-    const auto attribute = [&](size_t index, wgpu::VertexFormat format, uint64_t offset) {
-        attributes[index].format = format;
-        attributes[index].offset = offset;
-        attributes[index].shaderLocation = static_cast<uint32_t>(index);
-    };
-    if (world) {
-        attribute(0, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, position));
-        attribute(1, wgpu::VertexFormat::Float32x2, offsetof(WorldVertex, uv));
-        attribute(2, wgpu::VertexFormat::Float32x4, offsetof(WorldVertex, color));
-        attribute(3, wgpu::VertexFormat::Float32x2, offsetof(WorldVertex, localPosition));
-        attribute(4, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, anchor));
-        attribute(5, wgpu::VertexFormat::Float32x3, offsetof(WorldVertex, localOffset));
-        attribute(6, wgpu::VertexFormat::Float32, offsetof(WorldVertex, policy));
-    } else {
-        attribute(0, wgpu::VertexFormat::Float32x2, offsetof(GPUVertex, position));
-        attribute(1, wgpu::VertexFormat::Float32x2, offsetof(GPUVertex, uv));
-        attribute(2, wgpu::VertexFormat::Float32x4, offsetof(GPUVertex, color));
-    }
-    wgpu::VertexBufferLayout vertexLayout;
-    vertexLayout.arrayStride = world ? sizeof(WorldVertex) : sizeof(GPUVertex);
-    vertexLayout.stepMode = wgpu::VertexStepMode::Vertex;
-    vertexLayout.attributeCount = world ? 7 : 3;
-    vertexLayout.attributes = attributes.data();
-    wgpu::BlendState blend;
-    blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
-    blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    blend.alpha.srcFactor = wgpu::BlendFactor::One;
-    blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    wgpu::ColorTargetState colorTarget;
-    colorTarget.format = world ? m_worldColorFormat : m_colorFormat;
-    colorTarget.blend = &blend;
-    colorTarget.writeMask = wgpu::ColorWriteMask::All;
-    wgpu::FragmentState fragmentState;
-    fragmentState.module = fragmentModule;
-    fragmentState.entryPoint = "main";
-    fragmentState.targetCount = 1;
-    fragmentState.targets = &colorTarget;
-    const wgpu::BindGroupLayout &layout = world ? m_worldLayout : m_screenLayout;
-    wgpu::PipelineLayoutDescriptor layoutDescriptor;
-    layoutDescriptor.bindGroupLayoutCount = 1;
-    layoutDescriptor.bindGroupLayouts = &layout;
-    const wgpu::PipelineLayout pipelineLayout = m_device.CreatePipelineLayout(&layoutDescriptor);
-    wgpu::DepthStencilState depth;
-    depth.format = wgpu::TextureFormat::Depth32Float;
-    depth.depthWriteEnabled = wgpu::OptionalBool::False;
-    depth.depthCompare = alwaysOnTop ? wgpu::CompareFunction::Always : wgpu::CompareFunction::GreaterEqual;
-    wgpu::RenderPipelineDescriptor descriptor;
-    descriptor.layout = pipelineLayout;
-    descriptor.vertex.module = vertexModule;
-    descriptor.vertex.entryPoint = "main";
-    descriptor.vertex.bufferCount = 1;
-    descriptor.vertex.buffers = &vertexLayout;
-    descriptor.fragment = &fragmentState;
-    descriptor.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    descriptor.primitive.cullMode = wgpu::CullMode::None;
-    descriptor.multisample.count = world ? m_worldSampleCount : 1;
-    descriptor.depthStencil = world ? &depth : nullptr;
-    const wgpu::RenderPipeline pipeline = m_device.CreateRenderPipeline(&descriptor);
-    if (!pipeline)
-        throw std::runtime_error("WebGPU rejected UI material pipeline: " + binding.guid);
-    return cache.emplace(key, pipeline).first->second;
+    m_materials->StageFrame(frame, width, height);
 }
 
 std::pair<wgpu::Sampler, std::string> WebScreenUIRenderer::ResolveMaterialSampler(const MaterialBinding &binding,
@@ -566,12 +306,12 @@ std::pair<wgpu::Sampler, std::string> WebScreenUIRenderer::ResolveMaterialSample
         return {};
     const wgpu::Sampler inherited = textureId == kFontTextureId ? m_fontSampler : texture->second.sampler;
     std::string key = std::to_string(textureId);
-    if (binding.guid.empty())
+    if (binding.materialGuid.empty())
         return {inherited, key};
-    const auto material = AssetRegistry::Instance().GetAsset<InxMaterial>(binding.guid);
+    const auto material = AssetRegistry::Instance().GetAsset<InxMaterial>(binding.materialGuid);
     if (!material || material->IsDeleted() || material->GetVersion() != binding.generation)
-        throw std::runtime_error("UI material GUID is missing or its generation changed: " + binding.guid);
-    const MaterialTextureSampler *override = material->GetTextureSampler("texSampler");
+        throw std::runtime_error("UI material GUID is missing or its generation changed: " + binding.materialGuid);
+    const MaterialTextureSampler *override = material->GetTextureSampler("albedo_map");
     if (!override || !override->HasOverrides())
         return {inherited, key};
     key.push_back(':');
@@ -588,7 +328,7 @@ std::pair<wgpu::Sampler, std::string> WebScreenUIRenderer::ResolveMaterialSample
     descriptor.lodMaxClamp = static_cast<float>(textureId == kFontTextureId ? 0 : texture->second.mipLevels - 1);
     const auto sampler = m_device.CreateSampler(&descriptor);
     if (!sampler)
-        throw std::runtime_error("WebGPU rejected UI material texture sampler: " + binding.guid);
+        throw std::runtime_error("WebGPU rejected UI material texture sampler: " + binding.materialGuid);
     return {m_materialSamplers.emplace(key, sampler).first->second, key};
 }
 
@@ -617,6 +357,7 @@ void WebScreenUIRenderer::BeginFrame(uint32_t width, uint32_t height)
             throw std::runtime_error("Web UI font atlas publication failed before geometry recording");
     }
     m_cacheValid = false;
+    m_materialUsageDirty = true;
     ResetDrawList(*m_camera, width, height);
     ResetDrawList(*m_overlay, width, height);
     ResetDrawList(*m_world, width, height);
@@ -644,6 +385,28 @@ bool WebScreenUIRenderer::BeginFrameCached(uint32_t width, uint32_t height, uint
     return false;
 }
 
+void WebScreenUIRenderer::PruneUnusedMaterials()
+{
+    if (!m_materialUsageDirty)
+        return;
+    std::unordered_set<std::string> active;
+    for (size_t list = 0; list < m_bindingBoundaries.size(); ++list) {
+        const auto *draw = DrawList(static_cast<int>(list));
+        const auto &boundaries = m_bindingBoundaries[list];
+        size_t boundary = 0;
+        const MaterialBinding *binding = nullptr;
+        for (int index = 0; index < draw->CmdBuffer.Size; ++index) {
+            while (boundary < boundaries.size() && boundaries[boundary].commandStart <= index)
+                binding = &boundaries[boundary++].binding;
+            const auto &command = draw->CmdBuffer[index];
+            if (command.ElemCount && !command.UserCallback && binding && !binding->materialGuid.empty())
+                active.insert(binding->materialGuid);
+        }
+    }
+    m_materials->Prune(active);
+    m_materialUsageDirty = false;
+}
+
 void WebScreenUIRenderer::PushClipRect(int list, float minX, float minY, float maxX, float maxY)
 {
     if (ImDrawList *drawList = DrawList(list))
@@ -667,11 +430,12 @@ void WebScreenUIRenderer::SetMaterialBinding(int list, const std::string &guid, 
     if (!defaultBinding && (guid.empty() || generation == 0 || pipelineKey.empty()))
         throw std::invalid_argument("UI material binding requires GUID, generation and diagnostic key");
     auto &current = m_currentBindings[static_cast<size_t>(list)];
-    MaterialBinding next{guid, generation, pipelineKey, baseColor, alphaClipEnabled, alphaClipThreshold};
-    if (current.guid == next.guid && current.generation == next.generation && current.pipelineKey == next.pipelineKey &&
-        current.baseColor == next.baseColor && current.alphaClipEnabled == next.alphaClipEnabled &&
-        current.alphaClipThreshold == next.alphaClipThreshold)
+    MaterialBinding next{guid, generation, pipelineKey, baseColor, alphaClipThreshold, alphaClipEnabled};
+    if (current.materialGuid == next.materialGuid && current.generation == next.generation &&
+        current.pipelineKey == next.pipelineKey && current.baseColor == next.baseColor &&
+        current.alphaClipEnabled == next.alphaClipEnabled && current.alphaClipThreshold == next.alphaClipThreshold)
         return;
+    m_materialUsageDirty = true;
     // ImDrawList otherwise merges consecutive commands with the same texture
     // and scissor, which would mix two material generations into one draw.
     draw->AddCallback(CommandBoundary, nullptr);
@@ -897,9 +661,9 @@ uint64_t WebScreenUIRenderer::UploadTexture(const TextureCpuData &source, uint64
 
     std::array<wgpu::BindGroupEntry, 2> entries{};
     entries[0].binding = 0;
-    entries[0].sampler = gpu.sampler;
+    entries[0].textureView = gpu.view;
     entries[1].binding = 1;
-    entries[1].textureView = gpu.view;
+    entries[1].sampler = gpu.sampler;
     wgpu::BindGroupDescriptor groupDescriptor;
     groupDescriptor.layout = m_textureLayout;
     groupDescriptor.entryCount = entries.size();
@@ -943,8 +707,7 @@ bool WebScreenUIRenderer::EnsureBuffer(wgpu::Buffer &buffer, uint64_t &capacity,
 bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_t width, uint32_t height)
 {
     ImDrawList *draw = DrawList(list);
-    if (!pass || !m_pipeline || !draw || draw->VtxBuffer.empty() || draw->IdxBuffer.empty() || width == 0 ||
-        height == 0)
+    if (!pass || !draw || draw->VtxBuffer.empty() || draw->IdxBuffer.empty() || width == 0 || height == 0)
         return false;
     if (!RefreshFontAtlas())
         return false;
@@ -965,19 +728,20 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
         target.color[2] = color.z;
         target.color[3] = color.w;
     }
+    auto &buffers = m_screenBuffers[static_cast<size_t>(list)];
     const uint64_t vertexBytes = vertices.size() * sizeof(GPUVertex);
     const uint64_t indexBytes = static_cast<uint64_t>(draw->IdxBuffer.Size) * sizeof(ImDrawIdx);
     constexpr uint64_t constantStride = 256;
     static_assert(sizeof(ScreenConstants) <= constantStride);
-    if (!EnsureBuffer(m_vertexBuffer, m_vertexCapacity, vertexBytes, wgpu::BufferUsage::Vertex) ||
-        !EnsureBuffer(m_indexBuffer, m_indexCapacity, indexBytes, wgpu::BufferUsage::Index) ||
-        !EnsureBuffer(m_screenConstantsBuffer, m_screenConstantsCapacity,
+    if (!EnsureBuffer(buffers.vertex, buffers.vertexCapacity, vertexBytes, wgpu::BufferUsage::Vertex) ||
+        !EnsureBuffer(buffers.index, buffers.indexCapacity, indexBytes, wgpu::BufferUsage::Index) ||
+        !EnsureBuffer(buffers.constants, buffers.constantsCapacity,
                       constantStride * static_cast<uint64_t>(draw->CmdBuffer.Size), wgpu::BufferUsage::Uniform))
         return false;
-    m_queue.WriteBuffer(m_vertexBuffer, 0, vertices.data(), vertexBytes);
-    m_queue.WriteBuffer(m_indexBuffer, 0, draw->IdxBuffer.Data, indexBytes);
-    pass.SetVertexBuffer(0, m_vertexBuffer, 0, vertexBytes);
-    pass.SetIndexBuffer(m_indexBuffer, sizeof(ImDrawIdx) == 2 ? wgpu::IndexFormat::Uint16 : wgpu::IndexFormat::Uint32,
+    m_queue.WriteBuffer(buffers.vertex, 0, vertices.data(), vertexBytes);
+    m_queue.WriteBuffer(buffers.index, 0, draw->IdxBuffer.Data, indexBytes);
+    pass.SetVertexBuffer(0, buffers.vertex, 0, vertexBytes);
+    pass.SetIndexBuffer(buffers.index, sizeof(ImDrawIdx) == 2 ? wgpu::IndexFormat::Uint16 : wgpu::IndexFormat::Uint32,
                         0, indexBytes);
     std::unordered_map<std::string, wgpu::BindGroup> textureGroups;
     const auto &boundaries = m_bindingBoundaries[static_cast<size_t>(list)];
@@ -1008,17 +772,13 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
         const auto [sampler, samplerKey] = ResolveMaterialSampler(binding, textureId);
         auto group = textureGroups.find(samplerKey);
         if (group == textureGroups.end()) {
-            std::array<wgpu::BindGroupEntry, 3> entries{};
+            std::array<wgpu::BindGroupEntry, 2> entries{};
             entries[0].binding = 0;
             entries[0].textureView = textureView;
             entries[1].binding = 1;
             entries[1].sampler = sampler;
-            entries[2].binding = rhi::RootConstantBinding;
-            entries[2].buffer = m_screenConstantsBuffer;
-            entries[2].offset = 0;
-            entries[2].size = sizeof(ScreenConstants);
             wgpu::BindGroupDescriptor descriptor;
-            descriptor.layout = m_screenLayout;
+            descriptor.layout = m_textureLayout;
             descriptor.entryCount = entries.size();
             descriptor.entries = entries.data();
             group = textureGroups.emplace(samplerKey, m_device.CreateBindGroup(&descriptor)).first;
@@ -1035,10 +795,11 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
         constants.alphaClipEnabled = binding.alphaClipEnabled ? 1.0f : 0.0f;
         constants.alphaClipThreshold = binding.alphaClipThreshold;
         const uint64_t offset = static_cast<uint64_t>(commandIndex) * constantStride;
-        m_queue.WriteBuffer(m_screenConstantsBuffer, offset, &constants, sizeof(constants));
-        pass.SetPipeline(ResolveMaterialPipeline(binding, false, false));
+        m_queue.WriteBuffer(buffers.constants, offset, &constants, sizeof(constants));
         const uint32_t dynamicOffset = static_cast<uint32_t>(offset);
-        pass.SetBindGroup(0, group->second, 1, &dynamicOffset);
+        if (!m_materials->Bind(pass, binding, false, false, buffers.constants, uint32_t(list), dynamicOffset))
+            continue;
+        pass.SetBindGroup(3, group->second);
         pass.SetScissorRect(static_cast<uint32_t>(left), static_cast<uint32_t>(top),
                             static_cast<uint32_t>(right - left), static_cast<uint32_t>(bottom - top));
         pass.DrawIndexed(command.ElemCount, 1, command.IdxOffset, static_cast<int32_t>(command.VtxOffset), 0);
@@ -1051,18 +812,19 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
     return true;
 }
 
-bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, const glm::mat4 &viewProjection,
-                                      const glm::mat4 &view, const glm::mat4 &projection, uint32_t cullingMask,
-                                      uint32_t width, uint32_t height)
+bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height)
 {
-    if (!pass || !m_world || m_worldElements.empty() || !m_worldDepthPipeline || !m_worldTopPipeline || width == 0 ||
-        height == 0 || m_worldElementOpen) {
+    m_materials->StageCamera(camera);
+    const auto viewProjection = camera.GetViewProjectionMatrix();
+    const auto view = camera.GetViewMatrix();
+    const auto projection = camera.GetProjectionMatrix();
+    const auto cullingMask = camera.GetCullingMask();
+    if (!pass || !m_world || m_worldElements.empty() || width == 0 || height == 0 || m_worldElementOpen) {
         if (!m_reportedWorldCommandState && m_world && (m_world->VtxBuffer.Size > 0 || !m_worldElements.empty())) {
-            std::printf("INFERNUX_WEB_WORLD_UI_COMMAND_STATE spans=%zu vertices=%d indices=%d open=%d depth=%d top=%d "
+            std::printf("INFERNUX_WEB_WORLD_UI_COMMAND_STATE spans=%zu vertices=%d indices=%d open=%d "
                         "size=%ux%u\n",
                         m_worldElements.size(), m_world->VtxBuffer.Size, m_world->IdxBuffer.Size,
-                        m_worldElementOpen ? 1 : 0, m_worldDepthPipeline ? 1 : 0, m_worldTopPipeline ? 1 : 0, width,
-                        height);
+                        m_worldElementOpen ? 1 : 0, width, height);
             m_reportedWorldCommandState = true;
         }
         return false;
@@ -1169,17 +931,13 @@ bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, const glm::m
         const auto [sampler, samplerKey] = ResolveMaterialSampler(draw.binding, textureId);
         auto group = textureGroups.find(samplerKey);
         if (group == textureGroups.end()) {
-            std::array<wgpu::BindGroupEntry, 3> entries{};
+            std::array<wgpu::BindGroupEntry, 2> entries{};
             entries[0].binding = 0;
             entries[0].textureView = textureView;
             entries[1].binding = 1;
             entries[1].sampler = sampler;
-            entries[2].binding = rhi::RootConstantBinding;
-            entries[2].buffer = m_worldConstantsBuffer;
-            entries[2].offset = 0;
-            entries[2].size = sizeof(WorldConstants);
             wgpu::BindGroupDescriptor descriptor;
-            descriptor.layout = m_worldLayout;
+            descriptor.layout = m_textureLayout;
             descriptor.entryCount = entries.size();
             descriptor.entries = entries.data();
             group = textureGroups.emplace(samplerKey, m_device.CreateBindGroup(&descriptor)).first;
@@ -1197,9 +955,10 @@ bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, const glm::m
         constants.cameraUp = glm::vec4(cameraUp, 0.0f);
         const uint64_t offset = index * constantStride;
         m_queue.WriteBuffer(m_worldConstantsBuffer, offset, &constants, sizeof(constants));
-        pass.SetPipeline(ResolveMaterialPipeline(draw.binding, true, draw.top));
         const uint32_t dynamicOffset = static_cast<uint32_t>(offset);
-        pass.SetBindGroup(0, group->second, 1, &dynamicOffset);
+        if (!m_materials->Bind(pass, draw.binding, true, draw.top, m_worldConstantsBuffer, 2, dynamicOffset))
+            continue;
+        pass.SetBindGroup(3, group->second);
         pass.DrawIndexed(draw.command->ElemCount, 1, draw.command->IdxOffset,
                          static_cast<int32_t>(draw.command->VtxOffset), 0);
     }

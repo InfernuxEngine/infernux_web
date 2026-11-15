@@ -53,7 +53,8 @@ class WebSceneRenderer final
         wgpu::TextureView view;
         wgpu::Sampler sampler;
     };
-    [[nodiscard]] SampledTexture ResolveSampledTexture(const std::string &guid);
+    [[nodiscard]] SampledTexture ResolveSampledTexture(const std::string &guid,
+                                                       const MaterialTextureSampler *sampler = nullptr);
 
     /// Extract, upload, and record the directional shadow map before the main
     /// render pass begins.

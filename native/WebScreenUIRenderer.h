@@ -1,5 +1,6 @@
 #pragma once
 
+#include "WebUIMaterialCache.h"
 #include <glm/mat4x4.hpp>
 #include <glm/vec4.hpp>
 #include <imgui.h>
@@ -24,6 +25,7 @@ struct MaterialTextureSampler;
 
 namespace infernux::web
 {
+class WebSceneRenderer;
 
 /// Engine-owned Screen UI consumer for the WebGPU Player.
 ///
@@ -33,14 +35,16 @@ namespace infernux::web
 class WebScreenUIRenderer final
 {
   public:
-    WebScreenUIRenderer() = default;
+    WebScreenUIRenderer();
     ~WebScreenUIRenderer();
 
     bool Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::TextureFormat colorFormat,
-                    wgpu::TextureFormat worldColorFormat, uint32_t worldSampleCount);
+                    wgpu::TextureFormat worldColorFormat, uint32_t worldSampleCount, WebSceneRenderer &scene);
     bool ConfigureSampleCount(uint32_t sampleCount);
+    void StageFrame(const EngineGlobalsUBO &frame, uint32_t width, uint32_t height);
     void BeginFrame(uint32_t width, uint32_t height);
     bool BeginFrameCached(uint32_t width, uint32_t height, uint64_t contentRevision);
+    void PruneUnusedMaterials();
     void PushClipRect(int list, float minX, float minY, float maxX, float maxY);
     void PopClipRect(int list);
     void SetMaterialBinding(int list, const std::string &guid, uint64_t generation, const std::string &pipelineKey,
@@ -71,19 +75,10 @@ class WebScreenUIRenderer final
     void ReleaseTexture(uint64_t textureId);
 
     bool Render(wgpu::RenderPassEncoder pass, int list, uint32_t width, uint32_t height);
-    bool RenderWorld(wgpu::RenderPassEncoder pass, const glm::mat4 &viewProjection, const glm::mat4 &view,
-                     const glm::mat4 &projection, uint32_t cullingMask, uint32_t width, uint32_t height);
+    bool RenderWorld(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height);
 
   private:
-    struct MaterialBinding
-    {
-        std::string guid;
-        uint64_t generation = 0;
-        std::string pipelineKey;
-        std::array<float, 4> baseColor{1.0f, 1.0f, 1.0f, 1.0f};
-        bool alphaClipEnabled = false;
-        float alphaClipThreshold = 0.0f;
-    };
+    using MaterialBinding = UIShaderMaterialBinding;
 
     struct BindingBoundary
     {
@@ -108,23 +103,8 @@ class WebScreenUIRenderer final
         uint64_t ignoredOccluderId = 0;
     };
 
-    struct GPUVertex
-    {
-        float position[2];
-        float uv[2];
-        float color[4];
-    };
-
-    struct WorldVertex
-    {
-        float position[3];
-        float uv[2];
-        float color[4];
-        float localPosition[2];
-        float anchor[3];
-        float localOffset[3];
-        float policy;
-    };
+    using GPUVertex = UIQuadVertex;
+    using WorldVertex = UIWorldVertex;
 
     struct alignas(16) WorldConstants
     {
@@ -164,8 +144,6 @@ class WebScreenUIRenderer final
 
     ImDrawList *DrawList(int list) const;
     bool CreatePipelineAndFontAtlas();
-    bool CreateWorldPipelines();
-    wgpu::RenderPipeline ResolveMaterialPipeline(const MaterialBinding &binding, bool world, bool alwaysOnTop);
     [[nodiscard]] std::pair<wgpu::Sampler, std::string> ResolveMaterialSampler(const MaterialBinding &binding,
                                                                                uint64_t textureId);
     bool RefreshFontAtlas();
@@ -174,21 +152,12 @@ class WebScreenUIRenderer final
     wgpu::Device m_device;
     wgpu::Queue m_queue;
     wgpu::TextureFormat m_colorFormat = wgpu::TextureFormat::Undefined;
-    std::array<wgpu::ShaderModule, 2> m_worldShaders;
-    wgpu::RenderPipeline m_pipeline;
-    wgpu::RenderPipeline m_worldDepthPipeline;
-    wgpu::RenderPipeline m_worldTopPipeline;
-    std::unordered_map<std::string, wgpu::RenderPipeline> m_customScreenPipelines;
-    std::unordered_map<std::string, wgpu::RenderPipeline> m_customWorldPipelines;
+    std::unique_ptr<WebUIMaterialCache> m_materials;
     wgpu::BindGroupLayout m_textureLayout;
-    wgpu::BindGroupLayout m_screenLayout;
-    wgpu::BindGroupLayout m_worldLayout;
     wgpu::Buffer m_worldConstantsBuffer;
-    wgpu::Buffer m_screenConstantsBuffer;
     wgpu::Buffer m_worldVertexBuffer;
     wgpu::Buffer m_worldIndexBuffer;
     uint64_t m_worldConstantsCapacity = 0;
-    uint64_t m_screenConstantsCapacity = 0;
     uint64_t m_worldVertexCapacity = 0;
     uint64_t m_worldIndexCapacity = 0;
     wgpu::TextureFormat m_worldColorFormat = wgpu::TextureFormat::Undefined;
@@ -199,10 +168,12 @@ class WebScreenUIRenderer final
     wgpu::Sampler m_fontSampler;
     uint32_t m_fontWidth = 0;
     uint32_t m_fontHeight = 0;
-    wgpu::Buffer m_vertexBuffer;
-    wgpu::Buffer m_indexBuffer;
-    uint64_t m_vertexCapacity = 0;
-    uint64_t m_indexCapacity = 0;
+    struct ScreenBuffers
+    {
+        wgpu::Buffer vertex, index, constants;
+        uint64_t vertexCapacity = 0, indexCapacity = 0, constantsCapacity = 0;
+    };
+    std::array<ScreenBuffers, 2> m_screenBuffers;
     std::unordered_map<uint64_t, GPUTexture> m_textures;
     std::unordered_map<std::string, wgpu::Sampler> m_materialSamplers;
     uint64_t m_nextTextureId = 2;
@@ -217,6 +188,7 @@ class WebScreenUIRenderer final
     bool m_worldElementOpen = false;
     bool m_ownsContext = false;
     bool m_cacheValid = false;
+    bool m_materialUsageDirty = false;
     uint32_t m_cachedWidth = 0;
     uint32_t m_cachedHeight = 0;
     uint64_t m_cachedRevision = 0;
