@@ -45,10 +45,9 @@ option(INFERNUX_WEB_LINK_NATIVE_MODULE_PROBE
     "Link the Web Player runtime binding and scene inventories into the host"
     OFF
 )
-option(INFERNUX_WEB_LINK_ENGINE_RUNTIME
-    "Statically link the supported Infernux gameplay runtime into the Web Player"
-    ON
-)
+# The Player always consumes the engine asset registry and shared renderers.
+# Compile-only binding probes remain separate targets, not a second host mode.
+set(INFERNUX_WEB_LINK_ENGINE_RUNTIME ON)
 if(INFERNUX_WEB_LINK_NATIVE_MODULE_PROBE AND
    NOT INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE)
     message(FATAL_ERROR
@@ -211,10 +210,13 @@ add_executable(InfernuxWebPlayerHost
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/particle/ParticleGpuRuntime.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/FullscreenRenderer.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/TextureUploadBuilder.cpp"
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/CommandBuffer.cpp"
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/RenderGraphDescription.cpp"
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/RenderGraphSchedule.cpp"
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/ScriptableRenderContext.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/RenderPoseBuffer.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/shader/DeviceShaderProgram.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/SceneMaterialPass.cpp"
-    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/RenderGraphSchedule.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/rhi/RhiComputeBuffer.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/rhi/RhiComputeKernel.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/rhi/RhiRenderTexture.cpp"
@@ -344,6 +346,10 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingInput.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingPhysics.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingResources.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingRhi.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingRenderGraphDescription.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingRenderPipeline.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingCommandBuffer.cpp"
         ${_web_scene_binding_sources}
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingSkeleton.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/BindingSemanticCatalog.cpp"
@@ -369,7 +375,6 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
     )
     list(FILTER _web_scene_runtime_sources EXCLUDE REGEX "EditorCameraController\\.cpp$")
     list(FILTER _web_scene_runtime_sources EXCLUDE REGEX "SceneRenderBridge\\.cpp$")
-    list(FILTER _web_scene_runtime_sources EXCLUDE REGEX "SceneRenderer\\.cpp$")
     add_library(InfernuxWebSceneRuntimeProbe OBJECT EXCLUDE_FROM_ALL
         ${_web_scene_runtime_sources}
     )

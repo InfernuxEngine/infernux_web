@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace infernux::web
 {
@@ -71,6 +72,7 @@ struct WebSceneRenderer::Impl
     uint64_t frameIndex = 0;
     EngineGlobalsUBO frameGlobals;
     SceneRenderExtractor extractor;
+    SceneRenderer culler;
     RenderWorldSnapshot world;
     std::shared_ptr<const RenderWorldFrame> frame;
     SceneLightCollector lights;
@@ -557,9 +559,23 @@ bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uin
     s.skinValues.clear();
     s.instanceValues.clear();
     s.boneValues.assign(1, glm::mat4(1));
-    for (const auto &draw : s.frame->DrawCalls().drawCalls)
-        if (draw.layerMask & view.cullingMask)
-            s.AddDraw(draw);
+    const auto culled = s.culler.CullAndBuildForView(view, s.frame, s.shadowsEnabled);
+    const auto &visible = culled.visibleDrawCallsRef ? *culled.visibleDrawCallsRef : culled.visibleDrawCalls;
+    const auto &casters = culled.shadowDrawCallsRef ? *culled.shadowDrawCallsRef : culled.shadowDrawCalls;
+    std::unordered_set<RenderDrawIdentity, RenderDrawIdentityHash> visibleDraws;
+    visibleDraws.reserve(visible.size());
+    for (const auto &draw : visible) {
+        visibleDraws.insert(draw.identity);
+        s.AddDraw(draw);
+    }
+    // Camera visibility and camera layers do not remove a light's casters.
+    for (const auto &draw : casters) {
+        if (draw.castsShadows && !visibleDraws.count(draw.identity)) {
+            auto shadowOnly = draw;
+            shadowOnly.frustumVisible = false;
+            s.AddDraw(shadowOnly);
+        }
+    }
     if (s.skyEnabled && view.clearFlags == CameraClearFlags::Skybox && s.frame->Lighting()->skyboxMaterial) {
         DrawCall sky;
         sky.material = s.frame->Lighting()->skyboxMaterial;
