@@ -207,6 +207,10 @@ wgpu::PrimitiveTopology ToWebTopology(rhi::PrimitiveTopology topology)
         return wgpu::PrimitiveTopology::TriangleStrip;
     case rhi::PrimitiveTopology::LineList:
         return wgpu::PrimitiveTopology::LineList;
+    case rhi::PrimitiveTopology::PointList:
+        return wgpu::PrimitiveTopology::PointList;
+    case rhi::PrimitiveTopology::LineStrip:
+        return wgpu::PrimitiveTopology::LineStrip;
     }
     return wgpu::PrimitiveTopology::Undefined;
 }
@@ -220,6 +224,8 @@ wgpu::CullMode ToWebCull(rhi::CullMode mode)
         return wgpu::CullMode::Front;
     case rhi::CullMode::Back:
         return wgpu::CullMode::Back;
+    case rhi::CullMode::FrontAndBack:
+        break; // Culled draws are removed by the renderer before device creation.
     }
     return wgpu::CullMode::Undefined;
 }
@@ -255,6 +261,50 @@ wgpu::CompareFunction ToWebCompare(rhi::CompareFunction compare)
 uint64_t AlignedUniformSize(uint32_t byteSize)
 {
     return std::max<uint64_t>(16, (static_cast<uint64_t>(byteSize) + 15u) & ~15ull);
+}
+
+wgpu::BlendComponent ToWebBlend(const rhi::BlendComponent &source)
+{
+    constexpr std::array factors{wgpu::BlendFactor::Zero,
+                                 wgpu::BlendFactor::One,
+                                 wgpu::BlendFactor::Src,
+                                 wgpu::BlendFactor::OneMinusSrc,
+                                 wgpu::BlendFactor::Dst,
+                                 wgpu::BlendFactor::OneMinusDst,
+                                 wgpu::BlendFactor::SrcAlpha,
+                                 wgpu::BlendFactor::OneMinusSrcAlpha,
+                                 wgpu::BlendFactor::DstAlpha,
+                                 wgpu::BlendFactor::OneMinusDstAlpha,
+                                 wgpu::BlendFactor::Constant,
+                                 wgpu::BlendFactor::OneMinusConstant,
+                                 wgpu::BlendFactor::Constant,
+                                 wgpu::BlendFactor::OneMinusConstant,
+                                 wgpu::BlendFactor::SrcAlphaSaturated};
+    constexpr std::array operations{wgpu::BlendOperation::Add, wgpu::BlendOperation::Subtract,
+                                    wgpu::BlendOperation::ReverseSubtract, wgpu::BlendOperation::Min,
+                                    wgpu::BlendOperation::Max};
+    wgpu::BlendComponent result;
+    result.srcFactor = factors[static_cast<size_t>(source.source)];
+    result.dstFactor = factors[static_cast<size_t>(source.destination)];
+    result.operation = operations[static_cast<size_t>(source.operation)];
+    // WebGPU requires One/One for min/max; both APIs ignore these factors.
+    if (source.operation == rhi::BlendOperation::Minimum || source.operation == rhi::BlendOperation::Maximum)
+        result.srcFactor = result.dstFactor = wgpu::BlendFactor::One;
+    return result;
+}
+
+wgpu::StencilFaceState ToWebStencil(const rhi::StencilFaceState &source)
+{
+    constexpr std::array operations{wgpu::StencilOperation::Keep,           wgpu::StencilOperation::Zero,
+                                    wgpu::StencilOperation::Replace,        wgpu::StencilOperation::IncrementClamp,
+                                    wgpu::StencilOperation::DecrementClamp, wgpu::StencilOperation::Invert,
+                                    wgpu::StencilOperation::IncrementWrap,  wgpu::StencilOperation::DecrementWrap};
+    wgpu::StencilFaceState result;
+    result.compare = ToWebCompare(source.compare);
+    result.failOp = operations[static_cast<size_t>(source.fail)];
+    result.passOp = operations[static_cast<size_t>(source.pass)];
+    result.depthFailOp = operations[static_cast<size_t>(source.depthFail)];
+    return result;
 }
 
 } // namespace
@@ -330,6 +380,24 @@ WebGpuRhiDevice::WebGpuRhiDevice(wgpu::Device device, wgpu::Queue queue, uint32_
             rhi::FormatFeature::Sampled | rhi::FormatFeature::TransferSource | rhi::FormatFeature::TransferDestination;
         caps.optimalTiling |= rhi::IsDepthFormat(format) ? rhi::FormatFeature::DepthStencilAttachment
                                                          : rhi::FormatFeature::ColorAttachment;
+        // Core WebGPU filterable color formats. Float32 filtering is an
+        // optional device feature and is not requested by this host.
+        switch (format) {
+        case rhi::PixelFormat::R8UNorm:
+        case rhi::PixelFormat::RG8UNorm:
+        case rhi::PixelFormat::RGBA8UNorm:
+        case rhi::PixelFormat::RGBA8Srgb:
+        case rhi::PixelFormat::BGRA8UNorm:
+        case rhi::PixelFormat::BGRA8Srgb:
+        case rhi::PixelFormat::R16SFloat:
+        case rhi::PixelFormat::RG16SFloat:
+        case rhi::PixelFormat::RGBA16SFloat:
+        case rhi::PixelFormat::RGB10A2UNorm:
+            caps.optimalTiling |= rhi::FormatFeature::FilterLinear;
+            break;
+        default:
+            break;
+        }
         switch (format) {
         case rhi::PixelFormat::RGBA8UNorm:
         case rhi::PixelFormat::RGBA16SFloat:
@@ -744,6 +812,23 @@ rhi::BindGroupHandle WebGpuRhiDevice::CreateBindGroup(const rhi::BindGroupDesc &
 
 rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::GraphicsPipelineDesc &desc)
 {
+    if (desc.raster.polygonMode != rhi::PolygonMode::Fill || desc.raster.lineWidth != 1.0f ||
+        desc.raster.cullMode == rhi::CullMode::FrontAndBack) {
+        SetError("WebGPU does not support this polygon raster state");
+        return {};
+    }
+    if (!std::isfinite(desc.raster.depthBias) || std::trunc(desc.raster.depthBias) != desc.raster.depthBias ||
+        double(desc.raster.depthBias) < std::numeric_limits<int32_t>::min() ||
+        double(desc.raster.depthBias) > std::numeric_limits<int32_t>::max()) {
+        SetError("WebGPU requires an integer depth-bias constant");
+        return {};
+    }
+    if (desc.stencil.enabled && (desc.stencil.front.readMask != desc.stencil.back.readMask ||
+                                 desc.stencil.front.writeMask != desc.stencil.back.writeMask ||
+                                 desc.stencil.front.reference != desc.stencil.back.reference)) {
+        SetError("WebGPU requires common front/back stencil masks and reference");
+        return {};
+    }
     if (!desc.vertexInput.IsValid()) {
         SetError("invalid WebGPU vertex input layout");
         return {};
@@ -757,6 +842,7 @@ rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::G
     }
 
     GraphicsPipelinePayload payload;
+    payload.stencilReference = desc.stencil.front.reference;
     payload.layoutCount = desc.bindingLayoutCount;
     payload.pushConstantBytes = desc.pushConstantBytes;
     for (uint32_t index = 0; index < desc.bindingLayoutCount; ++index) {
@@ -792,12 +878,8 @@ rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::G
         targets[index].writeMask = static_cast<wgpu::ColorWriteMask>(source.writeMask);
         if (source.blendEnabled) {
             auto &blend = blends[index];
-            blend.color.operation = wgpu::BlendOperation::Add;
-            blend.color.srcFactor = source.premultipliedAlpha ? wgpu::BlendFactor::One : wgpu::BlendFactor::SrcAlpha;
-            blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-            blend.alpha.operation = wgpu::BlendOperation::Add;
-            blend.alpha.srcFactor = wgpu::BlendFactor::One;
-            blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+            blend.color = ToWebBlend(source.colorBlend);
+            blend.alpha = ToWebBlend(source.alphaBlend);
             targets[index].blend = &blend;
         }
     }
@@ -812,6 +894,15 @@ rhi::GraphicsPipelineHandle WebGpuRhiDevice::CreateGraphicsPipeline(const rhi::G
     depthState.format = ToWebFormat(desc.renderingSignature.depthFormat);
     depthState.depthWriteEnabled = desc.depth.writeEnabled ? wgpu::OptionalBool::True : wgpu::OptionalBool::False;
     depthState.depthCompare = desc.depth.testEnabled ? ToWebCompare(desc.depth.compare) : wgpu::CompareFunction::Always;
+    depthState.depthBias = static_cast<int32_t>(desc.raster.depthBias);
+    depthState.depthBiasSlopeScale = desc.raster.depthBiasSlope;
+    depthState.depthBiasClamp = desc.raster.depthBiasClamp;
+    if (desc.stencil.enabled) {
+        depthState.stencilFront = ToWebStencil(desc.stencil.front);
+        depthState.stencilBack = ToWebStencil(desc.stencil.back);
+        depthState.stencilReadMask = desc.stencil.front.readMask;
+        depthState.stencilWriteMask = desc.stencil.front.writeMask;
+    }
 
     wgpu::RenderPipelineDescriptor native;
     native.layout = pipelineLayout;
@@ -1065,6 +1156,7 @@ void WebGpuRhiDevice::BindPipeline(void *raw, rhi::GraphicsPipelineHandle pipeli
         return;
     context.pipeline = pipeline;
     context.pass.SetPipeline(payload->pipeline);
+    context.pass.SetStencilReference(payload->stencilReference);
     for (uint32_t index = 0; index < payload->layoutCount; ++index)
         context.device->BindGraphicsGroup(context, index);
 }

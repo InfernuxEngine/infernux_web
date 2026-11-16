@@ -163,6 +163,7 @@ class WebGpuRhiDevice final : public rhi::Device
         uint32_t layoutCount = 0;
         uint32_t pushConstantBytes = 0;
         bool rootHasResources = false;
+        uint32_t stencilReference = 0;
     };
 
     struct ComputePipelinePayload final

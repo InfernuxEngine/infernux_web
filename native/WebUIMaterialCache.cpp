@@ -1,7 +1,8 @@
 #include "WebUIMaterialCache.h"
 
 #include <function/renderer/InxRenderStruct.h>
-#include <function/renderer/shader/MaterialValueCopy.h>
+#include <function/renderer/shader/DeviceShaderProgram.h>
+#include <function/renderer/shader/MaterialUniformLayout.h>
 #include <function/resources/AssetDatabase/AssetDatabase.h>
 #include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/resources/InxMaterial/InxMaterial.h>
@@ -265,10 +266,10 @@ WebUIMaterialCache::Prepared &WebUIMaterialCache::Resolve(const UIShaderMaterial
         throw ShaderProgramDomainMismatch(expected, *shader->programDomain);
     if (!material->GetVertShaderReference().guid.empty() || !material->GetVertShaderReference().shaderId.empty())
         throw UIShaderMaterialError("UI geometry belongs to its producer; remove the material vertex selection");
-    const auto target = std::find_if(shader->program->targets.begin(), shader->program->targets.end(),
-                                     [](const auto &value) { return value.target == ShaderCodeTarget::Wgsl; });
+    const auto stages =
+        SelectMaterialShaderEntries(*shader->materialProgram, ShaderCompileTarget::Forward, ShaderCodeTarget::Wgsl);
     auto next = std::make_unique<Prepared>();
-    PrepareProgram(*next, std::shared_ptr<const ShaderTargetCode>(shader->program, &*target), world);
+    PrepareProgram(*next, std::shared_ptr<const ShaderTargetCode>(shader->program, &stages.front().program), world);
     next->generation = binding.generation;
     next->shaderGuid = shaderGuid;
     next->shaderVersion = registry.GetAssetVersion(shaderGuid);
@@ -280,11 +281,7 @@ WebUIMaterialCache::Prepared &WebUIMaterialCache::Resolve(const UIShaderMaterial
         for (const auto &resource : next->resources) {
             if (resource.binding.type != rhi::BindingType::UniformBuffer)
                 continue;
-            for (const auto &field : resource.value.fields) {
-                const auto &value = *values->GetProperty(field.name);
-                WriteMaterialValue(ShaderValueCopy(field, ShaderMatrixOrder::ColumnMajor), bytes.data(), value.type,
-                                   value.value, field.name);
-            }
+            MaterialUniformLayout(resource.value.fields).Write(bytes.data(), *values);
         }
         next->uniform = UniformBuffer(m_device, next->uniformBytes);
         m_queue.WriteBuffer(next->uniform, 0, bytes.data(), bytes.size());
