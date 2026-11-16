@@ -62,7 +62,6 @@ struct WebUIMaterialCache::Prepared
     struct TextureField
     {
         std::string name, guid;
-        uint32_t slot = 0;
         Texture texture;
     };
     struct Root
@@ -76,6 +75,7 @@ struct WebUIMaterialCache::Prepared
     std::shared_ptr<const InxMaterial> values;
     std::vector<ShaderResourceLayout> resources;
     std::vector<TextureField> textures;
+    std::vector<uint32_t> resourceTextures;
     wgpu::Buffer uniform;
     uint64_t uniformBytes = 0, rootBytes = 0;
     wgpu::BindGroupLayout layout;
@@ -287,20 +287,22 @@ WebUIMaterialCache::Prepared &WebUIMaterialCache::Resolve(const UIShaderMaterial
         next->uniform = UniformBuffer(m_device, next->uniformBytes);
         m_queue.WriteBuffer(next->uniform, 0, bytes.data(), bytes.size());
     }
-    for (const auto &property : shader->materialProgram->properties) {
-        if (!property.textureSlot)
+    next->resourceTextures.resize(next->resources.size());
+    std::unordered_map<std::string, uint32_t> textureIndices;
+    for (size_t index = 0; index < next->resources.size(); ++index) {
+        const auto &resource = next->resources[index];
+        if (resource.binding.type == rhi::BindingType::UniformBuffer)
             continue;
-        const auto slot = *property.textureSlot;
-        if (std::none_of(next->resources.begin(), next->resources.end(), [slot](const auto &resource) {
-                return resource.binding.type == rhi::BindingType::SampledTexture &&
-                       resource.binding.binding == 1 + 2 * slot;
-            }))
-            continue;
-        const auto &selected = std::get<std::string>(values->GetProperty(property.name)->value);
-        next->textures.push_back({property.name,
-                                  selected.empty() ? std::string(values->GetTextureDefault(property.name)) : selected,
-                                  slot,
-                                  {}});
+        const auto [texture, inserted] =
+            textureIndices.emplace(resource.name, static_cast<uint32_t>(next->textures.size()));
+        if (inserted) {
+            const auto &selected = std::get<std::string>(values->GetProperty(resource.name)->value);
+            next->textures.push_back(
+                {resource.name,
+                 selected.empty() ? std::string(values->GetTextureDefault(resource.name)) : selected,
+                 {}});
+        }
+        next->resourceTextures[index] = texture->second;
     }
     const auto accepted = m_prepared.insert_or_assign(binding.materialGuid, std::move(next));
     return *accepted.first->second;
@@ -407,18 +409,15 @@ wgpu::BindGroup WebUIMaterialCache::RootGroup(Prepared &prepared, const wgpu::Bu
     if (root.buffer.Get() == constants.Get() && root.group)
         return root.group;
     std::vector<wgpu::BindGroupEntry> entries;
-    for (const auto &resource : prepared.resources) {
+    for (size_t index = 0; index < prepared.resources.size(); ++index) {
+        const auto &resource = prepared.resources[index];
         wgpu::BindGroupEntry entry;
         entry.binding = resource.binding.binding;
         if (resource.binding.type == rhi::BindingType::UniformBuffer) {
             entry.buffer = prepared.uniform;
             entry.size = prepared.uniformBytes;
         } else {
-            const auto slot = (entry.binding - 1) / 2;
-            const auto &texture =
-                std::find_if(prepared.textures.begin(), prepared.textures.end(), [slot](const auto &value) {
-                    return value.slot == slot;
-                })->texture;
+            const auto &texture = prepared.textures[prepared.resourceTextures[index]].texture;
             if (resource.binding.type == rhi::BindingType::SampledTexture)
                 entry.textureView = texture.view;
             else
