@@ -137,6 +137,7 @@ struct CameraGraph
     uint64_t lastFrame = 0;
 };
 std::unordered_map<uint64_t, CameraGraph> g_cameraGraphs;
+std::unordered_map<uint64_t, std::shared_ptr<infernux::rhi::RenderTexture>> g_screenTargets;
 PyObject *g_renderPipelineOwner = nullptr;
 infernux::RenderPipelineCallback *g_renderPipeline = nullptr;
 uint32_t g_lastSampleCount = 1;
@@ -921,6 +922,7 @@ void Frame()
         };
         std::vector<CapturedCamera> captured;
         std::vector<infernux::RenderViewAccess> accesses;
+        std::unordered_map<uint64_t, infernux::rhi::SampleCount> screenSamples;
         captured.reserve(cameras.size());
         accesses.reserve(cameras.size());
         for (auto *camera : cameras) {
@@ -955,14 +957,30 @@ void Frame()
             graphView.depthFormat = output ? output->description.depthFormat : infernux::rhi::PixelFormat::D32SFloat;
             graphView.samples = static_cast<infernux::rhi::SampleCount>(g_lastSampleCount);
             graphView.revision = outputRevision;
+            auto destination = output;
+            if (!destination) {
+                const auto world = plan->world->WorldId();
+                const auto [entry, first] = screenSamples.emplace(world, graphView.samples);
+                if (!first && entry->second != graphView.samples)
+                    throw std::invalid_argument("Cameras sharing one screen must use the same sample count");
+                auto &target = g_screenTargets[world];
+                infernux::rhi::RenderTextureDesc description;
+                description.width = g_width; description.height = g_height;
+                description.colorFormat = graphView.colorFormat;
+                description.depthFormat = graphView.depthFormat;
+                description.samples = graphView.samples;
+                description.sampledDepth = true;
+                if (!target)
+                    target = std::make_shared<infernux::rhi::RenderTexture>(*g_rhi, "screen/" + std::to_string(world), description);
+                else
+                    target->Reconfigure(description);
+                destination = target->Acquire();
+            }
             state.graph->Apply(state.description, graphView, {},
                 infernux::ResolveGraphCameraClear(*state.description, cameraView.clearFlags,
-                    inx::color::SrgbToLinear(cameraView.backgroundColor)));
+                    inx::color::SrgbToLinear(cameraView.backgroundColor)), destination, cameraView.rect);
             state.graph->UpdateParameters(plan->parameters);
             auto access = state.graph->GetResourceAccess();
-            access.writes.push_back(output ? static_cast<const void *>(output->color.get()) : &g_cameraGraphs);
-            if (output && output->depth)
-                access.writes.push_back(output->depth.get());
             accesses.push_back(std::move(access));
             captured.push_back({camera, plan, &state});
         }
@@ -1003,13 +1021,7 @@ void Frame()
                         throw std::invalid_argument("Unexpected non-raster command in a render pass");
                     }
                 }, [](auto, const auto &) { throw std::invalid_argument("Graph work has no execution binding"); });
-            if (output) {
-                // Persistent camera outputs stay linear. Screen-only UI and
-                // display encoding were removed by the common output policy.
-                present(*state.graph, true, resources, g_rhi->GetNativeTextureView(output->color->GetView()),
-                        output->description.colorFormat,
-                        infernux::RasterViewportRect(cameraView.rect, output->width, output->height), false);
-            } else {
+            if (!output) {
                 present(*state.graph, state.description->outputDisplayEncoded, resources, view, ToRhiFormat(g_surfaceFormat),
                         infernux::RasterViewportRect(cameraView.rect, g_width, g_height), !rendered);
                 rendered = true;

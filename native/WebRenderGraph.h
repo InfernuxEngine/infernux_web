@@ -30,7 +30,9 @@ class WebRenderGraph final
     /// Compile only when topology or view extent changes. External texture
     /// generations are part of that publication, never looked up while drawing.
     bool Apply(std::shared_ptr<const RenderGraphDescription> graph, const rhi::RenderViewContext &view,
-                 const ImportTexture &imports = {}, const std::optional<GraphPassDesc> &cameraClear = {});
+                 const ImportTexture &imports = {}, const std::optional<GraphPassDesc> &cameraClear = {},
+                 std::shared_ptr<const rhi::RenderTextureGeneration> output = {},
+                 const glm::vec4 &rect = {0, 0, 1, 1});
     void UpdateParameters(const std::vector<GraphParameterBlockUpdate> &updates);
     void Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
                   const RecordRaster &raster, const RecordWork &work);

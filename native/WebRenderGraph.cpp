@@ -4,10 +4,12 @@
 #include <function/renderer/RenderGraphSchedule.h>
 #include <function/renderer/MaterialPassPipeline.h>
 #include <function/renderer/SceneDepthResolver.h>
+#include <function/renderer/TextureRegionRenderer.h>
 #include <function/resources/ShaderAsset/SlangCompiler.h>
 #include <function/renderer/rhi/RenderViewContext.h>
 #include <function/renderer/rhi/RhiRenderTexture.h>
 #include <function/renderer/rhi/RhiComputeBuffer.h>
+#include <function/renderer/rhi/CameraViewportTarget.h>
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
@@ -50,6 +52,10 @@ struct WebRenderGraph::Impl
     SceneDepthResolver depthResolver;
     rhi::RenderViewContext view;
     std::optional<GraphPassDesc> cameraClear;
+    rhi::CameraViewportTarget viewport;
+    std::shared_ptr<const rhi::RenderTextureGeneration> cameraTarget;
+    std::unordered_map<uint32_t, std::unique_ptr<TextureRegionRenderer>> regionRenderers;
+    glm::vec4 cameraRect{0, 0, 1, 1};
     size_t cameraClearIndex = SIZE_MAX;
     uint32_t width = 0, height = 0, samples = 0;
 
@@ -113,7 +119,8 @@ struct WebRenderGraph::Impl
                 if (!depthResolver.IsValid())
                     depthResolver.Initialize(depthProgram);
             }
-            texture = Allocate(single, view, source.IsDepth());
+            texture = source.IsViewColor() && cameraTarget ? cameraTarget->color
+                                                           : Allocate(single, view, source.IsDepth());
         }
         return texture;
     }
@@ -317,6 +324,13 @@ struct WebRenderGraph::Impl
         }
         if (resolved.count(graph->outputTexture) && dirty[graph->outputTexture])
             finalResolves.push_back(graph->outputTexture);
+        // The shared camera attachment stays linear, independently of the
+        // display-encoded graph output. A subsequent camera loads this domain.
+        if (cameraTarget)
+            for (const auto &texture : graph->textures)
+                if (texture.IsViewColor() && resolved.count(texture.name) && dirty[texture.name] &&
+                    texture.name != graph->outputTexture)
+                    finalResolves.push_back(texture.name);
     }
 
     void RecordResolves(wgpu::CommandEncoder encoder, const std::vector<std::string> &names)
@@ -338,6 +352,93 @@ struct WebRenderGraph::Impl
             }
         }
     }
+
+    void CopyRegion(wgpu::CommandEncoder encoder, Texture source, Texture destination,
+                      uint32_t sourceX, uint32_t sourceY, uint32_t destinationX, uint32_t destinationY,
+                      uint32_t copyWidth, uint32_t copyHeight, rhi::SampleCount count)
+    {
+        if (source == destination)
+            return;
+        const bool depth = rhi::IsDepthFormat(destination->GetFormat());
+        if (!depth && count == rhi::SampleCount::One && source->GetFormat() == destination->GetFormat()) {
+            rhi::TextureCopyRegion region;
+            region.sourceX = sourceX; region.sourceY = sourceY;
+            region.destinationX = destinationX; region.destinationY = destinationY;
+            region.width = copyWidth; region.height = copyHeight;
+            WebGpuTransferCommandContext context;
+            device.MakeTransferCommandEncoder(context, encoder).CopyTexture(source->GetTexture(), destination->GetTexture(), region);
+            return;
+        }
+        const auto key = (uint32_t(destination->GetFormat()) << 8) | uint32_t(count);
+        auto &renderer = regionRenderers[key];
+        if (!renderer) {
+            const auto program = SlangCompiler::Get().Compile(
+                {"inx_texture_region_" + std::to_string(key), "Infernux/TextureRegion.slang",
+                 TextureRegionRenderer::ShaderSource(depth, count != rhi::SampleCount::One)}, {}, {ShaderCodeTarget::Wgsl});
+            renderer = std::make_unique<TextureRegionRenderer>(device, program.targets[0], destination->GetFormat(), count);
+        }
+        rhi::RasterPassDescription description;
+        description.width = destinationX + copyWidth;
+        description.height = destinationY + copyHeight;
+        if (depth) {
+            description.depth.view = destination->GetView();
+            description.depth.format = destination->GetFormat();
+        } else {
+            description.colorCount = 1;
+            description.colors[0].view = destination->GetView();
+            description.colors[0].format = destination->GetFormat();
+        }
+        WebGpuRasterPass native;
+        device.PrepareRasterPass(description, native);
+        auto pass = encoder.BeginRenderPass(&native.descriptor);
+        pass.SetViewport(destinationX, destinationY, copyWidth, copyHeight, 0, 1);
+        pass.SetScissorRect(destinationX, destinationY, copyWidth, copyHeight);
+        WebGpuGraphicsCommandContext context;
+        renderer->Record(device.MakeGraphicsCommandEncoder(context, pass), std::move(source),
+                         sourceX, sourceY, destinationX, destinationY);
+        pass.End();
+    }
+
+    Texture CameraAttachment(const GraphTextureDesc &description) const
+    {
+        if (!cameraTarget || !description.IsViewAttachment())
+            return {};
+        const auto *attachment = description.IsViewDepth() ? cameraTarget->depth.get()
+                                                          : &cameraTarget->ColorAttachment();
+        return attachment ? Texture(cameraTarget, attachment) : Texture{};
+    }
+
+    void RestoreViewport(wgpu::CommandEncoder encoder)
+    {
+        if (!viewport.IsPartial())
+            return;
+        const auto &destination = *cameraTarget;
+        const auto &source = *viewport.Output();
+        if (!cameraClear || !cameraClear->clearColor)
+            CopyRegion(encoder, Texture(viewport.Output(), &source.ColorAttachment()),
+                       Texture(cameraTarget, &destination.ColorAttachment()), viewport.X(), viewport.Y(), 0, 0,
+                       width, height, destination.description.samples);
+        if ((!cameraClear || !cameraClear->clearDepth) && destination.depth)
+            CopyRegion(encoder, source.depth, destination.depth, viewport.X(), viewport.Y(), 0, 0,
+                       width, height, destination.description.samples);
+    }
+
+    void PublishOutput(wgpu::CommandEncoder encoder, Texture finalColor)
+    {
+        const auto &output = viewport.Output();
+        if (!output)
+            return;
+        CopyRegion(encoder, graph->outputDisplayEncoded ? cameraTarget->color : finalColor, output->color,
+                   0, 0, viewport.X(), viewport.Y(), width, height, rhi::SampleCount::One);
+        if (!viewport.IsPartial())
+            return;
+        if (output->multisampleColor)
+            CopyRegion(encoder, cameraTarget->multisampleColor, output->multisampleColor, 0, 0, viewport.X(), viewport.Y(),
+                       width, height, output->description.samples);
+        if (output->depth)
+            CopyRegion(encoder, cameraTarget->depth, output->depth, 0, 0, viewport.X(), viewport.Y(),
+                       width, height, output->description.samples);
+    }
 };
 
 WebRenderGraph::WebRenderGraph(WebGpuRhiDevice &device, std::shared_ptr<FullscreenRendererHost> host)
@@ -351,6 +452,13 @@ RenderViewAccess WebRenderGraph::GetResourceAccess() const
     const auto &s = *m_impl;
     RenderViewAccess access;
     access.viewId = s.view.id;
+    if (const auto &output = s.viewport.Output()) {
+        access.writes.push_back(output->color.get());
+        if (output->multisampleColor)
+            access.writes.push_back(output->multisampleColor.get());
+        if (output->depth)
+            access.writes.push_back(output->depth.get());
+    }
     for (const auto &texture : s.graph->textures) {
         if (texture.role != GraphTextureRole::Persistent)
             continue;
@@ -373,7 +481,8 @@ RenderViewAccess WebRenderGraph::GetResourceAccess() const
 }
 
 bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, const rhi::RenderViewContext &view,
-                             const ImportTexture &imports, const std::optional<GraphPassDesc> &cameraClear)
+                             const ImportTexture &imports, const std::optional<GraphPassDesc> &cameraClear,
+                             std::shared_ptr<const rhi::RenderTextureGeneration> output, const glm::vec4 &rect)
 {
     auto &s = *m_impl;
     const bool sameClear = s.cameraClear.has_value() == cameraClear.has_value() &&
@@ -382,7 +491,7 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
                          s.cameraClear->clearDepth == cameraClear->clearDepth));
     if (s.graph == graph && s.width == view.width && s.height == view.height && s.view.samples == view.samples &&
         s.view.colorFormat == view.colorFormat && s.view.depthFormat == view.depthFormat &&
-        s.view.revision == view.revision && sameClear) {
+        s.view.revision == view.revision && s.viewport.Output() == output && s.cameraRect == rect && sameClear) {
         if (cameraClear && s.cameraClearIndex != SIZE_MAX) {
             const std::array<float, 4> color{cameraClear->clearColorR, cameraClear->clearColorG,
                                                cameraClear->clearColorB, cameraClear->clearColorA};
@@ -405,6 +514,13 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
     s.samples = uint32_t(view.samples);
     s.view = view;
     s.cameraClear = cameraClear;
+    s.cameraRect = rect;
+    if (output && FindGraphOutputTextureAlias(*s.graph, *output))
+        throw std::invalid_argument("A camera target attachment cannot also be imported as a persistent graph resource");
+    s.viewport.Prepare(s.device, "camera/viewport/" + std::to_string(view.id), std::move(output), rect);
+    s.cameraTarget = s.viewport.IsPartial() ? s.viewport.Work()->Acquire() : s.viewport.Output();
+    for (auto &[key, renderer] : s.regionRenderers)
+        renderer->ClearBindings();
     s.cameraClearIndex = SIZE_MAX;
     s.CompileSchedule();
     s.passes.clear();
@@ -414,7 +530,9 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
     s.finalResolves.clear();
     s.depthResolver.Destroy();
     for (const auto &description : s.graph->textures) {
-        Texture texture = imports ? imports(description) : Texture{};
+        Texture texture = s.CameraAttachment(description);
+        if (!texture && imports)
+            texture = imports(description);
         if (!texture && description.renderTextureGeneration) {
             const auto *attachment = ResolveGraphTextureAttachment(*description.renderTextureGeneration, description.attachment);
             texture = Texture(description.renderTextureGeneration, attachment);
@@ -431,6 +549,10 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
         if (s.graph->passes[index].type == GraphPassType::Raster)
             s.CompileRaster(index, view);
     (void)s.SampledTexture(s.graph->outputTexture, false, view);
+    if (s.cameraTarget)
+        for (const auto &texture : s.graph->textures)
+            if (texture.IsViewColor())
+                (void)s.SampledTexture(texture.name, false, view);
     for (const auto index : s.order) {
         const auto &source = s.graph->passes[index];
         if (source.type != GraphPassType::Raster)
@@ -470,6 +592,7 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
 {
     auto &s = *m_impl;
     s.fullscreen.ResetPool();
+    s.RestoreViewport(encoder);
     for (const auto index : s.order) {
         const auto &source = s.graph->passes[index];
         auto &prepared = s.passes[index];
@@ -512,6 +635,7 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
         }
     }
     s.RecordResolves(encoder, s.finalResolves);
+    s.PublishOutput(encoder, Output());
 }
 
 WebRenderGraph::Texture WebRenderGraph::GetTexture(const std::string &name) const
