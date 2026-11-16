@@ -545,7 +545,7 @@ def _prepare_player_runtime() -> None:
 
     _player_host = PlatformPlayerHost(
         asset_database=_player_asset_database, frame_work=host.frame_work(),
-        compute_host=host.acquire_compute_host(), process_input=_process_screen_ui_events,
+        compute_host=host.acquire_compute_host(), process_input=_process_screen_ui_events, native_services=host,
         initial_world_count=normalize_build_settings(load_build_settings(_runtime_data_root))["player_initial_world_count"])
     session = _player_host.get_player_runtime()
     from infernux.application import Application

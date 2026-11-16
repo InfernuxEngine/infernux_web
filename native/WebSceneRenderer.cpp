@@ -20,6 +20,9 @@
 #include <function/renderer/rhi/RhiBuffer.h>
 #include <function/renderer/rhi/RhiComputeHost.h>
 #include <function/renderer/rhi/RhiRenderTexture.h>
+#include <function/renderer/rhi/RenderTextureRegistry.h>
+#include <function/resources/AssetRegistry/AssetRegistry.h>
+#include <function/scene/SceneManager.h>
 #include <function/resources/InxTexture/InxTexture.h>
 #include <function/resources/ShaderAsset/ShaderLoader.h>
 #include <function/scene/Camera.h>
@@ -80,6 +83,8 @@ struct WebSceneRenderer::Impl
     RenderWorldSnapshot world;
     std::shared_ptr<const RenderWorldFrame> frame;
     std::shared_ptr<const RenderViewData> view;
+    rhi::RenderTextureRegistry renderTextures;
+    uint32_t outputWidth = 1, outputHeight = 1;
     SceneLightCollector lights;
     std::shared_ptr<const lighting::ForwardPlusGridPipeline> gridProgram;
     Buffer dummy;
@@ -550,6 +555,33 @@ bool WebSceneRenderer::Initialize(WebGpuRhiDevice &device)
     s.Upload(s.dummy, zero.data(), sizeof(zero), rhi::BufferUsageFlags::Storage);
     return true;
 }
+void WebSceneRenderer::SetOutputSize(uint32_t width, uint32_t height)
+{
+    auto &s = *m_impl;
+    if (s.outputWidth == width && s.outputHeight == height)
+        return;
+    s.renderTextures.Resize(std::nullopt, width, height);
+    s.outputWidth = width;
+    s.outputHeight = height;
+}
+
+std::shared_ptr<rhi::RenderTexture> WebSceneRenderer::CreateRenderTexture(const rhi::RenderTextureDesc &description)
+{
+    auto &s = *m_impl;
+    return s.renderTextures.Create(*s.device, description, SceneManager::Instance().CurrentWorld().id,
+                                   s.outputWidth, s.outputHeight);
+}
+
+std::shared_ptr<rhi::RenderTexture> WebSceneRenderer::LoadRenderTexture(const std::string &guid)
+{
+    auto description = AssetRegistry::Instance().LoadAsset<rhi::RenderTextureDesc>(guid, ResourceType::RenderTexture);
+    if (!description)
+        throw std::invalid_argument("RenderTexture requires an imported asset GUID: " + guid);
+    auto &s = *m_impl;
+    return s.renderTextures.Load(*s.device, guid, std::move(description), SceneManager::Instance().CurrentWorld().id,
+                                 s.outputWidth, s.outputHeight);
+}
+
 void WebSceneRenderer::StageFrame(const EngineGlobalsUBO &frame)
 {
     auto &s = *m_impl;
@@ -596,6 +628,10 @@ std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, 
 {
     auto &s = *m_impl;
     camera.SetScreenDimensions(width, height);
+    if (camera.GetRenderToTexture() && !camera.GetTargetTexture() && !camera.GetTargetTextureGuid().empty())
+        camera.SetTargetTexture(LoadRenderTexture(camera.GetTargetTextureGuid()));
+    if (camera.WantsMemoryOutput())
+        camera.PrepareMemoryOutput(*s.device);
     (void)s.extractor.ExtractCameraFrame(s.world, &camera);
     const auto frame = s.world.Acquire();
     const auto &view = frame->PrimaryView();

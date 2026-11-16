@@ -4,6 +4,7 @@
 #include "InfernuxWebHostModule.h"
 #include "WebParticleRuntime.h"
 #include "WebScreenUIRenderer.h"
+#include "WebSceneRenderer.h"
 
 #include <core/threading/FrameWorkOwner.h>
 #include <function/renderer/gui/InxTextLayout.h>
@@ -30,6 +31,7 @@
 #include <function/resources/InxTexture/InxTexture.h>
 #include <function/resources/InxTexture/TextureLoader.h>
 #include <function/resources/PhysicMaterial/PhysicMaterialLoader.h>
+#include <function/resources/RenderTexture/RenderTextureLoader.h>
 #include <function/resources/ShaderAsset/ShaderLoader.h>
 #include <function/scene/SceneManager.h>
 #include <pybind11/pybind11.h>
@@ -53,11 +55,34 @@ namespace
 
 infernux::web::WebParticleRuntime *g_particleRuntime = nullptr;
 infernux::web::WebScreenUIRenderer *g_screenUIRenderer = nullptr;
+infernux::web::WebSceneRenderer *g_sceneRenderer = nullptr;
 infernux::rhi::ComputeHost *g_computeHost = nullptr;
 infernux::FrameWorkOwner *g_frameWork = nullptr;
 bool g_textInputActive = false;
 
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+PyObject *CreateRenderTexture(PyObject *, PyObject *description)
+{
+    try {
+        return pybind11::cast(g_sceneRenderer->CreateRenderTexture(
+            pybind11::cast<const infernux::rhi::RenderTextureDesc &>(pybind11::handle(description)))).release().ptr();
+    } catch (const std::exception &error) {
+        PyErr_SetString(PyExc_RuntimeError, error.what());
+        return nullptr;
+    }
+}
+
+PyObject *LoadRenderTexture(PyObject *, PyObject *guid)
+{
+    try {
+        return pybind11::cast(g_sceneRenderer->LoadRenderTexture(
+            pybind11::cast<std::string>(pybind11::handle(guid)))).release().ptr();
+    } catch (const std::exception &error) {
+        PyErr_SetString(PyExc_RuntimeError, error.what());
+        return nullptr;
+    }
+}
+
 PyObject *AcquireComputeHost(PyObject *, PyObject *)
 {
     try {
@@ -163,6 +188,7 @@ PyObject *InitializeRuntimeAssets(PyObject *, PyObject *arguments)
         registry.RegisterLoader(infernux::ResourceType::PhysicMaterial,
                                 std::make_unique<infernux::PhysicMaterialLoader>());
         registry.RegisterLoader(infernux::ResourceType::Texture, std::make_unique<infernux::TextureLoader>());
+        registry.RegisterLoader(infernux::ResourceType::RenderTexture, std::make_unique<infernux::RenderTextureLoader>());
         registry.RegisterLoader(infernux::ResourceType::Mesh, std::make_unique<infernux::MeshLoader>());
         registry.RegisterLoader(infernux::ResourceType::Audio, std::make_unique<infernux::AudioClipLoader>());
         registry.RegisterLoader(infernux::ResourceType::Script, std::make_unique<infernux::InxPythonScriptLoader>());
@@ -810,6 +836,8 @@ PyObject *ScreenUIReleaseTexture(PyObject *, PyObject *arguments)
 
 PyMethodDef kMethods[] = {
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+    {"_create_render_texture", CreateRenderTexture, METH_O, "Create a target through the shared RHI registry."},
+    {"_load_render_texture", LoadRenderTexture, METH_O, "Acquire the shared imported target owner."},
     {"acquire_compute_host", AcquireComputeHost, METH_NOARGS, "Borrow the renderer's WebGPU compute services."},
     {"frame_work", GetFrameWork, METH_NOARGS, "Borrow the browser frame's native work owner."},
 #endif
@@ -875,6 +903,11 @@ void InfernuxWebSetParticleRuntime(infernux::web::WebParticleRuntime *runtime) n
 void InfernuxWebSetScreenUIRenderer(infernux::web::WebScreenUIRenderer *renderer) noexcept
 {
     g_screenUIRenderer = renderer;
+}
+
+void InfernuxWebSetSceneRenderer(infernux::web::WebSceneRenderer *renderer) noexcept
+{
+    g_sceneRenderer = renderer;
 }
 
 void InfernuxWebSetComputeHost(infernux::rhi::ComputeHost *host) noexcept

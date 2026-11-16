@@ -824,6 +824,7 @@ void Frame()
     const auto shaderFrame = infernux::BuildEngineFrameGlobals(g_shaderTimeSeconds, float(deltaSeconds),
                                                                float(deltaSeconds), g_shaderFrameIndex++);
     g_screenUIRenderer.StageFrame(shaderFrame, g_width, g_height);
+    g_sceneRenderer.SetOutputSize(g_width, g_height);
     g_sceneRenderer.StageFrame(shaderFrame);
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
     auto &registry = infernux::AssetRegistry::Instance();
@@ -1110,6 +1111,8 @@ void StartSurface()
         InfernuxWebAbortStartup("Scene rendering initialization failed");
         return;
     }
+    g_sceneRenderer.SetOutputSize(g_width, g_height);
+    InfernuxWebSetSceneRenderer(&g_sceneRenderer);
     if (!g_screenUIRenderer.Initialize(*g_rhi, g_sceneRenderer)) {
         std::fprintf(stderr, "INFERNUX_WEB_SCREEN_UI_INITIALIZATION_FAILED\n");
         InfernuxWebAbortStartup("Screen UI initialization failed");

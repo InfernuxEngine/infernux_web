@@ -5,6 +5,7 @@
 #include <function/renderer/MaterialPassPipeline.h>
 #include <function/renderer/FullscreenRenderer.h>
 #include <function/renderer/rhi/RhiDescriptors.h>
+#include <function/renderer/rhi/RhiRenderTexture.h>
 #include <function/resources/InxMaterial/MaterialProperty.h>
 #include <memory>
 #include <string>
@@ -27,6 +28,9 @@ class WebSceneRenderer final
     WebSceneRenderer();
     ~WebSceneRenderer();
     bool Initialize(WebGpuRhiDevice &device);
+    void SetOutputSize(uint32_t width, uint32_t height);
+    std::shared_ptr<rhi::RenderTexture> CreateRenderTexture(const rhi::RenderTextureDesc &description);
+    std::shared_ptr<rhi::RenderTexture> LoadRenderTexture(const std::string &guid);
     struct SampledTexture
     {
         wgpu::TextureView view;
