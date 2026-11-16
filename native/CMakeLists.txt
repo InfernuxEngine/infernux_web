@@ -213,6 +213,8 @@ add_executable(InfernuxWebPlayerHost
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/TextureUploadBuilder.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/RenderPoseBuffer.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/shader/DeviceShaderProgram.cpp"
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/SceneMaterialPass.cpp"
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/RenderGraphSchedule.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/rhi/RhiComputeBuffer.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/rhi/RhiComputeKernel.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/rhi/RhiRenderTexture.cpp"

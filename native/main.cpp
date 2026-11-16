@@ -900,6 +900,8 @@ void Frame()
     const auto shaderFrame = infernux::BuildEngineFrameGlobals(g_shaderTimeSeconds, float(deltaSeconds),
                                                                float(deltaSeconds), g_shaderFrameIndex++);
     g_screenUIRenderer.StageFrame(shaderFrame, g_width, g_height);
+    g_sceneRenderer.StageFrame(shaderFrame);
+    g_postProcessRenderer.StageFrame(shaderFrame);
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
     auto &registry = infernux::AssetRegistry::Instance();
     if (registry.IsInitialized())
@@ -956,7 +958,7 @@ void Frame()
     bool foregroundSubmitted = false;
     if (surfaceTexture.texture) {
         wgpu::TextureView view = surfaceTexture.texture.CreateView();
-        wgpu::RenderPassColorAttachment colorAttachment;
+        wgpu::RenderPassColorAttachment colorAttachment{};
         colorAttachment.view = g_postProcessRenderer.SceneColorAttachmentView();
         if (g_postProcessRenderer.SceneSampleCount() > 1)
             colorAttachment.resolveTarget = g_postProcessRenderer.SceneColorView();
@@ -964,10 +966,10 @@ void Frame()
         colorAttachment.storeOp =
             g_postProcessRenderer.SceneSampleCount() > 1 ? wgpu::StoreOp::Discard : wgpu::StoreOp::Store;
         colorAttachment.clearValue = {0.0, 0.0, 0.0, 1.0};
-        wgpu::RenderPassDescriptor passDescriptor;
+        wgpu::RenderPassDescriptor passDescriptor{};
         passDescriptor.colorAttachmentCount = 1;
         passDescriptor.colorAttachments = &colorAttachment;
-        wgpu::RenderPassDepthStencilAttachment depthAttachment;
+        wgpu::RenderPassDepthStencilAttachment depthAttachment{};
         g_sceneRenderer.Resize(g_width, g_height);
         if (g_sceneRenderer.HasDepthTarget()) {
             depthAttachment.view = g_sceneRenderer.GetDepthView();
@@ -983,6 +985,7 @@ void Frame()
             return;
         }
         bool dithering = false;
+        bool stopNaNs = false;
         bool scenePrepared = false;
         bool renderedScene = false;
         if (g_sceneRenderer.HasDepthTarget())
@@ -996,6 +999,7 @@ void Frame()
         for (size_t index = 0; !g_splashActive && !g_webGpuValidationFailed && index < cameras.size(); ++index) {
             auto *camera = cameras[index];
             dithering = camera->GetDithering();
+            stopNaNs = camera->GetStopNaNs();
             if (!g_sceneRenderer.Prepare(encoder, g_width, g_height, camera)) {
                 InfernuxWebAbortStartup("Camera frame could not be prepared");
                 return;
@@ -1011,8 +1015,8 @@ void Frame()
             auto pass = encoder.BeginRenderPass(&passDescriptor);
             renderedScene = g_sceneRenderer.RenderPrepared(pass) || renderedScene;
             scenePrepared = true;
-            wgpu::RenderPassDepthStencilAttachment particleDepth;
-            wgpu::RenderPassDescriptor particlePass;
+            wgpu::RenderPassDepthStencilAttachment particleDepth{};
+            wgpu::RenderPassDescriptor particlePass{};
             if (g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics &&
                 g_particleRuntime.HasRenderWork(camera->GetCullingMask())) {
                 pass.End();
@@ -1046,22 +1050,22 @@ void Frame()
             auto pass = encoder.BeginRenderPass(&passDescriptor);
             pass.End();
         }
-        if (!g_splashActive && !g_webGpuValidationFailed && !g_postProcessRenderer.PrepareBloom(encoder)) {
+        if (!g_splashActive && !g_webGpuValidationFailed && !g_postProcessRenderer.Prepare(encoder)) {
             std::fprintf(stderr, "INFERNUX_WEB_BLOOM_RECORDING_FAILED\n");
             g_webGpuValidationFailed = true;
         }
 
-        wgpu::RenderPassColorAttachment presentAttachment;
+        wgpu::RenderPassColorAttachment presentAttachment{};
         presentAttachment.view = view;
         presentAttachment.loadOp = wgpu::LoadOp::Clear;
         presentAttachment.storeOp = wgpu::StoreOp::Store;
         presentAttachment.clearValue = {0.0, 0.0, 0.0, 1.0};
-        wgpu::RenderPassDescriptor presentDescriptor;
+        wgpu::RenderPassDescriptor presentDescriptor{};
         presentDescriptor.colorAttachmentCount = 1;
         presentDescriptor.colorAttachments = &presentAttachment;
         wgpu::RenderPassEncoder presentPass = encoder.BeginRenderPass(&presentDescriptor);
         if (!g_splashActive && !g_webGpuValidationFailed)
-            (void)g_postProcessRenderer.Render(presentPass, dithering);
+            (void)g_postProcessRenderer.Render(presentPass, dithering, stopNaNs);
         // Keep the authored splash visible while it is active.  Once the
         // splash has handed off to gameplay, do not expose the persistent
         // screen UI until a complete scene frame has been prepared and
@@ -1152,14 +1156,14 @@ void StartSurface()
     }
     Py_DECREF(renderSettings);
 
-    if (!g_postProcessRenderer.Initialize(g_device, g_surfaceFormat, sceneSampleCount) ||
+    if (!g_postProcessRenderer.Initialize(*g_rhi, g_surfaceFormat, sceneSampleCount) ||
         !g_postProcessRenderer.Configure(postProcessSettings)) {
         std::fprintf(stderr, "INFERNUX_WEB_POST_PROCESS_INITIALIZATION_FAILED\n");
         InfernuxWebAbortStartup("Post-processing initialization failed");
         return;
     }
     const auto sceneColorFormat = g_postProcessRenderer.SceneColorFormat();
-    if (!g_sceneRenderer.Initialize(*g_rhi, sceneColorFormat, sceneSampleCount)) {
+    if (!g_sceneRenderer.Initialize(*g_rhi, infernux::rhi::PixelFormat::RGBA16SFloat, sceneSampleCount)) {
         std::fprintf(stderr, "INFERNUX_WEBGPU_SCENE_PIPELINE_FAILED\n");
         InfernuxWebAbortStartup("Scene rendering initialization failed");
         return;
@@ -1239,7 +1243,12 @@ void StartSurface()
 
 extern "C" EMSCRIPTEN_KEEPALIVE void infernux_web_start()
 {
-    StartSurface();
+    try {
+        StartSurface();
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "INFERNUX_WEB_STARTUP_FAILED %s\n", error.what());
+        InfernuxWebAbortStartup(error.what());
+    }
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void infernux_web_frame()

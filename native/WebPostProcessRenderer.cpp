@@ -1,581 +1,452 @@
 #include "WebPostProcessRenderer.h"
+#include "WebGpuRhiDevice.h"
+
+#include <function/renderer/EngineGlobals.h>
+#include <function/renderer/FullscreenRenderer.h>
+#include <function/renderer/RenderGraphSchedule.h>
+#include <function/renderer/rhi/RhiRenderTexture.h>
+#include <function/resources/ShaderAsset/FullscreenProgramAsset.h>
 
 #include <algorithm>
-#include <array>
-#include <cmath>
 #include <cstdio>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace infernux::web
 {
 namespace
 {
-constexpr auto kHdrFormat = wgpu::TextureFormat::RGBA16Float;
-
-constexpr char kDownsampleShader[] = R"wgsl(
-struct Parameters {
-    inverse_resolution: vec2<f32>,
-    bloom_threshold: f32,
-    knee: f32,
-    clamp_max: f32,
-    prefilter: f32,
-    padding: vec2<f32>,
+constexpr auto HdrFormat = rhi::PixelFormat::RGBA16SFloat;
+enum class Effect
+{
+    Prefilter,
+    Downsample,
+    Upsample,
+    Composite,
+    ToneMapping,
+    Display
 };
-@group(0) @binding(0) var source_sampler: sampler;
-@group(0) @binding(1) var source_texture: texture_2d<f32>;
-@group(0) @binding(2) var<uniform> parameters: Parameters;
-struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
-@vertex fn vertex_main(@builtin(vertex_index) index: u32) -> VertexOutput {
-    let positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
-    var output: VertexOutput;
-    output.position = vec4<f32>(positions[index], 0.0, 1.0);
-    output.uv = positions[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
-    return output;
-}
-fn sample_source(uv: vec2<f32>) -> vec3<f32> {
-    return textureSampleLevel(source_texture, source_sampler, uv, 0.0).rgb;
-}
-fn downsample_13(uv: vec2<f32>) -> vec3<f32> {
-    let t = parameters.inverse_resolution;
-    let a = sample_source(uv + t * vec2<f32>(-1.0, -1.0));
-    let b = sample_source(uv + t * vec2<f32>( 0.0, -1.0));
-    let c = sample_source(uv + t * vec2<f32>( 1.0, -1.0));
-    let d = sample_source(uv + t * vec2<f32>(-1.0,  0.0));
-    let e = sample_source(uv);
-    let f = sample_source(uv + t * vec2<f32>( 1.0,  0.0));
-    let g = sample_source(uv + t * vec2<f32>(-1.0,  1.0));
-    let h = sample_source(uv + t * vec2<f32>( 0.0,  1.0));
-    let i = sample_source(uv + t * vec2<f32>( 1.0,  1.0));
-    let j = sample_source(uv + t * vec2<f32>(-0.5, -0.5));
-    let k = sample_source(uv + t * vec2<f32>( 0.5, -0.5));
-    let l = sample_source(uv + t * vec2<f32>(-0.5,  0.5));
-    let m = sample_source(uv + t * vec2<f32>( 0.5,  0.5));
-    return e * 0.125 + (a + c + g + i) * 0.03125 +
-           (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
-}
-fn quadratic_threshold(color: vec3<f32>) -> vec3<f32> {
-    let brightness = max(max(color.r, color.g), color.b);
-    let soft_knee = parameters.bloom_threshold * parameters.knee;
-    var rq = clamp(brightness - parameters.bloom_threshold + soft_knee, 0.0, 2.0 * soft_knee);
-    rq = rq * rq / (4.0 * soft_knee + 0.00001);
-    let contribution = max(rq, brightness - parameters.bloom_threshold) / max(brightness, 0.00001);
-    return color * max(contribution, 0.0);
-}
-@fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    var color = select(downsample_13(input.uv), sample_source(input.uv), parameters.prefilter > 0.5);
-    if (parameters.prefilter > 0.5) {
-        color = quadratic_threshold(min(color, vec3<f32>(parameters.clamp_max)));
+constexpr const char *ShaderIds[] = {"infernux/post/bloom_prefilter", "infernux/post/bloom_downsample",
+                                     "infernux/post/bloom_upsample",  "infernux/post/bloom_composite",
+                                     "infernux/post/tonemapping",     "infernux/internal/display_encode"};
+
+rhi::PixelFormat SurfaceFormat(wgpu::TextureFormat format)
+{
+    switch (format) {
+    case wgpu::TextureFormat::RGBA8Unorm:
+        return rhi::PixelFormat::RGBA8UNorm;
+    case wgpu::TextureFormat::RGBA8UnormSrgb:
+        return rhi::PixelFormat::RGBA8Srgb;
+    case wgpu::TextureFormat::BGRA8Unorm:
+        return rhi::PixelFormat::BGRA8UNorm;
+    case wgpu::TextureFormat::BGRA8UnormSrgb:
+        return rhi::PixelFormat::BGRA8Srgb;
+    default:
+        throw std::invalid_argument("Unsupported Web display attachment format");
     }
-    return vec4<f32>(color, 1.0);
 }
-)wgsl";
 
-constexpr char kUpsampleShader[] = R"wgsl(
-struct Parameters { inverse_resolution: vec2<f32>, scatter: f32, padding: f32, };
-@group(0) @binding(0) var source_sampler: sampler;
-@group(0) @binding(1) var source_texture: texture_2d<f32>;
-@group(0) @binding(2) var higher_texture: texture_2d<f32>;
-@group(0) @binding(3) var<uniform> parameters: Parameters;
-struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
-@vertex fn vertex_main(@builtin(vertex_index) index: u32) -> VertexOutput {
-    let positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
-    var output: VertexOutput;
-    output.position = vec4<f32>(positions[index], 0.0, 1.0);
-    output.uv = positions[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
-    return output;
-}
-fn source(uv: vec2<f32>) -> vec3<f32> { return textureSampleLevel(source_texture, source_sampler, uv, 0.0).rgb; }
-@fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let t = parameters.inverse_resolution;
-    var low = source(input.uv + vec2<f32>(-t.x, -t.y));
-    low += source(input.uv + vec2<f32>(0.0, -t.y)) * 2.0;
-    low += source(input.uv + vec2<f32>(t.x, -t.y));
-    low += source(input.uv + vec2<f32>(-t.x, 0.0)) * 2.0;
-    low += source(input.uv) * 4.0;
-    low += source(input.uv + vec2<f32>(t.x, 0.0)) * 2.0;
-    low += source(input.uv + vec2<f32>(-t.x, t.y));
-    low += source(input.uv + vec2<f32>(0.0, t.y)) * 2.0;
-    low += source(input.uv + vec2<f32>(t.x, t.y));
-    low /= 16.0;
-    let high = textureSampleLevel(higher_texture, source_sampler, input.uv, 0.0).rgb;
-    return vec4<f32>(mix(high, low, parameters.scatter), 1.0);
-}
-)wgsl";
+class WebFullscreenHost final : public FullscreenRendererHost
+{
+  public:
+    explicit WebFullscreenHost(WebGpuRhiDevice &device) : m_device(device)
+    {
+    }
+    rhi::Device &GetRhiDevice() noexcept override
+    {
+        return m_device;
+    }
+    uint32_t GetFrameCount() const noexcept override
+    {
+        return 1;
+    }
+    uint32_t GetCurrentFrame() const noexcept override
+    {
+        return 0;
+    }
+    rhi::BindingLayoutHandle GetPerViewLayout() const noexcept override
+    {
+        return {};
+    }
+    std::shared_ptr<const FullscreenProgram> AcquireProgram(const std::string &name) override
+    {
+        return LoadFullscreenProgram(name, ShaderCodeTarget::Wgsl);
+    }
 
-constexpr char kResolveShader[] = R"wgsl(
-struct Parameters {
-    bloom_intensity: f32,
-    exposure: f32,
-    encode_srgb: f32,
-    tonemapping_mode: f32,
-    bloom_tint: vec3<f32>,
-    dithering: f32,
+  private:
+    WebGpuRhiDevice &m_device;
 };
-@group(0) @binding(0) var source_sampler: sampler;
-@group(0) @binding(1) var scene_color: texture_2d<f32>;
-@group(0) @binding(2) var bloom_color: texture_2d<f32>;
-@group(0) @binding(3) var<uniform> parameters: Parameters;
-struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };
-@vertex fn vertex_main(@builtin(vertex_index) index: u32) -> VertexOutput {
-    let positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
-    var output: VertexOutput;
-    output.position = vec4<f32>(positions[index], 0.0, 1.0);
-    output.uv = positions[index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
-    return output;
-}
-fn aces_film(color: vec3<f32>) -> vec3<f32> {
-    let input_matrix = mat3x3<f32>(
-        vec3<f32>(0.59719, 0.07600, 0.02840), vec3<f32>(0.35458, 0.90834, 0.13383),
-        vec3<f32>(0.04823, 0.01566, 0.83777));
-    let output_matrix = mat3x3<f32>(
-        vec3<f32>(1.60475, -0.10208, -0.00327), vec3<f32>(-0.53108, 1.10813, -0.07276),
-        vec3<f32>(-0.07367, -0.00605, 1.07602));
-    var value = input_matrix * color;
-    let numerator = value * (value + vec3<f32>(0.0245786)) - vec3<f32>(0.000090537);
-    let denominator = value * (0.983729 * value + vec3<f32>(0.4329510)) + vec3<f32>(0.238081);
-    value = numerator / max(denominator, vec3<f32>(0.000001));
-    return clamp(output_matrix * value, vec3<f32>(0.0), vec3<f32>(1.0));
-}
-fn linear_to_srgb_channel(value: f32) -> f32 {
-    return select(1.055 * pow(max(value, 0.0), 1.0 / 2.4) - 0.055, value * 12.92, value <= 0.0031308);
-}
-fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(linear_to_srgb_channel(color.r), linear_to_srgb_channel(color.g), linear_to_srgb_channel(color.b));
-}
-fn srgb_to_linear_channel(value: f32) -> f32 {
-    return select(pow((value + 0.055) / 1.055, 2.4), value / 12.92, value <= 0.04045);
-}
-fn gradient_noise(pixel: vec2<f32>) -> f32 {
-    return fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
-}
-fn triangular_dither(pixel: vec2<f32>, offset: vec2<f32>) -> f32 {
-    return gradient_noise(pixel + offset) - gradient_noise(pixel.yx + offset.yx + vec2<f32>(37.0, 17.0));
-}
-@fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let scene = textureSampleLevel(scene_color, source_sampler, input.uv, 0.0).rgb;
-    let bloom = textureSampleLevel(bloom_color, source_sampler, input.uv, 0.0).rgb;
-    var color = (scene + bloom * parameters.bloom_tint * parameters.bloom_intensity) * parameters.exposure;
-    let mode = u32(parameters.tonemapping_mode + 0.5);
-    if (mode == 1u) { color = color / (color + vec3<f32>(1.0)); }
-    if (mode == 2u) { color = aces_film(color); }
-    if (mode == 0u) { color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)); }
-    if (parameters.dithering > 0.5) {
-        // Quantize in display space, including when the surface encodes sRGB in hardware.
-        let pixel = floor(input.position.xy);
-        let noise = vec3<f32>(triangular_dither(pixel, vec2<f32>(0.0, 0.0)),
-                              triangular_dither(pixel, vec2<f32>(19.0, 47.0)),
-                              triangular_dither(pixel, vec2<f32>(73.0, 11.0)));
-        let encoded = clamp(linear_to_srgb(color) + noise / 255.0, vec3<f32>(0.0), vec3<f32>(1.0));
-        if (parameters.encode_srgb > 0.5) { color = encoded; }
-        else { color = vec3<f32>(srgb_to_linear_channel(encoded.r), srgb_to_linear_channel(encoded.g),
-                                 srgb_to_linear_channel(encoded.b)); }
-    } else if (parameters.encode_srgb > 0.5) { color = linear_to_srgb(color); }
-    return vec4<f32>(color, 1.0);
-}
-)wgsl";
-
-bool IsSrgb(wgpu::TextureFormat format)
-{
-    return format == wgpu::TextureFormat::RGBA8UnormSrgb || format == wgpu::TextureFormat::BGRA8UnormSrgb;
-}
-
-wgpu::ShaderModule Shader(wgpu::Device device, const char *source)
-{
-    wgpu::ShaderSourceWGSL wgsl;
-    wgsl.code = source;
-    wgpu::ShaderModuleDescriptor descriptor;
-    descriptor.nextInChain = &wgsl;
-    return device.CreateShaderModule(&descriptor);
-}
-
-wgpu::RenderPipeline Pipeline(wgpu::Device device, wgpu::BindGroupLayout layout, wgpu::ShaderModule shader,
-                              wgpu::TextureFormat format)
-{
-    wgpu::ColorTargetState target;
-    target.format = format;
-    wgpu::FragmentState fragment;
-    fragment.module = shader;
-    fragment.entryPoint = "fragment_main";
-    fragment.targetCount = 1;
-    fragment.targets = &target;
-    wgpu::PipelineLayoutDescriptor pipelineLayout;
-    pipelineLayout.bindGroupLayoutCount = 1;
-    pipelineLayout.bindGroupLayouts = &layout;
-    wgpu::RenderPipelineDescriptor descriptor;
-    descriptor.layout = device.CreatePipelineLayout(&pipelineLayout);
-    descriptor.vertex.module = shader;
-    descriptor.vertex.entryPoint = "vertex_main";
-    descriptor.fragment = &fragment;
-    descriptor.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    descriptor.primitive.cullMode = wgpu::CullMode::None;
-    return device.CreateRenderPipeline(&descriptor);
-}
-
-wgpu::Buffer UniformBuffer(wgpu::Device device, uint64_t bytes)
-{
-    wgpu::BufferDescriptor descriptor;
-    descriptor.size = bytes;
-    descriptor.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
-    return device.CreateBuffer(&descriptor);
-}
 } // namespace
 
-bool WebPostProcessRenderer::Initialize(wgpu::Device device, wgpu::TextureFormat surfaceFormat,
+struct WebPostProcessRenderer::Impl
+{
+    using Texture = std::shared_ptr<const rhi::RenderTextureGeneration>;
+    using Parameters = std::vector<std::pair<std::string, ShaderParameterValue>>;
+    using Inputs = std::vector<std::pair<std::string, Texture>>;
+    struct Pass
+    {
+        Effect effect;
+        FullscreenPipelineEntry pipeline;
+        FullscreenParameters parameters;
+        std::vector<FullscreenResourceInput> inputs;
+        std::vector<Texture> sources;
+        Texture target;
+    };
+
+    explicit Impl(WebGpuRhiDevice &rhi, rhi::PixelFormat format, uint32_t samples)
+        : device(rhi), surfaceFormat(format), sceneSamples(samples)
+    {
+        renderer.Initialize(std::make_shared<WebFullscreenHost>(device));
+        rhi::BufferDesc description;
+        description.byteSize = sizeof(EngineGlobalsUBO);
+        description.usage = rhi::BufferUsageFlags::Uniform;
+        description.memory = rhi::BufferMemory::Upload;
+        globals = device.CreateBuffer(description);
+        if (!globals.IsValid())
+            throw std::runtime_error("Web view globals allocation failed");
+    }
+    ~Impl()
+    {
+        renderer.Destroy();
+        device.Release(globals);
+    }
+
+    WebGpuRhiDevice &device;
+    rhi::PixelFormat surfaceFormat;
+    uint32_t sceneSamples;
+    uint32_t width = 0, height = 0;
+    Settings settings;
+    EngineGlobalsUBO frameGlobals;
+    bool diagnosticBloom = true;
+    bool reportedReady = false;
+    FullscreenRenderer renderer;
+    rhi::BufferHandle globals;
+    std::unique_ptr<rhi::RenderTexture> scene;
+    std::vector<std::unique_ptr<rhi::RenderTexture>> targets;
+    std::vector<Pass> passes;
+    std::vector<uint32_t> executionOrder;
+    Pass display;
+
+    bool BloomEnabled() const noexcept
+    {
+        return settings.bloomEnabled && diagnosticBloom;
+    }
+
+    Texture Target(const std::string &name, uint32_t targetWidth, uint32_t targetHeight)
+    {
+        rhi::RenderTextureDesc description;
+        description.width = targetWidth;
+        description.height = targetHeight;
+        description.colorFormat = HdrFormat;
+        auto target = std::make_unique<rhi::RenderTexture>(device, name, description);
+        auto generation = target->Acquire();
+        targets.push_back(std::move(target));
+        return generation;
+    }
+
+    Pass Program(Effect effect, Texture target, const Inputs &inputs, const Parameters &parameters = {})
+    {
+        const std::string id = ShaderIds[static_cast<size_t>(effect)];
+        const auto program = renderer.AcquireProgram(id);
+        if (!program)
+            throw std::runtime_error("Fullscreen shader asset is unavailable: " + id);
+        FullscreenPipelineKey key;
+        key.shaderName = id;
+        key.program = program;
+        key.colorFormat = target ? HdrFormat : surfaceFormat;
+        key.useDynamicRendering = true;
+        key.depth.testEnabled = false;
+        key.depth.writeEnabled = false;
+        Pass pass;
+        pass.effect = effect;
+        pass.pipeline = renderer.EnsurePipeline(key);
+        pass.parameters = FullscreenRenderer::PrepareParameters(*program, parameters);
+        pass.target = std::move(target);
+        for (const auto &name : pass.pipeline.inputNames) {
+            const auto found =
+                std::find_if(inputs.begin(), inputs.end(), [&](const auto &input) { return input.first == name; });
+            if (found == inputs.end())
+                throw std::logic_error("Fullscreen input is not connected: " + id + '/' + name);
+            const auto &texture = *found->second->color;
+            FullscreenResourceInput input;
+            input.view = texture.GetView();
+            input.format = texture.GetFormat();
+            input.sampler = texture.GetSampler();
+            pass.inputs.push_back(input);
+            pass.sources.push_back(found->second);
+        }
+        return pass;
+    }
+
+    void Rebuild()
+    {
+        // Output/settings changes replace the attachment plan, while the
+        // shared renderer retains programs and graphics pipelines.
+        passes.clear();
+        display = {};
+        targets.clear();
+        rhi::RenderTextureDesc description;
+        description.width = width;
+        description.height = height;
+        description.colorFormat = HdrFormat;
+        description.samples = static_cast<rhi::SampleCount>(sceneSamples);
+        if (scene)
+            scene->Reconfigure(description);
+        else
+            scene = std::make_unique<rhi::RenderTexture>(device, "web/scene", description);
+        auto color = scene->Acquire();
+
+        if (BloomEnabled()) {
+            std::vector<Texture> levels;
+            levels.reserve(settings.bloomIterations);
+            for (uint32_t index = 0; index < settings.bloomIterations; ++index) {
+                auto level = Target("web/bloom/down/" + std::to_string(index), std::max(1u, width >> (index + 1u)),
+                                    std::max(1u, height >> (index + 1u)));
+                if (index == 0)
+                    passes.push_back(Program(
+                        Effect::Prefilter, level, {{"source_tex", color}},
+                        {{"threshold", settings.bloomThreshold}, {"knee", 0.5f}, {"clamp_max", settings.bloomClamp}}));
+                else
+                    passes.push_back(Program(Effect::Downsample, level, {{"source_tex", levels.back()}}));
+                levels.push_back(std::move(level));
+            }
+            auto bloom = levels.back();
+            for (size_t index = levels.size() - 1; index > 0; --index) {
+                const auto &high = levels[index - 1];
+                auto level = Target("web/bloom/up/" + std::to_string(index - 1), high->width, high->height);
+                passes.push_back(Program(Effect::Upsample, level, {{"source_tex", bloom}, {"destination_tex", high}},
+                                         {{"scatter", settings.bloomScatter}}));
+                bloom = std::move(level);
+            }
+            auto composite = Target("web/bloom/composite", width, height);
+            const auto &tint = settings.bloomTint;
+            passes.push_back(Program(Effect::Composite, composite, {{"bloom_tex", bloom}, {"scene_color", color}},
+                                     {{"intensity", settings.bloomIntensity},
+                                      {"tint", std::array<float, 4>{tint[0], tint[1], tint[2], 1.0f}}}));
+            color = std::move(composite);
+        }
+        if (settings.toneMappingMode != 0 || settings.exposure != 1.0f) {
+            auto mapped = Target("web/tonemapping", width, height);
+            passes.push_back(
+                Program(Effect::ToneMapping, mapped, {{"source_tex", color}},
+                        {{"mode", static_cast<int32_t>(settings.toneMappingMode)}, {"exposure", settings.exposure}}));
+            color = std::move(mapped);
+        }
+        display = Program(Effect::Display, {}, {{"source_tex", color}},
+                          {{"target_is_srgb", rhi::IsSrgbFormat(surfaceFormat)}});
+        CompileSchedule();
+    }
+
+    void CompileSchedule()
+    {
+        RenderGraphIdentitySource identity;
+        std::unordered_map<const rhi::RenderTextureGeneration *, GraphResourceHandle> resources;
+        const auto resource = [&](const Texture &texture) {
+            return resources
+                .try_emplace(texture.get(),
+                             GraphResourceHandle{identity.Current(), static_cast<uint32_t>(resources.size()), 1})
+                .first->second;
+        };
+        std::vector<GraphSchedulePass> declarations(passes.size() + 1);
+        for (size_t index = 0; index < declarations.size(); ++index) {
+            const auto &pass = index == passes.size() ? display : passes[index];
+            auto &declaration = declarations[index];
+            for (const auto &source : pass.sources)
+                declaration.reads.push_back({resource(source)});
+            declaration.writes.push_back(resource(pass.target));
+        }
+        auto schedule = CompileRenderGraphSchedule(declarations, resource(display.target));
+        if (!schedule.unresolved.empty())
+            throw std::logic_error("Fullscreen graph contains a dependency cycle");
+        executionOrder = std::move(schedule.order);
+        // The display pass is encoded into the host's acquired surface below.
+        executionOrder.pop_back();
+    }
+
+    void UpdateParameters()
+    {
+        // Parameter animation changes only prepared bytes, without rebuilding
+        // targets, reparsing schemas or compiling shaders/pipelines.
+        for (auto &pass : passes) {
+            auto &parameters = pass.parameters;
+            auto &values = parameters.values;
+            switch (pass.effect) {
+            case Effect::Prefilter:
+                values[0] = settings.bloomThreshold;
+                values[2] = settings.bloomClamp;
+                break;
+            case Effect::Upsample:
+                values[0] = settings.bloomScatter;
+                break;
+            case Effect::Composite: {
+                const auto &tint = settings.bloomTint;
+                values[0] = settings.bloomIntensity;
+                values[1] = std::array<float, 4>{tint[0], tint[1], tint[2], 1.0f};
+                break;
+            }
+            case Effect::ToneMapping:
+                values[0] = static_cast<int32_t>(settings.toneMappingMode);
+                values[1] = settings.exposure;
+                break;
+            case Effect::Downsample:
+            case Effect::Display:
+                break;
+            }
+            for (size_t index = 0; index < values.size(); ++index)
+                parameters.copies[index].Write(parameters.defaults.data(), values[index].Data());
+        }
+    }
+
+    void Draw(wgpu::RenderPassEncoder pass, const Pass &prepared)
+    {
+        WebGpuGraphicsCommandContext context;
+        auto commands = device.MakeGraphicsCommandEncoder(context, std::move(pass));
+        FullscreenViewResources view;
+        view.globals = {0, rhi::BindingType::UniformBuffer, globals, 0, sizeof(EngineGlobalsUBO)};
+        renderer.DrawProgram(commands, prepared.pipeline, prepared.inputs.data(), prepared.parameters, nullptr, view);
+    }
+};
+
+WebPostProcessRenderer::WebPostProcessRenderer() = default;
+WebPostProcessRenderer::~WebPostProcessRenderer() = default;
+
+bool WebPostProcessRenderer::Initialize(WebGpuRhiDevice &device, wgpu::TextureFormat surfaceFormat,
                                         uint32_t sceneSampleCount)
 {
-    m_device = device;
-    m_surfaceFormat = surfaceFormat;
-    m_sceneSampleCount = sceneSampleCount;
-    if (!m_device || surfaceFormat == wgpu::TextureFormat::Undefined ||
-        (sceneSampleCount != 1 && sceneSampleCount != 4))
-        return false;
-    wgpu::SamplerDescriptor sampler;
-    sampler.addressModeU = wgpu::AddressMode::ClampToEdge;
-    sampler.addressModeV = wgpu::AddressMode::ClampToEdge;
-    sampler.minFilter = wgpu::FilterMode::Linear;
-    sampler.magFilter = wgpu::FilterMode::Linear;
-    m_sampler = m_device.CreateSampler(&sampler);
-    m_resolveValues.encodeSrgb = IsSrgb(surfaceFormat) ? 0.0f : 1.0f;
-    m_resolveParameters = UniformBuffer(m_device, sizeof(ResolveParameters));
-    return m_sampler && m_resolveParameters && CreatePipelines();
-}
-
-bool WebPostProcessRenderer::CreatePipelines()
-{
-    std::array<wgpu::BindGroupLayoutEntry, 3> downEntries{};
-    downEntries[0].binding = 0;
-    downEntries[0].visibility = wgpu::ShaderStage::Fragment;
-    downEntries[0].sampler.type = wgpu::SamplerBindingType::Filtering;
-    downEntries[1].binding = 1;
-    downEntries[1].visibility = wgpu::ShaderStage::Fragment;
-    downEntries[1].texture.sampleType = wgpu::TextureSampleType::Float;
-    downEntries[1].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    downEntries[2].binding = 2;
-    downEntries[2].visibility = wgpu::ShaderStage::Fragment;
-    downEntries[2].buffer.type = wgpu::BufferBindingType::Uniform;
-    downEntries[2].buffer.minBindingSize = sizeof(DownsampleParameters);
-    wgpu::BindGroupLayoutDescriptor downLayout;
-    downLayout.entryCount = downEntries.size();
-    downLayout.entries = downEntries.data();
-    m_downsampleLayout = m_device.CreateBindGroupLayout(&downLayout);
-
-    std::array<wgpu::BindGroupLayoutEntry, 4> upEntries{};
-    upEntries[0] = downEntries[0];
-    upEntries[1] = downEntries[1];
-    upEntries[2].binding = 2;
-    upEntries[2].visibility = wgpu::ShaderStage::Fragment;
-    upEntries[2].texture.sampleType = wgpu::TextureSampleType::Float;
-    upEntries[2].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    upEntries[3].binding = 3;
-    upEntries[3].visibility = wgpu::ShaderStage::Fragment;
-    upEntries[3].buffer.type = wgpu::BufferBindingType::Uniform;
-    upEntries[3].buffer.minBindingSize = sizeof(UpsampleParameters);
-    wgpu::BindGroupLayoutDescriptor upLayout;
-    upLayout.entryCount = upEntries.size();
-    upLayout.entries = upEntries.data();
-    m_upsampleLayout = m_device.CreateBindGroupLayout(&upLayout);
-
-    std::array<wgpu::BindGroupLayoutEntry, 4> resolveEntries = upEntries;
-    resolveEntries[3].buffer.minBindingSize = sizeof(ResolveParameters);
-    wgpu::BindGroupLayoutDescriptor resolveLayout;
-    resolveLayout.entryCount = resolveEntries.size();
-    resolveLayout.entries = resolveEntries.data();
-    m_resolveLayout = m_device.CreateBindGroupLayout(&resolveLayout);
-
-    m_downsamplePipeline = Pipeline(m_device, m_downsampleLayout, Shader(m_device, kDownsampleShader), kHdrFormat);
-    m_upsamplePipeline = Pipeline(m_device, m_upsampleLayout, Shader(m_device, kUpsampleShader), kHdrFormat);
-    m_resolvePipeline = Pipeline(m_device, m_resolveLayout, Shader(m_device, kResolveShader), m_surfaceFormat);
-    return m_downsampleLayout && m_upsampleLayout && m_resolveLayout && m_downsamplePipeline && m_upsamplePipeline &&
-           m_resolvePipeline;
+    m_impl = std::make_unique<Impl>(device, SurfaceFormat(surfaceFormat), sceneSampleCount);
+    return true;
 }
 
 bool WebPostProcessRenderer::Resize(uint32_t width, uint32_t height)
 {
+    auto &impl = *m_impl;
     width = std::max(1u, width);
     height = std::max(1u, height);
-    if (m_width == width && m_height == height && m_sceneColorView && m_resolveGroup)
+    if (impl.width == width && impl.height == height)
         return true;
-    m_width = width;
-    m_height = height;
-    return CreateSceneTarget() && CreateBloomTargets() && CreateResolveBindGroup();
-}
-
-bool WebPostProcessRenderer::Configure(const Settings &settings)
-{
-    const bool wasBloomEnabled = BloomEnabled();
-    const uint32_t previousIterations = m_settings.bloomIterations;
-    m_settings = settings;
-    m_settings.bloomThreshold = std::max(0.0f, settings.bloomThreshold);
-    m_settings.bloomIntensity = std::max(0.0f, settings.bloomIntensity);
-    m_settings.bloomScatter = std::clamp(settings.bloomScatter, 0.0f, 1.0f);
-    m_settings.bloomClamp = std::max(0.0f, settings.bloomClamp);
-    m_settings.bloomIterations = std::clamp(settings.bloomIterations, 1u, 8u);
-    m_settings.toneMappingMode = std::min(settings.toneMappingMode, 2u);
-    m_settings.exposure = std::max(0.0001f, settings.exposure);
-    if (m_width == 0 || m_height == 0)
-        return true;
-    if (wasBloomEnabled != BloomEnabled() || previousIterations != m_settings.bloomIterations)
-        return CreateBloomTargets() && CreateResolveBindGroup();
-    UpdateParameterBuffers();
+    impl.width = width;
+    impl.height = height;
+    impl.Rebuild();
     return true;
 }
 
 bool WebPostProcessRenderer::ConfigureSampleCount(uint32_t sampleCount)
 {
-    if (sampleCount != 1 && sampleCount != 4)
-        return false;
-    if (sampleCount == m_sceneSampleCount)
+    auto &impl = *m_impl;
+    if (impl.sceneSamples == sampleCount)
         return true;
-    m_sceneSampleCount = sampleCount;
-    return m_width == 0 || m_height == 0 || CreateMultisampledTarget();
+    impl.sceneSamples = sampleCount;
+    if (impl.width != 0)
+        impl.Rebuild();
+    return true;
+}
+
+bool WebPostProcessRenderer::Configure(const Settings &settings)
+{
+    auto &impl = *m_impl;
+    Settings normalized = settings;
+    normalized.bloomThreshold = std::max(0.0f, settings.bloomThreshold);
+    normalized.bloomIntensity = std::max(0.0f, settings.bloomIntensity);
+    normalized.bloomScatter = std::clamp(settings.bloomScatter, 0.0f, 1.0f);
+    normalized.bloomClamp = std::max(0.0f, settings.bloomClamp);
+    normalized.bloomIterations = std::clamp(settings.bloomIterations, 1u, 8u);
+    normalized.toneMappingMode = std::min(settings.toneMappingMode, 2u);
+    normalized.exposure = std::max(0.0001f, settings.exposure);
+    if (impl.settings == normalized)
+        return true;
+    const bool rebuild = impl.settings.bloomEnabled != normalized.bloomEnabled ||
+                         impl.settings.bloomIterations != normalized.bloomIterations ||
+                         (impl.settings.toneMappingMode != 0 || impl.settings.exposure != 1.0f) !=
+                             (normalized.toneMappingMode != 0 || normalized.exposure != 1.0f);
+    impl.settings = normalized;
+    if (impl.width == 0)
+        return true;
+    if (rebuild)
+        impl.Rebuild();
+    else
+        impl.UpdateParameters();
+    return true;
 }
 
 bool WebPostProcessRenderer::SetBloomEnabledForDiagnostics(bool enabled)
 {
-    if (m_bloomEnabledForDiagnostics == enabled)
+    auto &impl = *m_impl;
+    if (impl.diagnosticBloom == enabled)
         return true;
-    m_bloomEnabledForDiagnostics = enabled;
-    if (m_width == 0 || m_height == 0)
-        return true;
-    return CreateBloomTargets() && CreateResolveBindGroup();
-}
-
-bool WebPostProcessRenderer::BloomEnabled() const noexcept
-{
-    return m_settings.bloomEnabled && m_bloomEnabledForDiagnostics;
-}
-
-bool WebPostProcessRenderer::CreateSceneTarget()
-{
-    wgpu::TextureDescriptor descriptor;
-    descriptor.size = {m_width, m_height, 1};
-    descriptor.dimension = wgpu::TextureDimension::e2D;
-    descriptor.format = kHdrFormat;
-    descriptor.mipLevelCount = 1;
-    descriptor.sampleCount = 1;
-    descriptor.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
-    m_sceneColor = m_device.CreateTexture(&descriptor);
-    m_sceneColorView = m_sceneColor ? m_sceneColor.CreateView() : wgpu::TextureView{};
-    if (!m_sceneColorView)
-        return false;
-
-    return CreateMultisampledTarget();
-}
-
-bool WebPostProcessRenderer::CreateMultisampledTarget()
-{
-    m_sceneColorMultisampled = {};
-    m_sceneColorMultisampledView = {};
-    if (m_sceneSampleCount == 1)
-        return true;
-
-    wgpu::TextureDescriptor descriptor;
-    descriptor.size = {m_width, m_height, 1};
-    descriptor.dimension = wgpu::TextureDimension::e2D;
-    descriptor.format = kHdrFormat;
-    descriptor.mipLevelCount = 1;
-    descriptor.sampleCount = m_sceneSampleCount;
-    descriptor.usage = wgpu::TextureUsage::RenderAttachment;
-    m_sceneColorMultisampled = m_device.CreateTexture(&descriptor);
-    m_sceneColorMultisampledView =
-        m_sceneColorMultisampled ? m_sceneColorMultisampled.CreateView() : wgpu::TextureView{};
-    return static_cast<bool>(m_sceneColorMultisampledView);
-}
-
-bool WebPostProcessRenderer::CreateBloomTargets()
-{
-    m_bloomLevels.clear();
-    if (!BloomEnabled())
-        return true;
-    const uint32_t count = std::clamp(m_settings.bloomIterations, 1u, 8u);
-    m_bloomLevels.resize(count);
-    for (uint32_t index = 0; index < count; ++index) {
-        auto &level = m_bloomLevels[index];
-        level.width = std::max(1u, m_width >> (index + 1u));
-        level.height = std::max(1u, m_height >> (index + 1u));
-        wgpu::TextureDescriptor texture;
-        texture.size = {level.width, level.height, 1};
-        texture.dimension = wgpu::TextureDimension::e2D;
-        texture.format = kHdrFormat;
-        texture.mipLevelCount = 1;
-        texture.sampleCount = 1;
-        texture.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
-        level.downTexture = m_device.CreateTexture(&texture);
-        level.downView = level.downTexture ? level.downTexture.CreateView() : wgpu::TextureView{};
-        level.upTexture = m_device.CreateTexture(&texture);
-        level.upView = level.upTexture ? level.upTexture.CreateView() : wgpu::TextureView{};
-        level.downParameters = UniformBuffer(m_device, sizeof(DownsampleParameters));
-        if (!level.downView || !level.upView || !level.downParameters)
-            return false;
-        std::array<wgpu::BindGroupEntry, 3> entries{};
-        entries[0].binding = 0;
-        entries[0].sampler = m_sampler;
-        entries[1].binding = 1;
-        entries[1].textureView = index == 0 ? m_sceneColorView : m_bloomLevels[index - 1].downView;
-        entries[2].binding = 2;
-        entries[2].buffer = level.downParameters;
-        entries[2].size = sizeof(DownsampleParameters);
-        wgpu::BindGroupDescriptor group;
-        group.layout = m_downsampleLayout;
-        group.entryCount = entries.size();
-        group.entries = entries.data();
-        level.downGroup = m_device.CreateBindGroup(&group);
-        if (!level.downGroup)
-            return false;
-    }
-    for (uint32_t higherIndex = 0; higherIndex + 1 < count; ++higherIndex) {
-        const uint32_t lowerIndex = higherIndex + 1;
-        auto &higher = m_bloomLevels[higherIndex];
-        const auto &lower = m_bloomLevels[lowerIndex];
-        higher.upParameters = UniformBuffer(m_device, sizeof(UpsampleParameters));
-        std::array<wgpu::BindGroupEntry, 4> entries{};
-        entries[0].binding = 0;
-        entries[0].sampler = m_sampler;
-        entries[1].binding = 1;
-        entries[1].textureView = lowerIndex + 1 == count ? lower.downView : lower.upView;
-        entries[2].binding = 2;
-        entries[2].textureView = higher.downView;
-        entries[3].binding = 3;
-        entries[3].buffer = higher.upParameters;
-        entries[3].size = sizeof(UpsampleParameters);
-        wgpu::BindGroupDescriptor group;
-        group.layout = m_upsampleLayout;
-        group.entryCount = entries.size();
-        group.entries = entries.data();
-        higher.upGroup = m_device.CreateBindGroup(&group);
-        if (!higher.upParameters || !higher.upGroup)
-            return false;
-    }
+    impl.diagnosticBloom = enabled;
+    if (impl.width != 0)
+        impl.Rebuild();
     return true;
 }
 
-bool WebPostProcessRenderer::CreateResolveBindGroup()
+void WebPostProcessRenderer::StageFrame(const EngineGlobalsUBO &frame)
 {
-    const wgpu::TextureView bloom =
-        m_bloomLevels.empty() ? m_sceneColorView
-                              : (m_bloomLevels.size() == 1 ? m_bloomLevels[0].downView : m_bloomLevels[0].upView);
-    UpdateParameterBuffers();
-    std::array<wgpu::BindGroupEntry, 4> entries{};
-    entries[0].binding = 0;
-    entries[0].sampler = m_sampler;
-    entries[1].binding = 1;
-    entries[1].textureView = m_sceneColorView;
-    entries[2].binding = 2;
-    entries[2].textureView = bloom;
-    entries[3].binding = 3;
-    entries[3].buffer = m_resolveParameters;
-    entries[3].size = sizeof(ResolveParameters);
-    wgpu::BindGroupDescriptor group;
-    group.layout = m_resolveLayout;
-    group.entryCount = entries.size();
-    group.entries = entries.data();
-    m_resolveGroup = m_device.CreateBindGroup(&group);
-    return static_cast<bool>(m_resolveGroup);
-}
-
-void WebPostProcessRenderer::UpdateParameterBuffers()
-{
-    for (size_t index = 0; index < m_bloomLevels.size(); ++index) {
-        const auto &level = m_bloomLevels[index];
-        DownsampleParameters down;
-        down.inverseWidth = 1.0f / static_cast<float>(index == 0 ? m_width : m_bloomLevels[index - 1].width);
-        down.inverseHeight = 1.0f / static_cast<float>(index == 0 ? m_height : m_bloomLevels[index - 1].height);
-        down.threshold = m_settings.bloomThreshold;
-        down.knee = 0.5f;
-        down.clampMax = m_settings.bloomClamp;
-        down.prefilter = index == 0 ? 1.0f : 0.0f;
-        m_device.GetQueue().WriteBuffer(level.downParameters, 0, &down, sizeof(down));
-        if (index + 1 < m_bloomLevels.size()) {
-            UpsampleParameters up;
-            up.inverseWidth = 1.0f / static_cast<float>(m_bloomLevels[index + 1].width);
-            up.inverseHeight = 1.0f / static_cast<float>(m_bloomLevels[index + 1].height);
-            up.scatter = m_settings.bloomScatter;
-            m_device.GetQueue().WriteBuffer(level.upParameters, 0, &up, sizeof(up));
-        }
-    }
-    m_resolveValues.bloomIntensity = BloomEnabled() ? m_settings.bloomIntensity : 0.0f;
-    m_resolveValues.exposure = m_settings.exposure;
-    m_resolveValues.toneMappingMode = static_cast<float>(m_settings.toneMappingMode);
-    m_resolveValues.bloomTint = m_settings.bloomTint;
-    m_device.GetQueue().WriteBuffer(m_resolveParameters, 0, &m_resolveValues, sizeof(m_resolveValues));
-}
-
-bool WebPostProcessRenderer::RecordColorPass(wgpu::CommandEncoder encoder, wgpu::TextureView target,
-                                             wgpu::RenderPipeline pipeline, wgpu::BindGroup group)
-{
-    if (!encoder || !target || !pipeline || !group)
-        return false;
-    wgpu::RenderPassColorAttachment attachment;
-    attachment.view = target;
-    attachment.loadOp = wgpu::LoadOp::Clear;
-    attachment.storeOp = wgpu::StoreOp::Store;
-    attachment.clearValue = {0.0, 0.0, 0.0, 1.0};
-    wgpu::RenderPassDescriptor descriptor;
-    descriptor.colorAttachmentCount = 1;
-    descriptor.colorAttachments = &attachment;
-    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&descriptor);
-    pass.SetPipeline(pipeline);
-    pass.SetBindGroup(0, group);
-    pass.Draw(3, 1, 0, 0);
-    pass.End();
-    return true;
+    m_impl->frameGlobals = frame;
 }
 
 wgpu::TextureFormat WebPostProcessRenderer::SceneColorFormat() const noexcept
 {
-    return kHdrFormat;
+    return wgpu::TextureFormat::RGBA16Float;
 }
 
 uint32_t WebPostProcessRenderer::SceneSampleCount() const noexcept
 {
-    return m_sceneSampleCount;
+    return m_impl->sceneSamples;
 }
 
 wgpu::TextureView WebPostProcessRenderer::SceneColorAttachmentView() const noexcept
 {
-    return m_sceneSampleCount == 1 ? m_sceneColorView : m_sceneColorMultisampledView;
+    return m_impl->device.GetNativeTextureView(m_impl->scene->Acquire()->ColorAttachment().GetView());
 }
 
 wgpu::TextureView WebPostProcessRenderer::SceneColorView() const noexcept
 {
-    return m_sceneColorView;
+    return m_impl->device.GetNativeTextureView(m_impl->scene->Acquire()->color->GetView());
 }
 
-bool WebPostProcessRenderer::PrepareBloom(wgpu::CommandEncoder encoder)
+bool WebPostProcessRenderer::Prepare(wgpu::CommandEncoder encoder)
 {
-    if (!BloomEnabled())
-        return true;
-    for (auto &level : m_bloomLevels) {
-        if (!RecordColorPass(encoder, level.downView, m_downsamplePipeline, level.downGroup))
-            return false;
-    }
-    if (m_bloomLevels.size() > 1) {
-        for (size_t index = m_bloomLevels.size() - 1; index > 0; --index) {
-            auto &higher = m_bloomLevels[index - 1];
-            if (!RecordColorPass(encoder, higher.upView, m_upsamplePipeline, higher.upGroup))
-                return false;
-        }
+    auto &impl = *m_impl;
+    // WriteBuffer is queue-ordered after the previous frame's submission.
+    // Each draw gets a separate slot until this frame has been submitted.
+    // Releasing RHI handles drops references; encoded WebGPU commands retain
+    // their allocations, so pool reuse needs no browser-thread GPU wait.
+    impl.renderer.ResetPool();
+    for (const auto index : impl.executionOrder) {
+        const auto &prepared = impl.passes[index];
+        wgpu::RenderPassColorAttachment attachment{};
+        attachment.view = impl.device.GetNativeTextureView(prepared.target->color->GetView());
+        attachment.loadOp = wgpu::LoadOp::Clear;
+        attachment.storeOp = wgpu::StoreOp::Store;
+        attachment.clearValue = {0.0, 0.0, 0.0, 1.0};
+        wgpu::RenderPassDescriptor descriptor{};
+        descriptor.colorAttachmentCount = 1;
+        descriptor.colorAttachments = &attachment;
+        auto pass = encoder.BeginRenderPass(&descriptor);
+        impl.Draw(pass, prepared);
+        pass.End();
     }
     return true;
 }
 
-bool WebPostProcessRenderer::Render(wgpu::RenderPassEncoder pass, bool dithering)
+bool WebPostProcessRenderer::Render(wgpu::RenderPassEncoder pass, bool dithering, bool stopNaNs)
 {
-    if (!pass || !m_resolvePipeline || !m_resolveGroup || !m_sceneColorView)
-        return false;
-    const float dither = dithering ? 1.0f : 0.0f;
-    if (m_resolveValues.dithering != dither) {
-        m_resolveValues.dithering = dither;
-        m_device.GetQueue().WriteBuffer(m_resolveParameters, 0, &m_resolveValues, sizeof(m_resolveValues));
-    }
-    pass.SetPipeline(m_resolvePipeline);
-    pass.SetBindGroup(0, m_resolveGroup);
-    pass.Draw(3, 1, 0, 0);
-    if (!m_reportedReady) {
-        std::printf("INFERNUX_WEB_POST_PROCESS_READY hdr=rgba16float msaa=%u bloom=%d iterations=%u tonemap=%u\n",
-                    m_sceneSampleCount, BloomEnabled() ? 1 : 0, m_settings.bloomIterations, m_settings.toneMappingMode);
-        m_reportedReady = true;
+    auto &impl = *m_impl;
+    auto globals = impl.frameGlobals;
+    globals.screenParams = {float(impl.width), float(impl.height), 1.0f / impl.width, 1.0f / impl.height};
+    globals.viewOptions = {dithering ? 1u : 0u, stopNaNs ? 1u : 0u, 1u, 0u};
+    if (!impl.device.WriteBuffer(impl.globals, 0, &globals, sizeof(globals)))
+        throw std::runtime_error("Web display globals upload failed");
+    impl.Draw(std::move(pass), impl.display);
+    if (!impl.reportedReady) {
+        std::printf("INFERNUX_WEB_POST_PROCESS_READY renderer=shared hdr=rgba16float msaa=%u bloom=%d iterations=%u "
+                    "tonemap=%u\n",
+                    impl.sceneSamples, impl.BloomEnabled() ? 1 : 0, impl.settings.bloomIterations,
+                    impl.settings.toneMappingMode);
+        impl.reportedReady = true;
     }
     return true;
 }
-
 } // namespace infernux::web
