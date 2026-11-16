@@ -279,6 +279,11 @@ uint64_t WebGpuComputeQueue::GetPendingSubmissionCount() const noexcept
     return m_pending.size();
 }
 
+rhi::SubmissionTicket WebGpuComputeQueue::GetCapacityPredecessor() const noexcept
+{
+    return m_pending.size() == m_capacity ? m_pending.front()->ticket : rhi::SubmissionTicket{};
+}
+
 uint64_t WebGpuComputeQueue::GetRetainedUploadBytes() const noexcept
 {
     uint64_t bytes = 0;

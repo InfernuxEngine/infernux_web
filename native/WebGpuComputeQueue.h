@@ -29,6 +29,7 @@ class WebGpuComputeQueue final : public rhi::ComputeQueue
     [[nodiscard]] rhi::GpuTimestampFrame GetProfile() const override;
     [[nodiscard]] uint64_t GetPendingSubmissionCount() const noexcept override;
     [[nodiscard]] uint64_t GetRetainedUploadBytes() const noexcept override;
+    [[nodiscard]] rhi::SubmissionTicket GetCapacityPredecessor() const noexcept override;
 
   private:
     struct Completion;
