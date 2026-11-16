@@ -419,6 +419,7 @@ struct WebSceneRenderer::Impl
                                      source.layerMask};
         if (previous)
             draw.previousPose = previous->devicePose.value;
+        auxiliary.poseIndices.w = source.surfaceId;
         ApplyDevicePose(auxiliary, source.devicePose, previous ? &previous->devicePose : nullptr);
         instanceValues.push_back(auxiliary);
         draws.push_back(std::move(draw));
