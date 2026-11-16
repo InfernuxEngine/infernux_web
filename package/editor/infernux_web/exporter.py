@@ -590,6 +590,7 @@ def _cook_web_player_assets(
             "platform": "web",
             "architecture": "wasm32",
         },
+        gpu_compute_aot=True,
     )
     player_assets = staging / "player-assets"
     player_assets.mkdir(parents=True)
