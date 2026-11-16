@@ -3,7 +3,7 @@
 #include <Python.h>
 #include <webgpu/webgpu_cpp.h>
 
-#include <function/renderer/rhi/RhiTypes.h>
+#include <function/renderer/rhi/RhiHandles.h>
 
 #include <cstdint>
 #include <memory>
@@ -11,8 +11,10 @@
 
 namespace infernux
 {
-class Camera;
-}
+struct MaterialPassPipelineDescriptor;
+struct RenderViewData;
+struct ShaderViewBindings;
+} // namespace infernux
 
 namespace infernux::web
 {
@@ -31,13 +33,12 @@ class WebParticleRuntime final
     WebParticleRuntime(const WebParticleRuntime &) = delete;
     WebParticleRuntime &operator=(const WebParticleRuntime &) = delete;
 
-    [[nodiscard]] bool Initialize(WebGpuRhiDevice &device, WebSceneRenderer &scene, rhi::PixelFormat colorFormat,
-                                  rhi::SampleCount sceneSampleCount);
-    [[nodiscard]] bool ConfigureSampleCount(rhi::SampleCount sceneSampleCount);
+    [[nodiscard]] bool Initialize(WebGpuRhiDevice &device, WebSceneRenderer &scene);
     void Shutdown() noexcept;
 
     [[nodiscard]] std::string ReplaceGraph(uint64_t graphInstanceId, PyObject *programs, PyObject *removeIds);
-    [[nodiscard]] std::string UpdateParameters(uint64_t graphInstanceId, PyObject *words);
+    [[nodiscard]] std::string ReplaceGraphs(PyObject *graphs);
+    [[nodiscard]] std::string UpdateParameters(uint64_t graphInstanceId, PyObject *updates);
     [[nodiscard]] bool BeginBatch(uint64_t graphInstanceId, PyObject *items);
     [[nodiscard]] bool SetPlaying(uint64_t emitterId, bool playing);
     [[nodiscard]] bool Reset(uint64_t emitterId);
@@ -46,8 +47,12 @@ class WebParticleRuntime final
 
     [[nodiscard]] bool RecordCompute(wgpu::CommandEncoder encoder);
     void NotifySubmission() noexcept;
-    [[nodiscard]] bool HasRenderWork(uint32_t cameraMask) const noexcept;
-    [[nodiscard]] bool Render(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height);
+    [[nodiscard]] bool RequiresSceneDepth(uint32_t cameraMask, int32_t queueMin, int32_t queueMax) const noexcept;
+    [[nodiscard]] bool Render(wgpu::RenderPassEncoder pass, const RenderViewData &view,
+                              const ShaderViewBindings &bindings, const MaterialPassPipelineDescriptor &target,
+                              int32_t queueMin, int32_t queueMax, rhi::TextureViewHandle sceneDepth = {},
+                              bool sceneDepthIsDepth = true);
+    void ReleaseView(rhi::BufferHandle globals) noexcept;
 
     [[nodiscard]] const std::string &LastError() const noexcept;
 

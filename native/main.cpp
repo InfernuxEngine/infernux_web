@@ -26,11 +26,13 @@
 #include "WebKeyboard.h"
 #include "WebParticleRuntime.h"
 #include "WebRenderGraph.h"
+#include <function/renderer/RenderGraphWork.h>
 #include <pybind11/pybind11.h>
 #include <function/resources/ShaderAsset/FullscreenProgramAsset.h>
 #include <function/renderer/rhi/RhiBuffer.h>
 #include <function/renderer/rhi/RhiRenderTexture.h>
 #include "WebSceneRenderer.h"
+#include <function/renderer/shader/ShaderViewBindings.h>
 #include "WebScreenUIRenderer.h"
 #include <function/renderer/rhi/RhiComputeHost.h>
 
@@ -134,9 +136,12 @@ struct CameraGraph
     std::shared_ptr<const infernux::RenderGraphDescription> source;
     std::shared_ptr<const infernux::RenderGraphDescription> description;
     uint64_t outputRevision = 0;
+    infernux::rhi::BufferHandle viewGlobals;
     uint64_t lastFrame = 0;
 };
 std::unordered_map<uint64_t, CameraGraph> g_cameraGraphs;
+std::unordered_map<uint64_t, uint64_t> g_mainCameraViews;
+infernux::web::WebGraphServices g_graphServices;
 std::unordered_map<uint64_t, std::shared_ptr<infernux::rhi::RenderTexture>> g_screenTargets;
 PyObject *g_renderPipelineOwner = nullptr;
 infernux::RenderPipelineCallback *g_renderPipeline = nullptr;
@@ -925,6 +930,7 @@ void Frame()
         std::unordered_map<uint64_t, infernux::rhi::SampleCount> screenSamples;
         captured.reserve(cameras.size());
         accesses.reserve(cameras.size());
+        g_mainCameraViews.clear();
         for (auto *camera : cameras) {
             if (g_splashActive || g_webGpuValidationFailed)
                 break;
@@ -936,9 +942,13 @@ void Frame()
             auto &state = g_cameraGraphs[plan->view->cameraId];
             state.lastFrame = g_shaderFrameIndex;
             if (!state.graph) {
-                state.graph = std::make_unique<infernux::web::WebRenderGraph>(*g_rhi, g_fullscreenHost);
+                state.graph = std::make_unique<infernux::web::WebRenderGraph>(*g_rhi, g_fullscreenHost, g_computeHost.get());
             }
             const auto &cameraView = *plan->view;
+            if (cameraView.isMainCamera)
+                g_mainCameraViews.insert_or_assign(plan->world->WorldId(), cameraView.cameraId);
+            else if (!cameraView.outputGeneration)
+                g_mainCameraViews.try_emplace(plan->world->WorldId(), cameraView.cameraId);
             const auto output = cameraView.outputGeneration;
             const auto outputRevision = output ? output->revision : 0;
             if (state.source != plan->graph || state.outputRevision != outputRevision) {
@@ -976,15 +986,58 @@ void Frame()
                     target->Reconfigure(description);
                 destination = target->Acquire();
             }
-            state.graph->Apply(state.description, graphView, {},
+            std::unordered_map<std::string, infernux::web::WebRenderGraph::Texture> textureAssets;
+            bool texturesReady = true;
+            for (const auto &texture : state.description->textures) {
+                if (texture.role != infernux::GraphTextureRole::Asset)
+                    continue;
+                auto asset = g_sceneRenderer.ResolveGraphTextureAsset(texture.assetGuid);
+                texturesReady &= static_cast<bool>(asset);
+                textureAssets.emplace(texture.name, std::move(asset));
+            }
+            if (!texturesReady) {
+                infernux::RenderViewAccess access;
+                access.viewId = graphView.id;
+                access.admitted = false;
+                access.writes.push_back(destination->color.get());
+                if (destination->multisampleColor)
+                    access.writes.push_back(destination->multisampleColor.get());
+                if (destination->depth)
+                    access.writes.push_back(destination->depth.get());
+                for (const auto &texture : state.description->textures) {
+                    if (!texture.renderTextureGeneration || !std::any_of(state.description->passes.begin(),
+                            state.description->passes.end(), [&](const auto &pass) { return pass.WritesTexture(texture.name); }))
+                        continue;
+                    access.writes.push_back(infernux::ResolveGraphTextureAttachment(*texture.renderTextureGeneration,
+                                                                                   texture.attachment));
+                }
+                accesses.push_back(std::move(access));
+                captured.push_back({camera, plan, &state});
+                continue;
+            }
+            const bool sampleParticleDepth = g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics &&
+                std::any_of(state.description->passes.begin(), state.description->passes.end(), [&](const auto &pass) {
+                    const auto *command = pass.PrimaryCommand();
+                    return command && command->type == infernux::GraphCommandType::DrawRenderers &&
+                        g_particleRuntime.RequiresSceneDepth(cameraView.cullingMask, command->queueMin, command->queueMax);
+                });
+            const bool rebuilt = state.graph->Apply(state.description, graphView, [&](const auto &texture) {
+                    const auto found = textureAssets.find(texture.name);
+                    return found == textureAssets.end() ? infernux::web::WebRenderGraph::Texture{} : found->second;
+                },
                 infernux::ResolveGraphCameraClear(*state.description, cameraView.clearFlags,
-                    inx::color::SrgbToLinear(cameraView.backgroundColor)), destination, cameraView.rect);
+                    inx::color::SrgbToLinear(cameraView.backgroundColor)), destination, cameraView.rect, sampleParticleDepth);
+            if (rebuilt && state.viewGlobals.IsValid())
+                g_particleRuntime.ReleaseView(state.viewGlobals);
             state.graph->UpdateParameters(plan->parameters);
-            auto access = state.graph->GetResourceAccess();
+            auto access = state.graph->GetResourceAccess(
+                g_sceneRenderer.CollectMaterialTextureReads(*plan, *state.graph));
             accesses.push_back(std::move(access));
             captured.push_back({camera, plan, &state});
         }
         const auto schedule = infernux::RenderViewSchedule::Build(accesses);
+        for (auto *input : schedule.cyclicInputs)
+            input->MarkResultCycle();
         for (const auto index : schedule.order) {
             const auto &capture = captured[index];
             auto *camera = capture.camera;
@@ -995,41 +1048,61 @@ void Frame()
             g_lastSampleCount = state.description->msaaSamples > 0 ? uint32_t(state.description->msaaSamples) : 1;
             g_sceneRenderer.Prepare(*plan, *state.graph);
             g_sceneRenderer.RecordPreparation(encoder);
-            if (!g_particleRuntime.ConfigureSampleCount(static_cast<infernux::rhi::SampleCount>(g_lastSampleCount)))
-                throw std::runtime_error(g_particleRuntime.LastError());
             const auto resources = g_sceneRenderer.FullscreenView();
-            state.graph->Record(encoder, resources,
-                [&](auto pass, const auto &command, const auto &raster, const auto &target) {
-                    using Type = infernux::GraphCommandType;
-                    switch (command.type) {
-                    case Type::DrawRenderers:
-                        g_sceneRenderer.Record(pass, command, target);
-                        if (command.queueMin <= 3000 && command.queueMax >= 3000 && g_particleRenderingEnabledForDiagnostics)
-                            (void)g_particleRuntime.Render(pass, *camera, raster.width, raster.height);
-                        break;
-                    case Type::DrawSkybox:
-                    case Type::DrawShadowCasters:
-                        g_sceneRenderer.Record(pass, command, target);
-                        break;
-                    case Type::DrawWorldUI:
-                        (void)g_screenUIRenderer.RenderWorld(pass, *camera, raster.width, raster.height, target, command.worldUILayerMask);
-                        break;
-                    case Type::DrawScreenUI:
-                        (void)g_screenUIRenderer.Render(pass, command.screenUIList, raster.width, raster.height, target);
-                        break;
-                    default:
-                        throw std::invalid_argument("Unexpected non-raster command in a render pass");
-                    }
-                }, [](auto, const auto &) { throw std::invalid_argument("Graph work has no execution binding"); });
-            if (!output) {
-                present(*state.graph, state.description->outputDisplayEncoded, resources, view, ToRhiFormat(g_surfaceFormat),
-                        infernux::RasterViewportRect(cameraView.rect, g_width, g_height), !rendered);
-                rendered = true;
+            state.viewGlobals = resources.globals.buffer;
+            const infernux::ShaderViewBindings particleView{g_sceneRenderer.ViewLayout(), resources.perView,
+                                                           resources.globals.buffer};
+            const auto record = [&] {
+                state.graph->Record(encoder, resources,
+                    [&](auto pass, const auto &command, const auto &raster, const auto &target, const auto *particleDepth) {
+                        using Type = infernux::GraphCommandType;
+                        switch (command.type) {
+                        case Type::DrawRenderers:
+                            g_sceneRenderer.Record(pass, command, target);
+                            if (g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics &&
+                                !command.rendererSelection && !command.overrideMaterialValue)
+                                (void)g_particleRuntime.Render(
+                                    pass, cameraView, particleView, target, command.queueMin, command.queueMax,
+                                    particleDepth ? particleDepth->GetView() : infernux::rhi::TextureViewHandle{},
+                                    particleDepth && infernux::rhi::IsDepthFormat(particleDepth->GetFormat()));
+                            break;
+                        case Type::DrawSkybox:
+                        case Type::DrawShadowCasters:
+                            g_sceneRenderer.Record(pass, command, target);
+                            break;
+                        case Type::DrawWorldUI:
+                            (void)g_screenUIRenderer.RenderWorld(pass, *camera, raster.width, raster.height, target, command.worldUILayerMask);
+                            break;
+                        case Type::DrawScreenUI:
+                            (void)g_screenUIRenderer.Render(pass, command.screenUIList, raster.width, raster.height, target);
+                            break;
+                        default:
+                            throw std::invalid_argument("Unexpected non-raster command in a render pass");
+                        }
+                    });
+                if (!output) {
+                    present(*state.graph, state.description->outputDisplayEncoded, resources, view, ToRhiFormat(g_surfaceFormat),
+                            infernux::RasterViewportRect(cameraView.rect, g_width, g_height), !rendered);
+                    rendered = true;
+                }
+                // Per-camera UI uploads precede this submit. The next view can
+                // then reuse its UI buffers without changing this recorded draw.
+                return encoder.Finish();
+            };
+            auto publication = state.graph->PreparePublication(g_graphServices.interests, [] {
+                return g_sceneRenderer.CaptureViewSample();
+            });
+            auto storage = state.graph->RetainWorkStorage();
+            if (storage || publication) {
+                const auto ticket = g_computeQueue->SubmitGraphics(record, std::move(storage));
+                if (publication)
+                    publication->Accept(ticket, g_graphServices.events);
+            } else {
+                auto commands = record();
+                g_queue.Submit(1, &commands);
             }
-            // Per-camera UI uploads precede this submit. The next view can
-            // then reuse its UI buffers without changing this recorded draw.
-            auto commands = encoder.Finish();
-            g_queue.Submit(1, &commands);
+            state.graph->AcceptHistory();
+            g_sceneRenderer.AcceptView();
             encoder = g_device.CreateCommandEncoder();
         }
         if (!rendered) {
@@ -1051,9 +1124,11 @@ void Frame()
             pass.End();
         }
         for (auto entry = g_cameraGraphs.begin(); entry != g_cameraGraphs.end();) {
-            if (entry->second.lastFrame + 1 < g_shaderFrameIndex)
+            if (entry->second.lastFrame + 1 < g_shaderFrameIndex) {
+                if (entry->second.viewGlobals.IsValid())
+                    g_particleRuntime.ReleaseView(entry->second.viewGlobals);
                 entry = g_cameraGraphs.erase(entry);
-            else
+            } else
                 ++entry;
         }
         g_screenUIRenderer.PruneUnusedMaterials();
@@ -1064,6 +1139,9 @@ void Frame()
             g_particleRuntime.NotifySubmission();
     }
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+    if (foregroundSubmitted)
+        infernux::SceneManager::Instance().EmitRuntimeFrameBarrier(
+            infernux::SceneManager::RuntimeFrameBarrier::RenderSubmitted);
     g_frameWork.AdvanceLate([foregroundSubmitted] {
         if (!foregroundSubmitted)
             return infernux::FrameGpuAvailability::ForegroundDeferred;
@@ -1117,7 +1195,6 @@ void StartSurface()
     g_renderPipelineOwner = pipeline.release().ptr();
     g_fullscreenHost = std::make_shared<FullscreenHost>();
     g_presentRenderer.Initialize(g_fullscreenHost);
-    constexpr uint32_t sceneSampleCount = 1;
     if (!g_sceneRenderer.Initialize(*g_rhi)) {
         std::fprintf(stderr, "INFERNUX_WEBGPU_SCENE_PIPELINE_FAILED\n");
         InfernuxWebAbortStartup("Scene rendering initialization failed");
@@ -1125,16 +1202,26 @@ void StartSurface()
     }
     g_sceneRenderer.SetOutputSize(g_width, g_height);
     InfernuxWebSetSceneRenderer(&g_sceneRenderer);
+    g_graphServices.capture = [](uint64_t camera, const std::string &name) {
+        if (camera == 0) {
+            const auto entry = g_mainCameraViews.find(infernux::SceneManager::Instance().CurrentWorld().id);
+            if (entry == g_mainCameraViews.end())
+                throw std::invalid_argument("The active World has not prepared its main camera");
+            camera = entry->second;
+        }
+        const auto found = g_cameraGraphs.find(camera);
+        if (found == g_cameraGraphs.end())
+            throw std::invalid_argument("The selected camera has not prepared a render graph");
+        return found->second.graph->CaptureBuffer(name);
+    };
+    InfernuxWebSetGraphServices(&g_graphServices);
     if (!g_screenUIRenderer.Initialize(*g_rhi, g_sceneRenderer)) {
         std::fprintf(stderr, "INFERNUX_WEB_SCREEN_UI_INITIALIZATION_FAILED\n");
         InfernuxWebAbortStartup("Screen UI initialization failed");
         return;
     }
     InfernuxWebSetScreenUIRenderer(&g_screenUIRenderer);
-    const auto particleSampleCount =
-        sceneSampleCount == 4 ? infernux::rhi::SampleCount::Four : infernux::rhi::SampleCount::One;
-    if (!g_particleRuntime.Initialize(*g_rhi, g_sceneRenderer, infernux::rhi::PixelFormat::RGBA16SFloat,
-                                      particleSampleCount)) {
+    if (!g_particleRuntime.Initialize(*g_rhi, g_sceneRenderer)) {
         std::fprintf(stderr, "INFERNUX_WEBGPU_PARTICLE_RUNTIME_FAILED %s\n", g_particleRuntime.LastError().c_str());
         InfernuxWebAbortStartup("Particle runtime initialization failed");
         return;

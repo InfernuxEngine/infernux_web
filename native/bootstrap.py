@@ -1206,23 +1206,21 @@ def _process_screen_ui_events(delta_time: float) -> None:
         _mouse_event_dispatcher.discard()
         _input_scene_token = scene_token
     surfaces = collect_runtime_ui_input_surfaces(*runtime_ui_scenes(_player_scene_manager))
+    pick_scene = _mouse_event_dispatcher.needs_scene_hit()
+    if not surfaces:
+        _screen_ui_event_processor.reset()
+        if not pick_scene:
+            _mouse_event_dispatcher.discard()
+            return
+
     camera = scene.effective_game_camera if scene is not None else None
     mouse_frame = Input.get_game_mouse_frame_state(0)
     mouse_x, mouse_y, scroll_x, scroll_y, held, down, up = mouse_frame
-    if not surfaces:
-        _screen_ui_event_processor.reset()
-        _mouse_event_dispatcher.process(
-            camera,
-            (mouse_x, mouse_y),
-            (float(_screen_width), float(_screen_height)),
-            button_state=(held, down, up),
-        )
-        return
-
-    mouse_positions, scene_hit = map_runtime_ui_pointer(
+    mapped = map_runtime_ui_pointer(
         surfaces, camera, mouse_x, mouse_y, _screen_width, _screen_height,
-        include_scene_hit=True,
+        include_scene_hit=pick_scene,
     )
+    mouse_positions, scene_hit = mapped if pick_scene else (mapped, None)
 
     pointers = _mouse_pointer_frames(
         mouse_positions,
@@ -1275,13 +1273,16 @@ def _process_screen_ui_events(delta_time: float) -> None:
     _screen_ui_event_processor.process_pointers(
         surfaces, pointers, max(0.0, min(float(delta_time), 0.25))
     )
-    _mouse_event_dispatcher.process(
-        camera,
-        (mouse_x, mouse_y),
-        (float(_screen_width), float(_screen_height)),
-        hit=scene_hit,
-        button_state=(held, down, up),
-    )
+    if pick_scene:
+        _mouse_event_dispatcher.process(
+            camera,
+            (mouse_x, mouse_y),
+            (float(_screen_width), float(_screen_height)),
+            hit=scene_hit,
+            button_state=(held, down, up),
+        )
+    else:
+        _mouse_event_dispatcher.discard()
 
 
 def _complete_pending_audio_activation() -> None:

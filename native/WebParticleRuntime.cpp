@@ -1,23 +1,29 @@
 #include "WebParticleRuntime.h"
 
-#include "InfernuxWebHostModule.h"
 #include "WebGpuRhiDevice.h"
 #include "WebSceneRenderer.h"
 
-#include <core/types/ColorSpace.h>
+#include <function/renderer/RenderWorld.h>
+#include <function/renderer/particle/ParticleGpuRenderer.h>
 #include <function/renderer/particle/ParticleGpuRuntime.h>
+#include <function/resources/InxMaterial/InxMaterial.h>
+#include <function/resources/ShaderAsset/ShaderLoader.h>
 #include <function/resources/ShaderAsset/SlangNativeModule.h>
-#include <function/scene/Camera.h>
+#include <function/resources/ShaderAsset/SlangParticleModule.h>
 
 #include <glm/glm.hpp>
+#include <pybind11/pybind11.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
+#include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -32,126 +38,6 @@ constexpr std::array<const char *, static_cast<size_t>(particle::GpuKernelStage:
     "bootstrap",        "init",         "update",    "update_rendering_fused", "contact_prepare", "contact_solve",
     "contact_dispatch", "render_reset", "rendering",
 };
-
-constexpr char kDepthShader[] = R"wgsl(
-@group(2) @binding(0) var scene_depth: texture_depth_2d;
-fn scene_depth_at(pixel: vec2<i32>) -> f32 {
-    return textureLoad(scene_depth, pixel, 0);
-}
-)wgsl";
-
-constexpr char kMultisampleDepthShader[] = R"wgsl(
-@group(2) @binding(0) var scene_depth: texture_depth_multisampled_2d;
-fn scene_depth_at(pixel: vec2<i32>) -> f32 {
-    var depth = textureLoad(scene_depth, pixel, 0);
-    for (var sample = 1u; sample < textureNumSamples(scene_depth); sample++) {
-        depth = min(depth, textureLoad(scene_depth, pixel, sample));
-    }
-    return depth;
-}
-)wgsl";
-
-constexpr char kParticleShader[] = R"wgsl(
-struct CameraData {
-    view_projection: mat4x4<f32>,
-    camera_right: vec4<f32>,
-    camera_up: vec4<f32>,
-    depth_reconstruct: vec4<f32>,
-};
-
-struct ParticleInstance {
-    position_size: vec4<f32>,
-    color: vec4<f32>,
-    rotation_custom: vec4<f32>,
-    scale_custom: vec4<f32>,
-    ribbon_data: vec4<u32>,
-    custom_data: vec4<f32>,
-    previous_position_history: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> camera: CameraData;
-@group(1) @binding(0) var<storage, read> instances: array<ParticleInstance>;
-@group(1) @binding(1) var<storage, read> render_indices: array<u32>;
-
-struct OutputData {
-    material_tint: vec4<f32>,
-    flipbook_grid: vec4<f32>,
-};
-@group(1) @binding(2) var<uniform> output_data: OutputData;
-@group(1) @binding(3) var sprite_texture: texture_2d<f32>;
-@group(1) @binding(4) var sprite_sampler: sampler;
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) uv: vec2<f32>,
-    @location(2) next_uv: vec2<f32>,
-    @location(3) frame_blend: f32,
-};
-
-@vertex
-fn vertex_main(@builtin(vertex_index) vertex_index: u32,
-               @builtin(instance_index) instance_index: u32) -> VertexOutput {
-    let corners = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
-        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0));
-    let particle = instances[render_indices[instance_index]];
-    let corner = corners[vertex_index];
-    let angle = particle.rotation_custom.x;
-    let rotated = vec2<f32>(
-        corner.x * cos(angle) - corner.y * sin(angle),
-        corner.x * sin(angle) + corner.y * cos(angle));
-    let extent = max(abs(particle.position_size.w), 0.001) *
-                 max(abs(particle.scale_custom.xy), vec2<f32>(0.001));
-    let world = particle.position_size.xyz +
-                camera.camera_right.xyz * rotated.x * extent.x +
-                camera.camera_up.xyz * rotated.y * extent.y;
-    var output: VertexOutput;
-    output.position = camera.view_projection * vec4<f32>(world, 1.0);
-    output.color = particle.color;
-    let grid = max(output_data.flipbook_grid.xy, vec2<f32>(1.0));
-    let frame_position = max(particle.custom_data.x, 0.0) % (grid.x * grid.y);
-    let frame = floor(frame_position);
-    let next_frame = (frame + 1.0) % (grid.x * grid.y);
-    let uv = vec2<f32>(corner.x * 0.5 + 0.5, 0.5 - corner.y * 0.5);
-    output.uv = (uv + vec2<f32>(frame % grid.x, floor(frame / grid.x))) / grid;
-    output.next_uv = (uv + vec2<f32>(next_frame % grid.x, floor(next_frame / grid.x))) / grid;
-    output.frame_blend = fract(frame_position);
-    return output;
-}
-
-@fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let current = textureSample(sprite_texture, sprite_sampler, input.uv);
-    let next = textureSample(sprite_texture, sprite_sampler, input.next_uv);
-    var color = mix(current, next, input.frame_blend) * input.color * output_data.material_tint;
-    if (output_data.flipbook_grid.w > 0.5) {
-        let scene = eye_depth(scene_depth_at(vec2<i32>(input.position.xy)));
-        let particle = eye_depth(input.position.z);
-        color.a *= smoothstep(0.0, 1.0, clamp((scene - particle) / output_data.flipbook_grid.z, 0.0, 1.0));
-    }
-    return color;
-}
-
-fn eye_depth(depth: f32) -> f32 {
-    let p = camera.depth_reconstruct;
-    let denominator = depth * p.z - p.x;
-    return abs((p.y - depth * p.w) / select(1e-7, denominator, abs(denominator) > 1e-7));
-}
-)wgsl";
-
-struct ParticleOutputData
-{
-    glm::vec4 tint{1.0f};
-    glm::vec4 flipbookGrid{1.0f, 1.0f, 0.0f, 0.0f};
-};
-
-glm::mat4 ToWebClipSpace(const glm::mat4 &vulkanViewProjection)
-{
-    glm::mat4 correction(1.0f);
-    correction[1][1] = -1.0f;
-    return correction * vulkanViewProjection;
-}
 
 template <typename T> bool ReadUnsigned(PyObject *value, T &result)
 {
@@ -192,85 +78,9 @@ bool ReadFloat(PyObject *value, float &result)
     return true;
 }
 
-bool ReadVector4(PyObject *value, glm::vec4 &result)
-{
-    PyObject *sequence = PySequence_Fast(value, "particle color must contain four numbers");
-    if (sequence) {
-        bool valid = PySequence_Fast_GET_SIZE(sequence) == 4;
-        for (Py_ssize_t index = 0; valid && index < 4; ++index)
-            valid = ReadFloat(PySequence_Fast_GET_ITEM(sequence, index), result[static_cast<glm::length_t>(index)]);
-        Py_DECREF(sequence);
-        return valid;
-    }
-    PyErr_Clear();
-    constexpr std::array<const char *, 4> names = {"x", "y", "z", "w"};
-    for (size_t index = 0; index < names.size(); ++index) {
-        PyObject *component = PyObject_GetAttrString(value, names[index]);
-        if (!component || !ReadFloat(component, result[static_cast<glm::length_t>(index)])) {
-            Py_XDECREF(component);
-            PyErr_Clear();
-            return false;
-        }
-        Py_DECREF(component);
-    }
-    return true;
-}
-
-glm::vec4 ReadOutputMaterialTint(PyObject *program)
-{
-    glm::vec4 tint(1.0f);
-    PyObject *outputs = PySequence_Fast(Field(program, "outputs"), "particle outputs must be a sequence");
-    if (!outputs || PySequence_Fast_GET_SIZE(outputs) < 1) {
-        Py_XDECREF(outputs);
-        PyErr_Clear();
-        return tint;
-    }
-    PyObject *material = Field(PySequence_Fast_GET_ITEM(outputs, 0), "material");
-    PyObject *native = Field(material, "native");
-    PyObject *color = native ? PyObject_CallMethod(native, "get_color", "s", "baseColor") : nullptr;
-    glm::vec4 authored(1.0f);
-    if (color && ReadVector4(color, authored))
-        tint = inx::color::SrgbToLinear(authored);
-    else
-        PyErr_Clear();
-    Py_XDECREF(color);
-    Py_DECREF(outputs);
-    return tint;
-}
-
-bool ReadOutputData(PyObject *program, ParticleOutputData &data, std::string &textureGuid)
-{
-    data.tint = ReadOutputMaterialTint(program);
-    textureGuid = "white";
-    PyObject *outputs = PySequence_Fast(Field(program, "outputs"), "particle outputs must be a sequence");
-    if (!outputs)
-        return false;
-    bool valid = true;
-    if (PySequence_Fast_GET_SIZE(outputs) > 0) {
-        PyObject *output = PySequence_Fast_GET_ITEM(outputs, 0);
-        uint32_t columns = 0, rows = 0;
-        valid = ReadUnsigned(Field(output, "flipbook_columns"), columns) && columns > 0 &&
-                ReadUnsigned(Field(output, "flipbook_rows"), rows) && rows > 0;
-        data.flipbookGrid = glm::vec4(columns, rows, 0.0f, 0.0f);
-        bool softParticles = false;
-        valid = valid && ReadBool(Field(output, "soft_particles"), softParticles) &&
-                ReadFloat(Field(output, "soft_distance"), data.flipbookGrid.z) && data.flipbookGrid.z > 0.0f;
-        data.flipbookGrid.w = softParticles ? 1.0f : 0.0f;
-        PyObject *native = Field(Field(output, "material"), "native");
-        PyObject *texture = native ? PyObject_CallMethod(native, "get_texture", "s", "texSampler") : nullptr;
-        if (!texture || (texture != Py_None && !PyUnicode_Check(texture)))
-            valid = false;
-        else if (texture != Py_None)
-            textureGuid = PyUnicode_AsUTF8(texture);
-        Py_XDECREF(texture);
-    }
-    Py_DECREF(outputs);
-    return valid;
-}
-
 bool ReadWordVector(PyObject *value, std::vector<uint32_t> &result)
 {
-    PyObject *sequence = PySequence_Fast(value, "particle parameter words must be a sequence");
+    PyObject *sequence = value ? PySequence_Fast(value, "particle parameter words must be a sequence") : nullptr;
     if (!sequence) {
         PyErr_Clear();
         return false;
@@ -278,7 +88,7 @@ bool ReadWordVector(PyObject *value, std::vector<uint32_t> &result)
     const Py_ssize_t count = PySequence_Fast_GET_SIZE(sequence);
     result.clear();
     result.reserve(static_cast<size_t>(std::max<Py_ssize_t>(0, count)));
-    bool valid = count >= 0 && count % 4 == 0;
+    bool valid = true;
     for (Py_ssize_t index = 0; valid && index < count; ++index) {
         uint32_t word = 0;
         valid = ReadUnsigned(PySequence_Fast_GET_ITEM(sequence, index), word);
@@ -346,7 +156,7 @@ bool ProgramUsesPortableSubset(PyObject *program, std::string &error)
         return false;
     }
     PyObject *outputs = Field(program, "outputs");
-    PyObject *sequence = PySequence_Fast(outputs, "particle outputs must be a sequence");
+    PyObject *sequence = outputs ? PySequence_Fast(outputs, "particle outputs must be a sequence") : nullptr;
     if (!sequence) {
         PyErr_Clear();
         error = "WebGPU particle outputs are invalid";
@@ -362,6 +172,57 @@ bool ProgramUsesPortableSubset(PyObject *program, std::string &error)
     if (!valid)
         error = "WebGPU particles currently render sprite outputs only";
     return valid;
+}
+
+particle::GpuParticleRendererDesc DecodeSpriteOutput(PyObject *output)
+{
+    particle::GpuParticleRendererDesc desc;
+    auto &semantics = desc.semantics;
+    if (!ReadBool(Field(output, "receive_scene_lighting"), semantics.receiveSceneLighting) ||
+        !ReadBool(Field(output, "receive_shadows"), semantics.receiveShadows) ||
+        !ReadBool(Field(output, "soft_particles"), semantics.softParticles) ||
+        !ReadFloat(Field(output, "soft_distance"), semantics.softDistance) ||
+        !ReadUnsigned(Field(output, "flipbook_columns"), desc.flipbookColumns) ||
+        !ReadUnsigned(Field(output, "flipbook_rows"), desc.flipbookRows) || desc.flipbookColumns == 0 ||
+        desc.flipbookRows == 0 || static_cast<uint64_t>(desc.flipbookColumns) * desc.flipbookRows > 65536u)
+        throw std::invalid_argument("WebGPU particle Sprite output parameters are invalid");
+
+    // The portable Web simulation exports an unsorted index stream.
+    semantics.sortMode = particle::ParticleSortMode::None;
+    PyObject *alignmentValue = Field(output, "sprite_alignment");
+    const char *alignment =
+        alignmentValue && PyUnicode_Check(alignmentValue) ? PyUnicode_AsUTF8(alignmentValue) : nullptr;
+    constexpr std::array<std::string_view, 4> names{"camera_plane", "camera_position", "axis", "velocity"};
+    const auto match = alignment ? std::find(names.begin(), names.end(), alignment) : names.end();
+    if (match == names.end()) {
+        PyErr_Clear();
+        throw std::invalid_argument("WebGPU particle Sprite alignment is invalid");
+    }
+    semantics.spriteAlignment = static_cast<particle::ParticleSpriteAlignment>(match - names.begin());
+    PyObject *axis = Field(output, "alignment_axis");
+    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> alignmentAxis(
+        axis ? PySequence_Fast(axis, "Sprite alignment axis requires three values") : nullptr, &Py_DecRef);
+    if (!alignmentAxis || PySequence_Fast_GET_SIZE(alignmentAxis.get()) != 3) {
+        PyErr_Clear();
+        throw std::invalid_argument("WebGPU particle Sprite alignment axis requires three values");
+    }
+    for (size_t index = 0; index < semantics.alignmentAxis.size(); ++index)
+        if (!ReadFloat(PySequence_Fast_GET_ITEM(alignmentAxis.get(), index), semantics.alignmentAxis[index]))
+            throw std::invalid_argument("WebGPU particle Sprite alignment axis is invalid");
+    if (!semantics.IsValid())
+        throw std::invalid_argument("WebGPU particle Sprite output semantics are invalid");
+
+    PyObject *material = Field(Field(output, "material"), "native");
+    if (!material || material == Py_None)
+        throw std::invalid_argument("WebGPU particle Sprite output requires a native material");
+    desc.material = pybind11::cast<std::shared_ptr<InxMaterial>>(pybind11::handle(material));
+    if (!desc.material || desc.material->IsDeleted())
+        throw std::invalid_argument("WebGPU particle Sprite material is unavailable");
+    ShaderLoader::PrepareMaterial(*desc.material);
+    desc.surface = desc.material->GetSelectedShaderArtifact();
+    if (!desc.surface || desc.surface->domain != ShaderProgramDomain::ParticleSprite)
+        throw std::invalid_argument("WebGPU particle Sprite output requires a particle Surface shader");
+    return desc;
 }
 
 struct FrameRequest
@@ -422,8 +283,19 @@ struct WebParticleRuntime::State
 {
     struct Graph
     {
-        uint64_t id = 0;
-        uint32_t slotCount = 0;
+        explicit Graph(WebGpuRhiDevice &owner) : device(owner)
+        {
+        }
+        ~Graph()
+        {
+            device.Release(playingStates);
+            device.Release(playingRequests);
+            device.Release(parameters);
+            device.Release(spawnMetadata);
+            device.Release(burstRequests);
+        }
+
+        WebGpuRhiDevice &device;
         std::vector<uint32_t> parameterWords;
         rhi::BufferHandle burstRequests;
         rhi::BufferHandle spawnMetadata;
@@ -434,12 +306,16 @@ struct WebParticleRuntime::State
 
     struct Emitter
     {
+        [[nodiscard]] bool Visible(uint32_t cameraMask) const noexcept
+        {
+            return drawReady && playing && (ownerLayerMask & cameraMask) != 0;
+        }
+
         uint64_t id = 0;
         uint64_t graphId = 0;
         uint64_t artifactRevision = 0;
         bool stateWasPreserved = false;
         uint32_t slot = 0;
-        uint32_t capacity = 0;
         uint32_t ownerLayerMask = 0;
         bool playing = true;
         bool resetPending = false;
@@ -447,118 +323,60 @@ struct WebParticleRuntime::State
         particle::GpuParticleTransforms transforms{};
         std::vector<FrameRequest> pending;
         std::unique_ptr<particle::ParticleGpuRuntime> runtime;
-        rhi::BindGroupHandle spawnGroup;
-        wgpu::Buffer outputBuffer;
-        wgpu::BindGroup renderGroup;
-        std::string textureGuid;
-        wgpu::TextureView boundTexture;
-        wgpu::Sampler boundSampler;
+        std::vector<std::unique_ptr<particle::ParticleGpuRenderer>> outputs;
     };
 
     WebGpuRhiDevice *rhi = nullptr;
     WebSceneRenderer *scene = nullptr;
-    wgpu::Device device;
-    wgpu::Queue queue;
-    rhi::PixelFormat colorFormat = rhi::PixelFormat::Undefined;
-    wgpu::RenderPipeline renderPipeline;
-    rhi::SampleCount renderSampleCount = rhi::SampleCount::One;
-    wgpu::BindGroupLayout cameraLayout;
-    wgpu::BindGroupLayout geometryLayout;
-    wgpu::Buffer cameraBuffer;
-    wgpu::BindGroup cameraGroup;
-    wgpu::BindGroupLayout depthLayout;
-    wgpu::BindGroup depthGroup;
-    wgpu::TextureView depthView;
-    std::unordered_map<uint64_t, Graph> graphs;
+    std::shared_ptr<const ShaderCompilation> spriteGeometry;
+    std::unordered_map<uint64_t, std::unique_ptr<Graph>> graphs;
     std::unordered_map<uint64_t, std::unique_ptr<Emitter>> emitters;
     std::unordered_set<uint64_t> capacityLimitedGraphs;
     std::unordered_map<uint64_t, uint64_t> capacityLimitedEmitterGraphs;
     std::unordered_map<uint64_t, uint64_t> capacityLimitedEmitterRevisions;
     std::string error;
     bool emissionSupported = true;
-    bool reportedReady = false;
     bool reportedDraw = false;
 
-    void ReleaseGraph(Graph &graph) noexcept
+    [[nodiscard]] uint64_t EmitterGraph(uint64_t id) const noexcept
     {
-        if (!rhi)
-            return;
-        rhi->Release(graph.playingStates);
-        rhi->Release(graph.playingRequests);
-        rhi->Release(graph.parameters);
-        rhi->Release(graph.spawnMetadata);
-        rhi->Release(graph.burstRequests);
-        graph = {};
+        if (const auto found = emitters.find(id); found != emitters.end())
+            return found->second->graphId;
+        const auto found = capacityLimitedEmitterGraphs.find(id);
+        return found == capacityLimitedEmitterGraphs.end() ? 0 : found->second;
     }
 
-    void ReleaseEmitter(Emitter &emitter) noexcept
-    {
-        emitter.renderGroup = {};
-        emitter.boundTexture = {};
-        emitter.boundSampler = {};
-        emitter.outputBuffer = {};
-        if (rhi)
-            rhi->Release(emitter.spawnGroup);
-        emitter.spawnGroup = {};
-        emitter.runtime.reset();
-    }
+    [[nodiscard]] std::string PrepareGraph(uint64_t graphId, PyObject *programs, PyObject *removeIds, State &staged,
+                                           std::unordered_set<uint64_t> &batchEmitterIds);
 
-    bool PrepareRenderGroup(Emitter &emitter)
+    void RemoveGraph(uint64_t id) noexcept
     {
-        const auto texture = scene->ResolveSampledTexture(emitter.textureGuid);
-        if (!texture.view || !texture.sampler)
-            return false;
-        if (emitter.renderGroup && emitter.boundTexture.Get() == texture.view.Get() &&
-            emitter.boundSampler.Get() == texture.sampler.Get())
-            return true;
-        std::array<wgpu::BindGroupEntry, 5> bindings{};
-        bindings[0].binding = 0;
-        bindings[0].buffer = rhi->GetNativeBuffer(emitter.runtime->InstanceBuffer());
-        bindings[0].size = static_cast<uint64_t>(emitter.capacity) * particle::ParticleGpuRuntime::RenderInstanceStride;
-        bindings[1].binding = 1;
-        bindings[1].buffer = rhi->GetNativeBuffer(emitter.runtime->RenderIndexBuffer());
-        bindings[1].size = static_cast<uint64_t>(emitter.capacity) * sizeof(uint32_t);
-        bindings[2].binding = 2;
-        bindings[2].buffer = emitter.outputBuffer;
-        bindings[2].size = sizeof(ParticleOutputData);
-        bindings[3].binding = 3;
-        bindings[3].textureView = texture.view;
-        bindings[4].binding = 4;
-        bindings[4].sampler = texture.sampler;
-        wgpu::BindGroupDescriptor descriptor;
-        descriptor.layout = geometryLayout;
-        descriptor.entryCount = bindings.size();
-        descriptor.entries = bindings.data();
-        emitter.renderGroup = device.CreateBindGroup(&descriptor);
-        emitter.boundTexture = texture.view;
-        emitter.boundSampler = texture.sampler;
-        return static_cast<bool>(emitter.renderGroup);
+        for (auto it = emitters.begin(); it != emitters.end();)
+            it = it->second->graphId == id ? emitters.erase(it) : std::next(it);
+        graphs.erase(id);
+        capacityLimitedGraphs.erase(id);
+        for (auto it = capacityLimitedEmitterGraphs.begin(); it != capacityLimitedEmitterGraphs.end();) {
+            if (it->second == id) {
+                capacityLimitedEmitterRevisions.erase(it->first);
+                it = capacityLimitedEmitterGraphs.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     void Clear() noexcept
     {
-        for (auto &[_, emitter] : emitters)
-            ReleaseEmitter(*emitter);
         emitters.clear();
-        for (auto &[_, graph] : graphs)
-            ReleaseGraph(graph);
         graphs.clear();
         capacityLimitedGraphs.clear();
         capacityLimitedEmitterGraphs.clear();
         capacityLimitedEmitterRevisions.clear();
-        renderPipeline = {};
-        cameraGroup = {};
-        cameraBuffer = {};
-        geometryLayout = {};
-        cameraLayout = {};
-        depthGroup = {};
-        depthView = {};
-        depthLayout = {};
-        queue = {};
-        device = {};
+        spriteGeometry.reset();
         rhi = nullptr;
         scene = nullptr;
         emissionSupported = true;
+        reportedDraw = false;
     }
 };
 
@@ -571,161 +389,26 @@ WebParticleRuntime::~WebParticleRuntime()
     Shutdown();
 }
 
-bool WebParticleRuntime::Initialize(WebGpuRhiDevice &device, WebSceneRenderer &scene, rhi::PixelFormat colorFormat,
-                                    rhi::SampleCount sceneSampleCount)
+bool WebParticleRuntime::Initialize(WebGpuRhiDevice &device, WebSceneRenderer &scene)
 {
     Shutdown();
-    m_state->rhi = &device;
-    m_state->scene = &scene;
-    m_state->device = device.NativeDevice();
-    m_state->queue = device.NativeQueue();
-    m_state->colorFormat = colorFormat;
-    if (!m_state->device || !m_state->queue || colorFormat == rhi::PixelFormat::Undefined) {
+    m_state->error.clear();
+    if (!device.NativeDevice() || !device.NativeQueue()) {
         m_state->error = "Web particle runtime requires a ready WebGPU device";
         return false;
     }
+    m_state->rhi = &device;
+    m_state->scene = &scene;
     constexpr uint32_t kRequiredParticleStorageBuffersPerStage = 12;
     const uint32_t availableStorageBuffers = device.GetCapabilities().limits.maxStorageBuffersPerStage;
     if (availableStorageBuffers < kRequiredParticleStorageBuffersPerStage) {
-        // Device limits are immutable for a WebGPU device. Keep the public
-        // particle control plane resident, but apply capacity backpressure at
-        // zero so scene startup and non-particle rendering remain available.
-        // A supported device takes the only full GPU implementation below.
+        // Keep the controls resident with zero emission capacity on smaller devices.
         m_state->emissionSupported = false;
-        m_state->reportedReady = true;
         std::printf("INFERNUX_WEBGPU_PARTICLE_CAPACITY_LIMIT available=%u required=%u emission=paused\n",
                     availableStorageBuffers, kRequiredParticleStorageBuffersPerStage);
-        return true;
+    } else {
+        std::printf("INFERNUX_WEBGPU_PARTICLE_RUNTIME_READY\n");
     }
-
-    wgpu::BufferDescriptor cameraBufferDesc;
-    cameraBufferDesc.size = sizeof(glm::mat4) + sizeof(glm::vec4) * 3;
-    cameraBufferDesc.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
-    m_state->cameraBuffer = m_state->device.CreateBuffer(&cameraBufferDesc);
-
-    wgpu::BindGroupLayoutEntry cameraEntry;
-    cameraEntry.binding = 0;
-    cameraEntry.visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
-    cameraEntry.buffer.type = wgpu::BufferBindingType::Uniform;
-    cameraEntry.buffer.minBindingSize = cameraBufferDesc.size;
-    wgpu::BindGroupLayoutDescriptor cameraLayoutDesc;
-    cameraLayoutDesc.entryCount = 1;
-    cameraLayoutDesc.entries = &cameraEntry;
-    m_state->cameraLayout = m_state->device.CreateBindGroupLayout(&cameraLayoutDesc);
-    wgpu::BindGroupEntry cameraBinding;
-    cameraBinding.binding = 0;
-    cameraBinding.buffer = m_state->cameraBuffer;
-    cameraBinding.size = cameraBufferDesc.size;
-    wgpu::BindGroupDescriptor cameraGroupDesc;
-    cameraGroupDesc.layout = m_state->cameraLayout;
-    cameraGroupDesc.entryCount = 1;
-    cameraGroupDesc.entries = &cameraBinding;
-    m_state->cameraGroup = m_state->device.CreateBindGroup(&cameraGroupDesc);
-
-    std::array<wgpu::BindGroupLayoutEntry, 5> geometryEntries{};
-    for (uint32_t index = 0; index < 2; ++index) {
-        geometryEntries[index].binding = index;
-        geometryEntries[index].visibility = wgpu::ShaderStage::Vertex;
-        geometryEntries[index].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
-    }
-    geometryEntries[2].binding = 2;
-    geometryEntries[2].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
-    geometryEntries[2].buffer.type = wgpu::BufferBindingType::Uniform;
-    geometryEntries[2].buffer.minBindingSize = sizeof(ParticleOutputData);
-    geometryEntries[3].binding = 3;
-    geometryEntries[3].visibility = wgpu::ShaderStage::Fragment;
-    geometryEntries[3].texture.sampleType = wgpu::TextureSampleType::Float;
-    geometryEntries[3].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    geometryEntries[4].binding = 4;
-    geometryEntries[4].visibility = wgpu::ShaderStage::Fragment;
-    geometryEntries[4].sampler.type = wgpu::SamplerBindingType::Filtering;
-    wgpu::BindGroupLayoutDescriptor geometryLayoutDesc;
-    geometryLayoutDesc.entryCount = geometryEntries.size();
-    geometryLayoutDesc.entries = geometryEntries.data();
-    m_state->geometryLayout = m_state->device.CreateBindGroupLayout(&geometryLayoutDesc);
-
-    if (!m_state->cameraBuffer || !m_state->cameraLayout || !m_state->cameraGroup || !m_state->geometryLayout ||
-        !ConfigureSampleCount(sceneSampleCount)) {
-        m_state->error = "WebGPU failed to create the particle render pipeline";
-        Shutdown();
-        return false;
-    }
-    std::printf("INFERNUX_WEBGPU_PARTICLE_RUNTIME_READY\n");
-    m_state->reportedReady = true;
-    return true;
-}
-
-bool WebParticleRuntime::ConfigureSampleCount(rhi::SampleCount sceneSampleCount)
-{
-    if (!m_state->device || (sceneSampleCount != rhi::SampleCount::One && sceneSampleCount != rhi::SampleCount::Four))
-        return false;
-    if (!m_state->emissionSupported)
-        return true;
-    if (m_state->renderPipeline && m_state->renderSampleCount == sceneSampleCount)
-        return true;
-    const auto colorFormat = m_state->colorFormat;
-
-    wgpu::BindGroupLayoutEntry depthEntry;
-    depthEntry.binding = 0;
-    depthEntry.visibility = wgpu::ShaderStage::Fragment;
-    depthEntry.texture.sampleType = wgpu::TextureSampleType::Depth;
-    depthEntry.texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    depthEntry.texture.multisampled = sceneSampleCount == rhi::SampleCount::Four;
-    wgpu::BindGroupLayoutDescriptor depthLayoutDesc;
-    depthLayoutDesc.entryCount = 1;
-    depthLayoutDesc.entries = &depthEntry;
-    const auto depthLayout = m_state->device.CreateBindGroupLayout(&depthLayoutDesc);
-    const std::string shaderText =
-        std::string(depthEntry.texture.multisampled ? kMultisampleDepthShader : kDepthShader) + kParticleShader;
-    wgpu::ShaderSourceWGSL shaderSource;
-    shaderSource.code = shaderText.c_str();
-    wgpu::ShaderModuleDescriptor shaderDesc;
-    shaderDesc.nextInChain = &shaderSource;
-    const auto shader = m_state->device.CreateShaderModule(&shaderDesc);
-    const std::array<wgpu::BindGroupLayout, 3> layouts = {m_state->cameraLayout, m_state->geometryLayout, depthLayout};
-    wgpu::PipelineLayoutDescriptor pipelineLayoutDesc;
-    pipelineLayoutDesc.bindGroupLayoutCount = layouts.size();
-    pipelineLayoutDesc.bindGroupLayouts = layouts.data();
-    wgpu::ColorTargetState colorTarget;
-    colorTarget.format = colorFormat == rhi::PixelFormat::BGRA8Srgb      ? wgpu::TextureFormat::BGRA8UnormSrgb
-                         : colorFormat == rhi::PixelFormat::RGBA8Srgb    ? wgpu::TextureFormat::RGBA8UnormSrgb
-                         : colorFormat == rhi::PixelFormat::RGBA8UNorm   ? wgpu::TextureFormat::RGBA8Unorm
-                         : colorFormat == rhi::PixelFormat::RGBA16SFloat ? wgpu::TextureFormat::RGBA16Float
-                                                                         : wgpu::TextureFormat::BGRA8Unorm;
-    wgpu::BlendState blend;
-    blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
-    blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    blend.alpha.srcFactor = wgpu::BlendFactor::One;
-    blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    colorTarget.blend = &blend;
-    wgpu::FragmentState fragment;
-    fragment.module = shader;
-    fragment.entryPoint = "fragment_main";
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
-    wgpu::DepthStencilState depth;
-    depth.format = wgpu::TextureFormat::Depth32Float;
-    depth.depthWriteEnabled = wgpu::OptionalBool::False;
-    depth.depthCompare = wgpu::CompareFunction::GreaterEqual;
-    wgpu::RenderPipelineDescriptor pipelineDesc;
-    pipelineDesc.layout = m_state->device.CreatePipelineLayout(&pipelineLayoutDesc);
-    pipelineDesc.vertex.module = shader;
-    pipelineDesc.vertex.entryPoint = "vertex_main";
-    pipelineDesc.fragment = &fragment;
-    pipelineDesc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    pipelineDesc.primitive.cullMode = wgpu::CullMode::None;
-    pipelineDesc.depthStencil = &depth;
-    pipelineDesc.multisample.count = static_cast<uint32_t>(sceneSampleCount);
-    const auto candidate = m_state->device.CreateRenderPipeline(&pipelineDesc);
-    if (!candidate) {
-        m_state->error = "WebGPU failed to create the particle render pipeline";
-        return false;
-    }
-    m_state->renderPipeline = candidate;
-    m_state->renderSampleCount = sceneSampleCount;
-    m_state->depthLayout = depthLayout;
-    m_state->depthGroup = {};
-    m_state->depthView = {};
     return true;
 }
 
@@ -737,272 +420,297 @@ void WebParticleRuntime::Shutdown() noexcept
 
 std::string WebParticleRuntime::ReplaceGraph(uint64_t graphInstanceId, PyObject *programs, PyObject *removeIds)
 {
-    if (!m_state->rhi || graphInstanceId == 0)
-        return "WebGPU particle runtime is not initialized";
-    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> programOwner(
-        PySequence_Fast(programs, "particle programs must be a sequence"), &Py_DecRef);
-    PyObject *programSequence = programOwner.get();
-    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> removeOwner(
-        PySequence_Fast(removeIds, "particle remove_ids must be a sequence"), &Py_DecRef);
-    PyObject *removeSequence = removeOwner.get();
-    if (!programSequence || !removeSequence) {
-        PyErr_Clear();
+    if (!programs || !removeIds)
         return "WebGPU particle graph publication contains an invalid sequence";
+    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> graphs(
+        Py_BuildValue("[{s:K,s:O,s:O}]", "graph_instance_id", static_cast<unsigned long long>(graphInstanceId),
+                      "programs", programs, "remove_ids", removeIds),
+        &Py_DecRef);
+    if (!graphs) {
+        PyErr_Clear();
+        return "WebGPU particle graph publication request could not be prepared";
     }
-    // Compile the complete replacement before touching the accepted graph.
-    // The same frozen stages and root contract serve Vulkan and WebGPU.
-    const Py_ssize_t programCount = PySequence_Fast_GET_SIZE(programSequence);
-    std::vector<std::array<ShaderTargetCode, static_cast<size_t>(particle::GpuKernelStage::Count)>> compiled(
-        programCount);
+    return ReplaceGraphs(graphs.get());
+}
+
+std::string WebParticleRuntime::ReplaceGraphs(PyObject *graphs)
+{
+    if (!m_state->rhi)
+        return "WebGPU particle runtime is not initialized";
+    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> sequence(
+        graphs ? PySequence_Fast(graphs, "particle graphs must be a sequence") : nullptr, &Py_DecRef);
+    if (!sequence || PySequence_Fast_GET_SIZE(sequence.get()) == 0) {
+        PyErr_Clear();
+        return "WebGPU particle graph publication batch requires graph requests";
+    }
+
+    State staged;
+    std::unordered_set<uint64_t> graphIds;
+    std::unordered_set<uint64_t> emitterIds;
     try {
-        if (m_state->emissionSupported) {
-            for (Py_ssize_t index = 0; index < programCount; ++index) {
-                PyObject *program = PySequence_Fast_GET_ITEM(programSequence, index);
-                PyObject *sources = Field(program, "kernel_sources");
-                for (size_t stage = 0; stage < kStageNames.size(); ++stage) {
-                    if (static_cast<particle::GpuKernelStage>(stage) == particle::GpuKernelStage::UpdateRenderingFused)
-                        continue;
-                    PyObject *source = sources ? Field(sources, kStageNames[stage]) : nullptr;
-                    if (!source || !PyUnicode_Check(source))
-                        return std::string("WebGPU particle stage source is missing: ") + kStageNames[stage];
-                    const std::string path = std::string("Particle/") + kStageNames[stage] + ".slang";
-                    compiled[index][stage] =
-                        CompileSlangNativeModule({"particle_" + std::to_string(index) + "_" + kStageNames[stage], path,
-                                                  PyUnicode_AsUTF8(source)},
-                                                 ShaderCodeTarget::Wgsl);
-                }
-            }
+        for (Py_ssize_t index = 0; index < PySequence_Fast_GET_SIZE(sequence.get()); ++index) {
+            PyObject *graph = PySequence_Fast_GET_ITEM(sequence.get(), index);
+            uint64_t graphId = 0;
+            if (!ReadUnsigned(Field(graph, "graph_instance_id"), graphId) || graphId == 0 ||
+                !graphIds.insert(graphId).second)
+                return "WebGPU particle publication batch contains an invalid or duplicate graph id";
+            if (auto error = m_state->PrepareGraph(graphId, Field(graph, "programs"), Field(graph, "remove_ids"),
+                                                   staged, emitterIds);
+                !error.empty())
+                return error;
         }
+        m_state->graphs.reserve(m_state->graphs.size() + staged.graphs.size());
+        m_state->emitters.reserve(m_state->emitters.size() + staged.emitters.size());
+        m_state->capacityLimitedGraphs.reserve(m_state->capacityLimitedGraphs.size() +
+                                               staged.capacityLimitedGraphs.size());
+        m_state->capacityLimitedEmitterGraphs.reserve(m_state->capacityLimitedEmitterGraphs.size() +
+                                                      staged.capacityLimitedEmitterGraphs.size());
+        m_state->capacityLimitedEmitterRevisions.reserve(m_state->capacityLimitedEmitterRevisions.size() +
+                                                         staged.capacityLimitedEmitterRevisions.size());
     } catch (const std::exception &error) {
+        PyErr_Clear();
         return error.what();
     }
-    for (Py_ssize_t index = 0; index < PySequence_Fast_GET_SIZE(removeSequence); ++index) {
-        uint64_t id = 0;
-        if (!ReadUnsigned(PySequence_Fast_GET_ITEM(removeSequence, index), id)) {
-            return "WebGPU particle remove_ids contains an invalid emitter id";
-        }
-        auto found = m_state->emitters.find(id);
-        if (found != m_state->emitters.end()) {
-            m_state->ReleaseEmitter(*found->second);
-            m_state->emitters.erase(found);
-        }
-        m_state->capacityLimitedEmitterGraphs.erase(id);
-        m_state->capacityLimitedEmitterRevisions.erase(id);
-    }
 
-    if (programCount == 0) {
-        auto graph = m_state->graphs.find(graphInstanceId);
-        if (graph != m_state->graphs.end()) {
-            m_state->ReleaseGraph(graph->second);
-            m_state->graphs.erase(graph);
-        }
-        m_state->capacityLimitedGraphs.erase(graphInstanceId);
-        for (auto iterator = m_state->capacityLimitedEmitterGraphs.begin();
-             iterator != m_state->capacityLimitedEmitterGraphs.end();) {
-            if (iterator->second != graphInstanceId) {
-                ++iterator;
-                continue;
-            }
-            m_state->capacityLimitedEmitterRevisions.erase(iterator->first);
-            iterator = m_state->capacityLimitedEmitterGraphs.erase(iterator);
-        }
-        return {};
-    }
-
-    uint32_t slotCount = 0;
-    std::vector<uint32_t> parameters;
-    std::vector<uint64_t> graphEmitterIds;
-    for (Py_ssize_t index = 0; index < programCount; ++index) {
-        PyObject *program = PySequence_Fast_GET_ITEM(programSequence, index);
-        std::string error;
-        uint64_t id = 0;
-        uint64_t encodedGraph = 0;
-        uint32_t slot = 0;
-        if (!ProgramUsesPortableSubset(program, error) || !ReadUnsigned(Field(program, "id"), id) || id == 0 ||
-            !ReadUnsigned(Field(program, "graph_instance_id"), encodedGraph) || encodedGraph != graphInstanceId ||
-            !ReadUnsigned(Field(program, "graph_emitter_index"), slot) || slot >= 1024) {
-            return error.empty() ? "WebGPU particle program identity is invalid" : error;
-        }
-        std::vector<uint32_t> words;
-        if (!ReadWordVector(Field(program, "parameter_words"), words)) {
-            return "WebGPU particle parameter block is invalid";
-        }
-        if (parameters.empty())
-            parameters = std::move(words);
-        else if (parameters != words) {
-            return "WebGPU particle emitters in one graph disagree on parameters";
-        }
-        slotCount = std::max(slotCount, slot + 1);
-        graphEmitterIds.push_back(id);
-    }
-    if (parameters.empty())
-        parameters.assign(4, 0);
-
-    if (!m_state->emissionSupported) {
-        for (auto iterator = m_state->capacityLimitedEmitterGraphs.begin();
-             iterator != m_state->capacityLimitedEmitterGraphs.end();) {
-            if (iterator->second != graphInstanceId) {
-                ++iterator;
-                continue;
-            }
-            m_state->capacityLimitedEmitterRevisions.erase(iterator->first);
-            iterator = m_state->capacityLimitedEmitterGraphs.erase(iterator);
-        }
-        for (Py_ssize_t index = 0; index < programCount; ++index) {
-            PyObject *program = PySequence_Fast_GET_ITEM(programSequence, index);
-            uint64_t emitterId = 0;
-            uint64_t artifactRevision = 0;
-            if (!ReadUnsigned(Field(program, "id"), emitterId) || emitterId == 0 ||
-                !ReadUnsigned(Field(program, "artifact_revision"), artifactRevision) || artifactRevision == 0) {
-                return "WebGPU capacity-limited particle program identity is invalid";
-            }
-            m_state->capacityLimitedEmitterGraphs[emitterId] = graphInstanceId;
-            m_state->capacityLimitedEmitterRevisions[emitterId] = artifactRevision;
-        }
-        m_state->capacityLimitedGraphs.insert(graphInstanceId);
-        return {};
-    }
-
-    for (auto iterator = m_state->emitters.begin(); iterator != m_state->emitters.end();) {
-        if (iterator->second->graphId != graphInstanceId) {
-            ++iterator;
-            continue;
-        }
-        m_state->ReleaseEmitter(*iterator->second);
-        iterator = m_state->emitters.erase(iterator);
-    }
-    auto oldGraph = m_state->graphs.find(graphInstanceId);
-    if (oldGraph != m_state->graphs.end()) {
-        m_state->ReleaseGraph(oldGraph->second);
-        m_state->graphs.erase(oldGraph);
-    }
-
-    State::Graph graph;
-    graph.id = graphInstanceId;
-    graph.slotCount = slotCount;
-    graph.parameterWords = parameters;
-    std::vector<uint32_t> zeros(slotCount, 0);
-    std::vector<uint32_t> playing(slotCount, 1);
-    graph.burstRequests = CreateStorageBuffer(*m_state->rhi, slotCount * sizeof(uint32_t), false, zeros.data());
-    graph.spawnMetadata = CreateStorageBuffer(*m_state->rhi, slotCount * kSpawnMetadataStride, true);
-    graph.parameters =
-        CreateStorageBuffer(*m_state->rhi, parameters.size() * sizeof(uint32_t), false, parameters.data());
-    graph.playingRequests = CreateStorageBuffer(*m_state->rhi, slotCount * sizeof(uint32_t), false, zeros.data());
-    graph.playingStates = CreateStorageBuffer(*m_state->rhi, slotCount * sizeof(uint32_t), false, playing.data());
-    if (!graph.burstRequests.IsValid() || !graph.spawnMetadata.IsValid() || !graph.parameters.IsValid() ||
-        !graph.playingRequests.IsValid() || !graph.playingStates.IsValid()) {
-        m_state->ReleaseGraph(graph);
-        return "WebGPU particle graph buffers could not be created";
-    }
-    m_state->graphs.emplace(graphInstanceId, std::move(graph));
-    auto &publishedGraph = m_state->graphs.at(graphInstanceId);
-
-    for (Py_ssize_t index = 0; index < programCount; ++index) {
-        PyObject *program = PySequence_Fast_GET_ITEM(programSequence, index);
-        auto emitter = std::make_unique<State::Emitter>();
-        uint32_t capacity = 0;
-        uint32_t stateStride = 0;
-        uint32_t eventTypes = 0;
-        uint32_t slot = 0;
-        if (!ReadUnsigned(Field(program, "id"), emitter->id) ||
-            !ReadUnsigned(Field(program, "graph_emitter_index"), slot) ||
-            !ReadUnsigned(Field(program, "owner_layer_mask"), emitter->ownerLayerMask) ||
-            !ReadUnsigned(Field(program, "artifact_revision"), emitter->artifactRevision) ||
-            !ReadUnsigned(Field(program, "capacity"), capacity) || capacity == 0 || capacity > (1u << 24u) ||
-            !ReadUnsigned(Field(program, "state_stride"), stateStride) || stateStride == 0 || stateStride % 16 != 0 ||
-            !ReadUnsigned(Field(program, "event_type_count"), eventTypes)) {
-            return "WebGPU particle program layout is invalid";
-        }
-        PyObject *hashObject = Field(program, "kernel_hash");
-        if (!hashObject || !PyUnicode_Check(hashObject)) {
-            return "WebGPU particle kernel hash is missing";
-        }
-        const char *kernelHash = PyUnicode_AsUTF8(hashObject);
-        if (!kernelHash || std::strlen(kernelHash) != 64) {
-            return "WebGPU particle kernel hash is invalid";
-        }
-        particle::GpuEmitterDesc desc;
-        desc.capacity = capacity;
-        desc.stateStride = stateStride;
-        desc.eventTypeCount = eventTypes;
-        // The fused Vulkan kernel exceeds the portable WebGPU per-stage
-        // storage-buffer budget. Keep simulation and render export as distinct
-        // GPU stages so each pipeline publishes only the resources it uses.
-        desc.supportsFusedUpdateRendering = false;
-        for (size_t stage = 0; stage < kStageNames.size(); ++stage) {
-            if (static_cast<particle::GpuKernelStage>(stage) == particle::GpuKernelStage::UpdateRenderingFused)
-                continue;
-            const auto &entry = compiled[index][stage].entries.front();
-            desc.kernels[stage] =
-                particle::ShaderBytecode::FromWgsl(entry.code.data(), entry.code.size(), entry.name.c_str());
-        }
-        emitter->graphId = graphInstanceId;
-        emitter->slot = slot;
-        emitter->capacity = capacity;
-        emitter->runtime = std::make_unique<particle::ParticleGpuRuntime>();
-        if (!emitter->runtime->Create(*m_state->rhi, desc)) {
-            return "WebGPU particle compute pipelines could not be created: " + m_state->rhi->LastError();
-        }
-        const particle::GpuParticleSimulationControl simulationControl{};
-        particle::GpuParticleSimulationControl enabledControl = simulationControl;
-        enabledControl.anyViewVisible = 1;
-        enabledControl.simulationAllowed = 1;
-        if (!m_state->rhi->WriteBuffer(emitter->runtime->SimulationControlBuffer(), 0, &enabledControl,
-                                       sizeof(enabledControl))) {
-            return "WebGPU particle simulation control could not be initialized";
-        }
-        rhi::BindGroupDesc spawnGroupDesc;
-        spawnGroupDesc.layout = emitter->runtime->GraphSpawnLayout();
-        spawnGroupDesc.buffers[spawnGroupDesc.bufferCount++] = {0, rhi::BindingType::StorageBuffer,
-                                                                publishedGraph.burstRequests};
-        spawnGroupDesc.buffers[spawnGroupDesc.bufferCount++] = {
-            1, rhi::BindingType::StorageBuffer, publishedGraph.spawnMetadata,
-            static_cast<uint64_t>(slot) * kSpawnMetadataStride, sizeof(WebSpawnMetadata)};
-        spawnGroupDesc.buffers[spawnGroupDesc.bufferCount++] = {2, rhi::BindingType::StorageBuffer,
-                                                                publishedGraph.parameters};
-        spawnGroupDesc.buffers[spawnGroupDesc.bufferCount++] = {3, rhi::BindingType::StorageBuffer,
-                                                                publishedGraph.playingRequests};
-        spawnGroupDesc.buffers[spawnGroupDesc.bufferCount++] = {4, rhi::BindingType::StorageBuffer,
-                                                                publishedGraph.playingStates};
-        emitter->spawnGroup = m_state->rhi->CreateBindGroup(spawnGroupDesc);
-
-        const auto instances = m_state->rhi->GetNativeBuffer(emitter->runtime->InstanceBuffer());
-        const auto indices = m_state->rhi->GetNativeBuffer(emitter->runtime->RenderIndexBuffer());
-        ParticleOutputData outputData;
-        if (!ReadOutputData(program, outputData, emitter->textureGuid)) {
-            PyErr_Clear();
-            return "WebGPU particle output material or flipbook layout is invalid";
-        }
-        wgpu::BufferDescriptor outputBufferDescriptor;
-        outputBufferDescriptor.size = sizeof(outputData);
-        outputBufferDescriptor.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
-        emitter->outputBuffer = m_state->device.CreateBuffer(&outputBufferDescriptor);
-        if (emitter->outputBuffer)
-            m_state->queue.WriteBuffer(emitter->outputBuffer, 0, &outputData, sizeof(outputData));
-        if (!emitter->spawnGroup.IsValid() || !emitter->outputBuffer || !instances || !indices) {
-            return "WebGPU particle bind groups could not be created";
-        }
-        std::printf("INFERNUX_WEBGPU_PARTICLE_OUTPUT_READY tint=%.4f,%.4f,%.4f,%.4f hdr=1\n", outputData.tint.x,
-                    outputData.tint.y, outputData.tint.z, outputData.tint.w);
-        m_state->emitters.emplace(emitter->id, std::move(emitter));
-    }
+    // Every candidate owns its buffers and surfaces before the accepted graphs retire.
+    for (const auto graphId : graphIds)
+        m_state->RemoveGraph(graphId);
+    const size_t publishedEmitters = staged.emitters.size();
+    m_state->graphs.merge(staged.graphs);
+    m_state->emitters.merge(staged.emitters);
+    m_state->capacityLimitedGraphs.merge(staged.capacityLimitedGraphs);
+    m_state->capacityLimitedEmitterGraphs.merge(staged.capacityLimitedEmitterGraphs);
+    m_state->capacityLimitedEmitterRevisions.merge(staged.capacityLimitedEmitterRevisions);
+    if (publishedEmitters != 0)
+        std::printf("INFERNUX_WEBGPU_PARTICLE_OUTPUT_READY geometry=slang emitters=%zu\n", publishedEmitters);
     return {};
 }
 
-std::string WebParticleRuntime::UpdateParameters(uint64_t graphInstanceId, PyObject *words)
+std::string WebParticleRuntime::State::PrepareGraph(uint64_t graphInstanceId, PyObject *programs, PyObject *removeIds,
+                                                    State &staged, std::unordered_set<uint64_t> &batchEmitterIds)
+{
+    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> programOwner(
+        programs ? PySequence_Fast(programs, "particle programs must be a sequence") : nullptr, &Py_DecRef);
+    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> removeOwner(
+        removeIds ? PySequence_Fast(removeIds, "particle remove_ids must be a sequence") : nullptr, &Py_DecRef);
+    if (!programOwner || !removeOwner) {
+        PyErr_Clear();
+        return "WebGPU particle graph publication contains an invalid sequence";
+    }
+
+    for (Py_ssize_t index = 0; index < PySequence_Fast_GET_SIZE(removeOwner.get()); ++index) {
+        uint64_t id = 0;
+        if (!ReadUnsigned(PySequence_Fast_GET_ITEM(removeOwner.get(), index), id) || id == 0 ||
+            !batchEmitterIds.insert(id).second)
+            return "WebGPU particle remove_ids contains an invalid or duplicate emitter id";
+        if (const auto owner = EmitterGraph(id); owner != 0 && owner != graphInstanceId)
+            return "WebGPU particle graph cannot remove another graph's emitter";
+    }
+    const Py_ssize_t programCount = PySequence_Fast_GET_SIZE(programOwner.get());
+    if (programCount == 0)
+        return PySequence_Fast_GET_SIZE(removeOwner.get()) == 0 ? "WebGPU particle graph update cannot be empty" : "";
+
+    auto &device = *rhi;
+    std::unique_ptr<Graph> graph;
+    std::unordered_map<uint64_t, std::unique_ptr<Emitter>> candidates;
+    std::unordered_set<uint32_t> slots;
+    uint32_t slotCount = 0;
+    std::vector<uint32_t> parameters;
+    for (Py_ssize_t index = 0; index < programCount; ++index) {
+        PyObject *program = PySequence_Fast_GET_ITEM(programOwner.get(), index);
+        std::string error;
+        uint64_t encodedGraph = 0;
+        auto emitter = std::make_unique<Emitter>();
+        emitter->graphId = graphInstanceId;
+        if (!ProgramUsesPortableSubset(program, error) || !ReadUnsigned(Field(program, "id"), emitter->id) ||
+            emitter->id == 0 || !ReadUnsigned(Field(program, "graph_instance_id"), encodedGraph) ||
+            encodedGraph != graphInstanceId || !ReadUnsigned(Field(program, "graph_emitter_index"), emitter->slot) ||
+            emitter->slot >= 1024 || !slots.insert(emitter->slot).second ||
+            !ReadUnsigned(Field(program, "artifact_revision"), emitter->artifactRevision) ||
+            emitter->artifactRevision == 0)
+            return error.empty() ? "WebGPU particle program identity is invalid" : error;
+        if (!batchEmitterIds.insert(emitter->id).second)
+            return "WebGPU particle publication batch contains duplicate or conflicting emitter ids";
+        if (const auto owner = EmitterGraph(emitter->id); owner != 0 && owner != graphInstanceId)
+            return "WebGPU particle emitter id already belongs to another graph";
+        std::vector<uint32_t> words;
+        if (!ReadWordVector(Field(program, "parameter_words"), words) || words.size() % 4 != 0)
+            return "WebGPU particle parameter block is invalid";
+        if (index == 0)
+            parameters = std::move(words);
+        else if (parameters != words)
+            return "WebGPU particle emitters in one graph disagree on parameters";
+        slotCount = std::max(slotCount, emitter->slot + 1);
+        const auto id = emitter->id;
+        candidates.emplace(id, std::move(emitter));
+    }
+    if (!emissionSupported) {
+        for (const auto &[id, emitter] : candidates) {
+            staged.capacityLimitedEmitterGraphs.emplace(id, graphInstanceId);
+            staged.capacityLimitedEmitterRevisions.emplace(id, emitter->artifactRevision);
+        }
+        staged.capacityLimitedGraphs.insert(graphInstanceId);
+        return {};
+    }
+
+    graph = std::make_unique<Graph>(device);
+    if (parameters.empty())
+        parameters.assign(4, 0);
+    graph->parameterWords = parameters;
+    const std::vector<uint32_t> zeros(slotCount, 0);
+    const std::vector<uint32_t> playing(slotCount, 1);
+    graph->burstRequests = CreateStorageBuffer(device, slotCount * sizeof(uint32_t), false, zeros.data());
+    graph->spawnMetadata = CreateStorageBuffer(device, slotCount * kSpawnMetadataStride, true);
+    graph->parameters = CreateStorageBuffer(device, parameters.size() * sizeof(uint32_t), false, parameters.data());
+    graph->playingRequests = CreateStorageBuffer(device, slotCount * sizeof(uint32_t), false, zeros.data());
+    graph->playingStates = CreateStorageBuffer(device, slotCount * sizeof(uint32_t), false, playing.data());
+    if (!graph->burstRequests.IsValid() || !graph->spawnMetadata.IsValid() || !graph->parameters.IsValid() ||
+        !graph->playingRequests.IsValid() || !graph->playingStates.IsValid())
+        return "WebGPU particle graph buffers could not be created";
+
+    try {
+        if (!spriteGeometry) {
+            const auto &geometry = GetSlangParticleGraphicsModules().front().module;
+            spriteGeometry = std::make_shared<const ShaderCompilation>(
+                SlangCompiler::Get().Compile(geometry, {}, {ShaderCodeTarget::Wgsl}));
+        }
+        for (Py_ssize_t index = 0; index < programCount; ++index) {
+            PyObject *program = PySequence_Fast_GET_ITEM(programOwner.get(), index);
+            uint64_t id = 0;
+            ReadUnsigned(Field(program, "id"), id);
+            auto &emitter = *candidates.at(id);
+            particle::GpuEmitterDesc desc;
+            if (!ReadUnsigned(Field(program, "owner_layer_mask"), emitter.ownerLayerMask) ||
+                !ReadUnsigned(Field(program, "capacity"), desc.capacity) || desc.capacity == 0 ||
+                desc.capacity > (1u << 24u) || !ReadUnsigned(Field(program, "state_stride"), desc.stateStride) ||
+                desc.stateStride == 0 || desc.stateStride % 16 != 0 ||
+                !ReadUnsigned(Field(program, "event_type_count"), desc.eventTypeCount))
+                return "WebGPU particle program layout is invalid";
+            PyObject *hash = Field(program, "kernel_hash");
+            const char *kernelHash = hash && PyUnicode_Check(hash) ? PyUnicode_AsUTF8(hash) : nullptr;
+            if (!kernelHash || std::strlen(kernelHash) != 64) {
+                PyErr_Clear();
+                return "WebGPU particle kernel hash is invalid";
+            }
+
+            // Web simulation records the update and render export separately.
+            desc.supportsFusedUpdateRendering = false;
+            PyObject *sources = Field(program, "kernel_sources");
+            std::array<ShaderTargetCode, kStageNames.size()> compiled;
+            for (size_t stage = 0; stage < kStageNames.size(); ++stage) {
+                if (static_cast<particle::GpuKernelStage>(stage) == particle::GpuKernelStage::UpdateRenderingFused)
+                    continue;
+                PyObject *value = Field(sources, kStageNames[stage]);
+                const char *text = value && PyUnicode_Check(value) ? PyUnicode_AsUTF8(value) : nullptr;
+                if (!text) {
+                    PyErr_Clear();
+                    return std::string("WebGPU particle stage source is missing: ") + kStageNames[stage];
+                }
+                const std::string sourcePath = std::string("Particle/") + kStageNames[stage] + ".slang";
+                compiled[stage] = CompileSlangNativeModule(
+                    {"particle_" + std::to_string(index) + "_" + kStageNames[stage], sourcePath, text},
+                    ShaderCodeTarget::Wgsl);
+            }
+            desc.reflectedKernels = &compiled;
+            desc.reflectedSpawnBindings = {
+                {0, rhi::BindingType::StorageBuffer, graph->burstRequests},
+                {1, rhi::BindingType::StorageBuffer, graph->spawnMetadata,
+                 static_cast<uint64_t>(emitter.slot) * kSpawnMetadataStride, sizeof(WebSpawnMetadata)},
+                {2, rhi::BindingType::StorageBuffer, graph->parameters},
+                {3, rhi::BindingType::StorageBuffer, graph->playingRequests},
+                {4, rhi::BindingType::StorageBuffer, graph->playingStates},
+            };
+            emitter.runtime = std::make_unique<particle::ParticleGpuRuntime>();
+            if (!emitter.runtime->Create(device, desc))
+                return "WebGPU particle compute pipelines could not be created: " + device.LastError();
+            particle::GpuParticleSimulationControl control{};
+            control.anyViewVisible = 1;
+            control.simulationAllowed = 1;
+            if (!device.WriteBuffer(emitter.runtime->SimulationControlBuffer(), 0, &control, sizeof(control)))
+                return "WebGPU particle simulation control could not be initialized";
+            const std::unique_ptr<PyObject, decltype(&Py_DecRef)> outputs(
+                PySequence_Fast(Field(program, "outputs"), "particle outputs must be a sequence"), &Py_DecRef);
+            if (!outputs) {
+                PyErr_Clear();
+                return "WebGPU particle outputs are invalid";
+            }
+            for (Py_ssize_t outputIndex = 0; outputIndex < PySequence_Fast_GET_SIZE(outputs.get()); ++outputIndex) {
+                auto output = DecodeSpriteOutput(PySequence_Fast_GET_ITEM(outputs.get(), outputIndex));
+                output.geometry = spriteGeometry;
+                output.instances = emitter.runtime->InstanceBuffer();
+                output.renderIndices = emitter.runtime->RenderIndexBuffer();
+                output.textureResolver =
+                    [scene = this->scene, material = output.material,
+                     textureViews = std::unordered_map<std::string, std::weak_ptr<const rhi::TextureGpuView>>{}](
+                        const std::string &guid, const std::string &binding,
+                        particle::GpuParticleTextureRequest) mutable -> particle::GpuBillboardTextureLease {
+                    auto texture = scene->ResolveSampledTexture(guid, material->GetTextureSampler(binding));
+                    if (!texture)
+                        return {};
+                    const auto handle = texture->GetView();
+                    const auto sampler = texture->GetSampler();
+                    auto &previous = textureViews[binding];
+                    auto view = previous.lock();
+                    if (!view || view->GetView() != handle || view->GetSampler() != sampler) {
+                        const uint64_t revision = (static_cast<uint64_t>(handle.generation) << 32u) | handle.index;
+                        view = std::make_shared<const rhi::TextureGpuView>(
+                            guid.empty() ? "white" : guid, revision, texture->GetTexture(), handle, sampler,
+                            texture->GetResidentBytes(), texture, texture->GetFormat(), texture->GetViewDesc(),
+                            texture->GetUploadSubmission());
+                        previous = view;
+                    }
+                    return {particle::GpuBillboardTextureStatus::Ready, handle, sampler, {}, std::move(view)};
+                };
+                auto renderer = std::make_unique<particle::ParticleGpuRenderer>();
+                if (!renderer->Create(device, output))
+                    return "WebGPU particle Slang surface bindings could not be created: " + device.LastError();
+                emitter.outputs.push_back(std::move(renderer));
+            }
+        }
+    } catch (const std::exception &error) {
+        PyErr_Clear();
+        return error.what();
+    }
+    staged.graphs.emplace(graphInstanceId, std::move(graph));
+    staged.emitters.merge(candidates);
+    return {};
+}
+
+std::string WebParticleRuntime::UpdateParameters(uint64_t graphInstanceId, PyObject *updates)
 {
     if (!m_state->emissionSupported)
         return m_state->capacityLimitedGraphs.find(graphInstanceId) != m_state->capacityLimitedGraphs.end()
                    ? std::string{}
                    : "WebGPU particle graph is not resident";
-    auto found = m_state->graphs.find(graphInstanceId);
-    std::vector<uint32_t> decoded;
-    if (found == m_state->graphs.end() || !ReadWordVector(words, decoded) ||
-        decoded.size() != found->second.parameterWords.size())
-        return "WebGPU particle parameter update does not match a live graph";
-    if (!m_state->rhi->WriteBuffer(found->second.parameters, 0, decoded.data(), decoded.size() * sizeof(uint32_t)))
+    const auto found = m_state->graphs.find(graphInstanceId);
+    if (found == m_state->graphs.end())
+        return "WebGPU particle graph is not resident";
+    const std::unique_ptr<PyObject, decltype(&Py_DecRef)> sequence(
+        updates ? PySequence_Fast(updates, "particle parameter updates must be a sequence") : nullptr, &Py_DecRef);
+    if (!sequence || PySequence_Fast_GET_SIZE(sequence.get()) == 0) {
+        PyErr_Clear();
+        return "WebGPU particle parameter update is invalid";
+    }
+    auto decoded = found->second->parameterWords;
+    for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE(sequence.get()); ++i) {
+        const std::unique_ptr<PyObject, decltype(&Py_DecRef)> update(
+            PySequence_Fast(PySequence_Fast_GET_ITEM(sequence.get(), i),
+                            "particle parameter update needs offset and words"),
+            &Py_DecRef);
+        uint32_t offset = 0;
+        std::vector<uint32_t> words;
+        if (!update || PySequence_Fast_GET_SIZE(update.get()) != 2 ||
+            !ReadUnsigned(PySequence_Fast_GET_ITEM(update.get(), 0), offset) ||
+            !ReadWordVector(PySequence_Fast_GET_ITEM(update.get(), 1), words) || offset > decoded.size() ||
+            words.size() > decoded.size() - offset) {
+            PyErr_Clear();
+            return "WebGPU particle parameter update does not match the graph's parameter layout";
+        }
+        std::copy(words.begin(), words.end(), decoded.begin() + offset);
+    }
+    if (!m_state->rhi->WriteBuffer(found->second->parameters, 0, decoded.data(), decoded.size() * sizeof(uint32_t)))
         return "WebGPU particle parameter upload failed";
-    found->second.parameterWords = std::move(decoded);
+    found->second->parameterWords = std::move(decoded);
     return {};
 }
 
@@ -1063,7 +771,7 @@ bool WebParticleRuntime::SetPlaying(uint64_t emitterId, bool playing)
     if (graph == m_state->graphs.end())
         return false;
     const uint32_t value = playing ? 1u : 0u;
-    if (!m_state->rhi->WriteBuffer(graph->second.playingStates,
+    if (!m_state->rhi->WriteBuffer(graph->second->playingStates,
                                    static_cast<uint64_t>(found->second->slot) * sizeof(uint32_t), &value,
                                    sizeof(value)))
         return false;
@@ -1139,18 +847,16 @@ bool WebParticleRuntime::RecordCompute(wgpu::CommandEncoder commandEncoder)
         }
         for (const FrameRequest &request : currentEmitter->pending) {
             if (currentEmitter->runtime->NeedsBootstrap() && !recordStage([&](const auto &commands) {
-                    return currentEmitter->runtime->RecordBootstrap(commands, request.systemSeed,
-                                                                    currentEmitter->spawnGroup);
+                    return currentEmitter->runtime->RecordBootstrap(commands, request.systemSeed, {});
                 })) {
                 m_state->error = "WebGPU particle bootstrap recording failed";
                 return false;
             }
             if (request.simulate && request.spawnCount > 0) {
                 if (!recordStage([&](const auto &commands) {
-                        currentEmitter->runtime->RecordInitIndirect(commands, request.spawnCount, request.spawnBaseId,
-                                                                    request.spawnGeneration, request.systemSeed,
-                                                                    request.simulationStep, request.deltaTime,
-                                                                    currentEmitter->spawnGroup, {}, 0);
+                        currentEmitter->runtime->RecordInitIndirect(
+                            commands, request.spawnCount, request.spawnBaseId, request.spawnGeneration,
+                            request.systemSeed, request.simulationStep, request.deltaTime, {}, {}, 0);
                         return true;
                     })) {
                     m_state->error = "WebGPU particle initialization recording failed";
@@ -1159,35 +865,28 @@ bool WebParticleRuntime::RecordCompute(wgpu::CommandEncoder commandEncoder)
             }
             if (request.simulate) {
                 const bool resetRecorded = recordStage([&](const auto &commands) {
-                    return currentEmitter->runtime->RecordRenderReset(commands, currentEmitter->spawnGroup, false,
-                                                                      true);
+                    return currentEmitter->runtime->RecordRenderReset(commands, {}, false, true);
                 });
-                const bool updateRecorded = resetRecorded && recordStage([&](const auto &commands) {
-                                                return currentEmitter->runtime->RecordUpdate(
-                                                    commands, request.systemSeed, request.simulationStep,
-                                                    request.deltaTime, currentEmitter->spawnGroup);
-                                            });
+                const bool updateRecorded =
+                    resetRecorded && recordStage([&](const auto &commands) {
+                        return currentEmitter->runtime->RecordUpdate(commands, request.systemSeed,
+                                                                     request.simulationStep, request.deltaTime, {});
+                    });
                 if (!updateRecorded) {
                     m_state->error = "WebGPU particle simulation recording failed";
                     return false;
                 }
                 currentEmitter->runtime->PublishAliveWrite();
-                if (request.render && !recordStage([&](const auto &commands) {
-                        return currentEmitter->runtime->RecordRendering(
-                            commands, request.systemSeed, request.simulationStep, currentEmitter->spawnGroup);
-                    })) {
-                    m_state->error = "WebGPU particle rendering export failed";
-                    return false;
-                }
-            } else if (request.render) {
-                const bool resetRecorded = recordStage([&](const auto &commands) {
-                    return currentEmitter->runtime->RecordRenderReset(commands, currentEmitter->spawnGroup);
-                });
-                const bool renderingRecorded =
-                    resetRecorded && recordStage([&](const auto &commands) {
-                        return currentEmitter->runtime->RecordRendering(
-                            commands, request.systemSeed, request.simulationStep, currentEmitter->spawnGroup);
-                    });
+            }
+            if (request.render) {
+                // Update may have published a different alive list. Prepare
+                // its indirect dispatch arguments before recording render export.
+                const bool resetRecorded = recordStage(
+                    [&](const auto &commands) { return currentEmitter->runtime->RecordRenderReset(commands, {}); });
+                const bool renderingRecorded = resetRecorded && recordStage([&](const auto &commands) {
+                                                   return currentEmitter->runtime->RecordRendering(
+                                                       commands, request.systemSeed, request.simulationStep, {});
+                                               });
                 if (!renderingRecorded) {
                     m_state->error = "WebGPU particle rendering export failed";
                     return false;
@@ -1206,69 +905,68 @@ void WebParticleRuntime::NotifySubmission() noexcept
         emitter->runtime->NotifySubmission(true);
 }
 
-bool WebParticleRuntime::HasRenderWork(uint32_t cameraMask) const noexcept
+bool WebParticleRuntime::RequiresSceneDepth(uint32_t cameraMask, int32_t queueMin, int32_t queueMax) const noexcept
 {
-    return m_state->emissionSupported && m_state->renderPipeline &&
-           std::any_of(m_state->emitters.begin(), m_state->emitters.end(), [cameraMask](const auto &entry) {
-               const auto &emitter = *entry.second;
-               return emitter.drawReady && emitter.playing && (emitter.ownerLayerMask & cameraMask) != 0;
-           });
+    for (const auto &[_, emitter] : m_state->emitters) {
+        if (!emitter->Visible(cameraMask))
+            continue;
+        for (const auto &output : emitter->outputs) {
+            const auto queue = output->RenderQueue();
+            if (queueMin <= queue && queue <= queueMax && output->RequiresSceneDepth())
+                return true;
+        }
+    }
+    return false;
 }
 
-bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height)
+bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, const RenderViewData &view,
+                                const ShaderViewBindings &bindings, const MaterialPassPipelineDescriptor &target,
+                                int32_t queueMin, int32_t queueMax, rhi::TextureViewHandle sceneDepth,
+                                bool sceneDepthIsDepth)
 {
-    if (!m_state->emissionSupported || !m_state->renderPipeline || !pass)
+    if (!m_state->rhi || !pass || target.colorFormats.size() != 1 ||
+        (target.target != ShaderCompileTarget::Forward && target.target != ShaderCompileTarget::ForwardPlus))
         return false;
-    camera.SetAspectRatio(static_cast<float>(width) / static_cast<float>(std::max(1u, height)));
-    struct CameraData
-    {
-        glm::mat4 viewProjection{1.0f};
-        glm::vec4 right{1.0f, 0.0f, 0.0f, 0.0f};
-        glm::vec4 up{0.0f, 1.0f, 0.0f, 0.0f};
-        glm::vec4 depthReconstruct{};
-    } data;
-    data.viewProjection = ToWebClipSpace(camera.GetViewProjectionMatrix());
-    const glm::mat4 cameraToWorld = glm::inverse(camera.GetViewMatrix());
-    data.right = glm::vec4(glm::normalize(glm::vec3(cameraToWorld[0])), 0.0f);
-    data.up = glm::vec4(glm::normalize(glm::vec3(cameraToWorld[1])), 0.0f);
-    const auto projection = camera.GetProjectionMatrix();
-    data.depthReconstruct = {projection[2][2], projection[3][2], projection[2][3], projection[3][3]};
-    const auto depthView = m_state->scene->GetDepthView();
-    if (!depthView)
-        return false;
-    if (!m_state->depthGroup || m_state->depthView.Get() != depthView.Get()) {
-        wgpu::BindGroupEntry entry;
-        entry.binding = 0;
-        entry.textureView = depthView;
-        wgpu::BindGroupDescriptor descriptor;
-        descriptor.layout = m_state->depthLayout;
-        descriptor.entryCount = 1;
-        descriptor.entries = &entry;
-        m_state->depthGroup = m_state->device.CreateBindGroup(&descriptor);
-        m_state->depthView = depthView;
-    }
-    m_state->queue.WriteBuffer(m_state->cameraBuffer, 0, &data, sizeof(data));
-    pass.SetPipeline(m_state->renderPipeline);
-    pass.SetBindGroup(0, m_state->cameraGroup);
-    pass.SetBindGroup(2, m_state->depthGroup);
+
+    const glm::mat4 cameraToWorld = glm::inverse(view.view);
+    const glm::vec3 right = glm::normalize(glm::vec3(cameraToWorld[0]));
+    const glm::vec3 up = glm::normalize(glm::vec3(cameraToWorld[1]));
+    particle::GpuParticleViewConstants constants;
+    constants.cameraRight = {right.x, right.y, right.z, 0.0f};
+    constants.cameraUp = {up.x, up.y, up.z, 0.0f};
+    const auto &projection = view.projection;
+    constants.depthReconstruct = {projection[2][2], projection[3][2], projection[2][3], projection[3][3]};
+    constants.alignmentReference = {view.position.x, view.position.y, view.position.z, 0.0f};
+
+    WebGpuGraphicsCommandContext context;
+    const auto encoder = m_state->rhi->MakeGraphicsCommandEncoder(context, pass);
     bool drew = false;
     for (const auto &[_, emitter] : m_state->emitters) {
-        if (!emitter->drawReady || !emitter->playing || (emitter->ownerLayerMask & camera.GetCullingMask()) == 0)
+        if (!emitter->Visible(view.cullingMask))
             continue;
-        if (!m_state->PrepareRenderGroup(*emitter))
-            continue;
-        const auto indirect = m_state->rhi->GetNativeBuffer(emitter->runtime->IndirectBuffer());
-        if (!indirect)
-            continue;
-        pass.SetBindGroup(1, emitter->renderGroup);
-        pass.DrawIndirect(indirect, 0);
-        drew = true;
+        constants.objectData[2] = emitter->ownerLayerMask;
+        for (const auto &output : emitter->outputs) {
+            const auto queue = output->RenderQueue();
+            if (queue < queueMin || queue > queueMax)
+                continue;
+            const auto depth = output->RequiresSceneDepth() ? sceneDepth : rhi::TextureViewHandle{};
+            if (output->RecordDraw(encoder, target, emitter->runtime->IndirectBuffer(), constants, bindings, {}, depth,
+                                   sceneDepthIsDepth))
+                drew = true;
+        }
     }
     if (drew && !m_state->reportedDraw) {
         std::printf("INFERNUX_WEBGPU_PARTICLE_DRAW_READY emitters=%zu\n", m_state->emitters.size());
         m_state->reportedDraw = true;
     }
     return drew;
+}
+
+void WebParticleRuntime::ReleaseView(rhi::BufferHandle globals) noexcept
+{
+    for (const auto &[_, emitter] : m_state->emitters)
+        for (auto &output : emitter->outputs)
+            output->ReleaseView(globals);
 }
 
 const std::string &WebParticleRuntime::LastError() const noexcept

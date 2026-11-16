@@ -13,6 +13,7 @@
 #include <core/types/ColorSpace.h>
 #include <function/renderer/MaterialSamplerState.h>
 #include <function/renderer/RenderInstanceHistory.h>
+#include <function/renderer/RenderViewHistory.h>
 #include <function/renderer/RenderWorld.h>
 #include <function/renderer/SceneMaterialPass.h>
 #include <function/renderer/TextureUploadBuilder.h>
@@ -53,14 +54,41 @@ std::string SamplerIdentity(const MaterialTextureSampler &sampler)
            std::to_string(static_cast<uint32_t>(sampler.addressW));
 }
 
-UniformBufferObject CameraUniform(const RenderViewData &view)
+bool PassIncludesDraw(const GraphCommandDesc &command, const DrawCall &draw, bool sky)
+{
+    const bool shadow = command.type == GraphCommandType::DrawShadowCasters;
+    if (!draw.material || sky != (command.type == GraphCommandType::DrawSkybox) ||
+        (shadow ? !draw.castsShadows : !draw.frustumVisible))
+        return false;
+    const auto &source = draw.material;
+    if (!sky && (source->GetRenderQueue() < command.queueMin || source->GetRenderQueue() > command.queueMax))
+        return false;
+    if (command.rendererSelection && !command.rendererSelection->Find(draw.identity))
+        return false;
+    const auto &tag = source->GetPassTag();
+    if (!sky && !command.passTag.empty() &&
+        ((command.overrideMaterialValue && tag != command.passTag) ||
+         (!command.overrideMaterialValue && !tag.empty() && tag != command.passTag)))
+        return false;
+    const auto &material = command.rendererSelection ? command.rendererSelection->Material()
+                           : command.overrideMaterialValue ? command.overrideMaterialValue : source;
+    const auto &artifact = material->GetSelectedShaderArtifact();
+    if (!artifact || (shadow && !artifact->FindVariant(ShaderCompileTarget::Shadow)))
+        return false;
+    const bool deferred = artifact->FindVariant(ShaderCompileTarget::GBuffer) != nullptr;
+    return (command.materialFilter != GraphMaterialFilter::DeferredCompatible || deferred) &&
+           (command.materialFilter != GraphMaterialFilter::DeferredUnsupported || !deferred);
+}
+
+UniformBufferObject CameraUniform(const RenderViewData &view, const glm::mat4 &projection,
+                                  const glm::mat4 &previousViewProjection)
 {
     UniformBufferObject value{};
     value.model = glm::mat4(1);
     value.view = view.view;
-    value.proj = view.projection;
-    value.previousViewProj = view.viewProjection;
-    value.inverseViewProj = glm::inverse(view.viewProjection);
+    value.proj = projection;
+    value.previousViewProj = previousViewProjection;
+    value.inverseViewProj = glm::inverse(projection * view.view);
     value.projectionParams = {view.nearClip, view.farClip, 1.0f / view.farClip, view.nearClip / view.farClip};
     value.zBufferParams = depth::LinearizationParams(view.nearClip, view.farClip);
     return value;
@@ -74,7 +102,7 @@ struct WebSceneRenderer::Impl
     uint32_t width = 0, height = 0;
     uint32_t shadowResolution = 0;
     Texture depth;
-    Texture white, black, normal;
+    Texture white, black, normal, defaultShadow;
     bool skyEnabled = true, shadowsEnabled = true;
     uint64_t frameIndex = 0;
     EngineGlobalsUBO frameGlobals;
@@ -135,6 +163,12 @@ struct WebSceneRenderer::Impl
         bool usesGrid = false;
         rhi::TextureViewHandle fullscreenShadow;
         std::shared_ptr<const RenderGraphDescription> graph;
+        std::shared_ptr<const RenderViewData> acceptedView;
+        glm::mat4 previousViewProjection{1.0f};
+        float previousTime = 0.f;
+        uint32_t temporalSample = 0;
+        bool useMotion = false;
+        RenderInstanceHistory motion;
         std::unordered_map<RenderDrawIdentity, Material, RenderDrawIdentityHash> materials;
     };
     std::unordered_map<uint64_t, ViewResources> views;
@@ -148,9 +182,13 @@ struct WebSceneRenderer::Impl
         uint64_t vertexBytes = 0;
         MeshIndexFormat indexFormat;
         Material *material = nullptr;
+        std::shared_ptr<const RenderPoseValue> previousPose;
         uint32_t instance = 0;
         bool sky = false, ready = false;
     };
+    glm::mat4 preparedProjection{1.0f};
+    glm::mat4 preparedViewProjection{1.0f};
+    glm::vec2 preparedJitter{0.0f};
     std::vector<Draw> draws;
     std::vector<size_t> orderedDraws;
 
@@ -257,7 +295,7 @@ struct WebSceneRenderer::Impl
         TextureUploadBatch upload(*source, sampler);
         return device->UploadTexture(upload.GetRequest());
     }
-    Texture ResolveTexture(const std::string &guid, const MaterialTextureSampler &sampler)
+    Texture ResolveTexture(const std::string &guid, const MaterialTextureSampler &sampler, bool requiredAsset = false)
     {
         if (guid.empty() || guid == "white" || guid == "White")
             return white;
@@ -274,6 +312,8 @@ struct WebSceneRenderer::Impl
         }
         case WebTextureAssetLoad::Result::Missing:
             entry.image.reset();
+            if (requiredAsset)
+                throw std::invalid_argument("Render graph texture asset is unavailable: " + guid);
             break;
         default:
             break;
@@ -356,20 +396,31 @@ struct WebSceneRenderer::Impl
             draw.vertexBuffer = mesh.vertices->GetBuffer();
         draw.instance = static_cast<uint32_t>(modelValues.size());
         modelValues.push_back(source.worldMatrix);
+        const auto *previous = current->useMotion
+                                   ? current->motion.Previous(source.identity, source.skinContinuity, source.devicePose)
+                                   : nullptr;
         GPUSkinInstanceData skin;
         if (source.skinBoneMatrices && !source.skinBoneMatrices->empty()) {
-            skin.boneOffset = skin.previousBoneOffset = boneValues.size();
-            skin.boneCount = source.skinBoneMatrices->size();
+            const auto appendPalette = [&](const std::vector<glm::mat4> &palette) {
+                const auto offset = static_cast<uint32_t>(boneValues.size());
+                boneValues.insert(boneValues.end(), palette.begin(), palette.end());
+                return offset;
+            };
+            skin.boneOffset = appendPalette(*source.skinBoneMatrices);
+            skin.previousBoneOffset = previous && previous->skin && previous->skin != source.skinBoneMatrices
+                                          ? appendPalette(*previous->skin) : skin.boneOffset;
+            skin.boneCount = static_cast<uint32_t>(source.skinBoneMatrices->size());
             skin.flags = kGPUSkinFlagEnabled;
-            boneValues.insert(boneValues.end(), source.skinBoneMatrices->begin(), source.skinBoneMatrices->end());
         }
         skinValues.push_back(skin);
-        GPUInstanceAuxData auxiliary;
-        auxiliary.previousModel = source.worldMatrix;
-        auxiliary.objectId = PackGPUObjectId(source.objectId);
-        auxiliary.layerMask = source.layerMask;
-        auxiliary.flags = source.receivesShadows ? 0 : kGPUInstanceAuxFlagNoReceiveShadows;
-        ApplyDevicePose(auxiliary, source.devicePose);
+        const auto id = source.pickingObjectId ? source.pickingObjectId : source.objectId;
+        GPUInstanceAuxData auxiliary{previous ? previous->model : source.worldMatrix, PackGPUObjectId(id),
+                                     (previous ? kGPUInstanceAuxFlagValidHistory : 0u) |
+                                         (source.receivesShadows ? 0u : kGPUInstanceAuxFlagNoReceiveShadows),
+                                     source.layerMask};
+        if (previous)
+            draw.previousPose = previous->devicePose.value;
+        ApplyDevicePose(auxiliary, source.devicePose, previous ? &previous->devicePose : nullptr);
         instanceValues.push_back(auxiliary);
         draws.push_back(std::move(draw));
     }
@@ -391,6 +442,11 @@ struct WebSceneRenderer::Impl
             }
             if (binding.type == rhi::BindingType::StorageBuffer) {
                 auto buffer = material.GetBuffer(resource.name);
+                if (draw.source.parameterBlock) {
+                    const auto updated = draw.source.parameterBlock->buffers.find(resource.name);
+                    if (updated != draw.source.parameterBlock->buffers.end())
+                        buffer = updated->second;
+                }
                 if (!buffer)
                     throw std::invalid_argument("Scene material buffer is not assigned: " + resource.name);
                 addBuffer(AcceptedBuffer(buffer), buffer->GetByteSize());
@@ -443,7 +499,8 @@ struct WebSceneRenderer::Impl
             }
         }
         if (resource.set == 2) {
-            const auto &pose = draw.source.devicePose.value;
+            const auto &pose = binding.binding == 5 && draw.previousPose ? draw.previousPose
+                                                                               : draw.source.devicePose.value;
             switch (binding.binding) {
             case 0:
                 addOwned(current->globals);
@@ -509,6 +566,9 @@ struct WebSceneRenderer::Impl
                                                                 ? rhi::IndexFormat::Uint16
                                                                 : rhi::IndexFormat::Uint32);
         commands.DrawIndexed(draw.source.indexCount, 1, draw.source.indexStart, draw.source.vertexStart, draw.instance);
+        if (descriptor.target == ShaderCompileTarget::Motion)
+            current->motion.Record(draw.source.identity, draw.source.worldMatrix, draw.source.skinBoneMatrices,
+                                   draw.source.skinContinuity, draw.source.devicePose);
     }
 };
 
@@ -613,14 +673,15 @@ void WebSceneRenderer::SetShadowsEnabledForDiagnostics(bool enabled) noexcept
 {
     m_impl->shadowsEnabled = enabled;
 }
-WebSceneRenderer::SampledTexture WebSceneRenderer::ResolveSampledTexture(const std::string &guid,
-                                                                         const MaterialTextureSampler *sampler)
+std::shared_ptr<const rhi::TextureResource>
+WebSceneRenderer::ResolveSampledTexture(const std::string &guid, const MaterialTextureSampler *sampler)
 {
-    auto &s = *m_impl;
-    auto value = s.ResolveTexture(guid, sampler ? *sampler : MaterialTextureSampler{});
-    return value ? SampledTexture{s.device->GetNativeTextureView(value->GetView()),
-                                  s.device->GetNativeSampler(value->GetSampler())}
-                 : SampledTexture{};
+    return m_impl->ResolveTexture(guid, sampler ? *sampler : MaterialTextureSampler{});
+}
+
+std::shared_ptr<const rhi::TextureResource> WebSceneRenderer::ResolveGraphTextureAsset(const std::string &guid)
+{
+    return m_impl->ResolveTexture(guid, {}, true);
 }
 
 std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, uint32_t height,
@@ -645,7 +706,59 @@ std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, 
     return context.CapturePlan();
 }
 
-void WebSceneRenderer::Prepare(const RenderViewPlan &plan, const WebRenderGraph &graph)
+std::vector<MaterialTextureRead> WebSceneRenderer::CollectMaterialTextureReads(const RenderViewPlan &plan,
+                                                                           const WebRenderGraph &graph) const
+{
+    std::vector<MaterialTextureRead> reads;
+    for (const auto index : graph.ExecutionOrder()) {
+        const auto &pass = graph.Description().passes[index];
+        const auto *command = pass.PrimaryCommand();
+        if (!command)
+            continue;
+        const auto visitMaterial = [&](const std::shared_ptr<InxMaterial> &material) {
+            if (!material)
+                return;
+            for (const auto &[name, texture] : material->GetRenderTextures()) {
+                auto generation = material->GetRenderTextureGeneration(name);
+                if (generation && std::none_of(reads.begin(), reads.end(), [&](const auto &item) {
+                        return item.passName == pass.name && item.generation == generation;
+                    }))
+                    reads.push_back({pass.name, texture, std::move(generation)});
+            }
+        };
+        const auto visit = [&](const DrawCall &draw) {
+            const auto &override = command->rendererSelection ? command->rendererSelection->Material()
+                                                               : command->overrideMaterialValue;
+            const auto &material = override ? override : draw.material;
+            if (material && !material->GetRenderTextures().empty() && draw.material && draw.material->GetRenderState().cullMode != MaterialCullMode::FrontAndBack &&
+                PassIncludesDraw(*command, draw, false)) {
+                visitMaterial(material);
+            }
+        };
+        switch (command->type) {
+        case GraphCommandType::DrawRenderers:
+            for (const auto &draw : plan.culling.visibleRenderers.DrawCalls())
+                visit(draw);
+            for (const auto &draw : plan.draws)
+                visit(draw);
+            break;
+        case GraphCommandType::DrawShadowCasters:
+            if (m_impl->shadowsEnabled)
+                for (const auto &draw : plan.culling.shadowCasters.DrawCalls())
+                    visit(draw);
+            break;
+        case GraphCommandType::DrawSkybox:
+            if (m_impl->skyEnabled && plan.view->clearFlags == CameraClearFlags::Skybox)
+                visitMaterial(plan.world->Lighting()->skyboxMaterial);
+            break;
+        default:
+            break;
+        }
+    }
+    return reads;
+}
+
+void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph)
 {
     auto &s = *m_impl;
     s.frame = plan.world;
@@ -656,22 +769,46 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, const WebRenderGraph 
     s.width = view.pixelWidth;
     s.height = view.pixelHeight;
     const uint32_t width = s.width, height = s.height;
-    if (s.current->graph != plan.graph) {
-        s.current->materials.clear();
-        s.current->graph = plan.graph;
+    auto &resources = *s.current;
+    const bool newGraph = resources.graph != plan.graph;
+    if (newGraph) {
+        const bool topologyChanged = !resources.graph || !RenderGraphTopologyEquals(*resources.graph, *plan.graph);
+        resources.materials.clear();
+        resources.graph = plan.graph;
+        if (topologyChanged)
+            resources.acceptedView.reset();
+        resources.useMotion = std::any_of(graph.ExecutionOrder().begin(), graph.ExecutionOrder().end(),
+                                          [&](uint32_t pass) {
+                                              const auto *command = graph.Description().passes[pass].PrimaryCommand();
+                                              return command && command->shaderTarget == ShaderCompileTarget::Motion;
+                                          });
     }
+    if (!resources.acceptedView || resources.acceptedView->pixelWidth != width ||
+        resources.acceptedView->pixelHeight != height || IsRenderViewCut(*resources.acceptedView, view)) {
+        resources.acceptedView.reset();
+        resources.motion.Clear();
+        graph.InvalidateHistory();
+        resources.temporalSample = 0;
+    }
+    if (resources.useMotion)
+        resources.motion.BeginFrame();
     s.shadowResolution = 0;
-    for (const auto &texture : plan.graph->textures)
+    s.depth.reset();
+    resources.shadow.reset();
+    for (const auto &texture : graph.Description().textures)
         if (texture.IsViewDepth())
             s.depth = graph.GetTexture(texture.name);
-    for (const auto &pass : plan.graph->passes)
+    for (const auto &pass : graph.Description().passes)
         for (const auto &command : pass.commands)
             if (command.type == GraphCommandType::DrawShadowCasters) {
                 s.current->shadow = graph.GetTexture(pass.writeDepth);
                 s.shadowResolution = ResolveGraphPassExtent(*plan.graph, pass, width, height).first;
             }
-    if (!s.current->shadow)
-        s.current->shadow = s.Attachment(1, 1, 1, true);
+    if (!resources.shadow) {
+        if (!s.defaultShadow)
+            s.defaultShadow = s.Attachment(1, 1, 1, true);
+        resources.shadow = s.defaultShadow;
+    }
     s.draws.clear();
     s.modelValues.clear();
     s.skinValues.clear();
@@ -716,11 +853,19 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, const WebRenderGraph 
     s.Storage(s.current->skins, s.skinValues);
     s.Storage(s.current->bones, s.boneValues);
     s.Storage(s.current->instances, s.instanceValues);
-    auto viewport = CameraUniform(view);
-    s.Uniform(s.current->camera, viewport);
+    s.preparedJitter = plan.graph->temporalJitter ? RenderViewJitterNdc(resources.temporalSample, width, height)
+                                                : glm::vec2(0.0f);
+    s.preparedProjection = JitterRenderViewProjection(view.projection, s.preparedJitter);
+    s.preparedViewProjection = s.preparedProjection * view.view;
+    const auto &previousProjection = resources.acceptedView ? resources.previousViewProjection : s.preparedViewProjection;
+    const auto viewport = CameraUniform(view, s.preparedProjection, previousProjection);
+    s.Uniform(resources.camera, viewport);
     auto globals = s.frameGlobals;
     globals.screenParams = {float(width), float(height), 1.0f / width, 1.0f / height};
+    globals.worldSpaceCameraPos = glm::vec4(view.position, 1.0f);
     globals.projectionParams = viewport.projectionParams;
+    globals.zBufferParams = viewport.zBufferParams;
+    globals.frameParams.w = resources.acceptedView ? resources.previousTime : globals.time.x;
     globals.viewOptions = {view.dithering ? 1u : 0u, view.stopNaNs ? 1u : 0u, 1, 0};
     s.Uniform(s.current->globals, globals);
     s.lights.CollectLights(*s.frame->Lighting(), view.position);
@@ -772,6 +917,27 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, const WebRenderGraph 
     }
 }
 
+void WebSceneRenderer::AcceptView()
+{
+    auto &s = *m_impl;
+    auto &resources = *s.current;
+    resources.acceptedView = s.view;
+    resources.previousViewProjection = s.preparedViewProjection;
+    resources.previousTime = s.frameGlobals.time.x;
+    if (resources.useMotion)
+        resources.motion.CommitFrame();
+    if (resources.graph->temporalJitter)
+        resources.temporalSample = (resources.temporalSample + 1u) % kTemporalJitterSampleCount;
+}
+
+std::shared_ptr<GraphEventViewSample> WebSceneRenderer::CaptureViewSample() const
+{
+    const auto &s = *m_impl;
+    return std::make_shared<GraphEventViewSample>(GraphEventViewSample{
+        s.width, s.height, s.preparedJitter, s.view->view, s.preparedProjection, s.view->projection,
+        s.current->acceptedView ? std::optional{s.current->previousViewProjection} : std::nullopt});
+}
+
 void WebSceneRenderer::RecordPreparation(wgpu::CommandEncoder encoder)
 {
     auto &s = *m_impl;
@@ -779,7 +945,7 @@ void WebSceneRenderer::RecordPreparation(wgpu::CommandEncoder encoder)
         return;
     const auto &view = *s.view;
     lighting::ForwardPlusGridConstants constants{};
-    std::memcpy(constants.viewProjection, &view.viewProjection[0][0], sizeof(constants.viewProjection));
+    std::memcpy(constants.viewProjection, &s.preparedViewProjection[0][0], sizeof(constants.viewProjection));
     constants.viewportAndProjectionScale[2] = std::abs(view.projection[0][0]);
     constants.viewportAndProjectionScale[3] = std::abs(view.projection[1][1]);
     auto pass = encoder.BeginComputePass();
@@ -793,32 +959,11 @@ void WebSceneRenderer::Record(wgpu::RenderPassEncoder pass, const GraphCommandDe
 {
     auto &s = *m_impl;
     const bool shadow = command.type == GraphCommandType::DrawShadowCasters;
-    const bool sky = command.type == GraphCommandType::DrawSkybox;
     s.orderedDraws.clear();
     for (size_t index = 0; index < s.draws.size(); ++index) {
         const auto &draw = s.draws[index];
-        if (sky != draw.sky || (shadow ? !draw.source.castsShadows : !draw.source.frustumVisible))
-            continue;
-        const auto &source = draw.source.material;
-        if (!sky && (source->GetRenderQueue() < command.queueMin || source->GetRenderQueue() > command.queueMax))
-            continue;
-        if (command.rendererSelection && !command.rendererSelection->Find(draw.source.identity))
-            continue;
-        const auto &tag = source->GetPassTag();
-        if (!sky && !command.passTag.empty() &&
-            ((command.overrideMaterialValue && tag != command.passTag) ||
-             (!command.overrideMaterialValue && !tag.empty() && tag != command.passTag)))
-            continue;
-        const auto &material = command.rendererSelection ? command.rendererSelection->Material()
-                               : command.overrideMaterialValue ? command.overrideMaterialValue : source;
-        const auto &artifact = material->GetSelectedShaderArtifact();
-        if (shadow && !artifact->FindVariant(ShaderCompileTarget::Shadow))
-            continue;
-        const bool deferred = artifact->FindVariant(ShaderCompileTarget::GBuffer) != nullptr;
-        if ((command.materialFilter == GraphMaterialFilter::DeferredCompatible && !deferred) ||
-            (command.materialFilter == GraphMaterialFilter::DeferredUnsupported && deferred))
-            continue;
-        s.orderedDraws.push_back(index);
+        if (PassIncludesDraw(command, draw.source, draw.sky))
+            s.orderedDraws.push_back(index);
     }
     if (command.sortMode == "back_to_front") {
         const auto &view = *s.view;

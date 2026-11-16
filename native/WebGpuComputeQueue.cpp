@@ -1,5 +1,6 @@
 #include "WebGpuComputeQueue.h"
 
+#include <algorithm>
 #include <chrono>
 #include <emscripten.h>
 #include <limits>
@@ -52,7 +53,8 @@ class RecordingContext final : public rhi::ComputeRecordingContext
         if (!producer.IsValid())
             return;
         if (producer.device != m_device.GetDeviceId() ||
-            (producer.queue == rhi::QueueRole::Compute && producer.serial > m_submitted))
+            (producer.queue != rhi::QueueRole::Compute && producer.queue != rhi::QueueRole::Graphics) ||
+            producer.serial > m_submitted)
             throw std::invalid_argument("WebGPU compute requires an accepted same-device producer");
         // The browser exposes one ordered queue for graphics/compute/copies.
         // Every producer has already been submitted; no host wait is required.
@@ -114,6 +116,31 @@ struct WebGpuComputeQueue::Completion
     std::string error;
     uint64_t uploadStagingBytes = 0;
 
+    // Command completion alone cannot publish a successful value after validation failed.
+    struct ValidationScope
+    {
+        wgpu::Device device;
+        std::shared_ptr<Completion> completion;
+
+        ValidationScope(wgpu::Device owner, std::shared_ptr<Completion> packet)
+            : device(std::move(owner)), completion(std::move(packet))
+        {
+            device.PushErrorScope(wgpu::ErrorFilter::Validation);
+        }
+        ~ValidationScope()
+        {
+            device.PopErrorScope(
+                wgpu::CallbackMode::AllowSpontaneous,
+                [value = completion](wgpu::PopErrorScopeStatus status, wgpu::ErrorType type, wgpu::StringView message) {
+                    if (status != wgpu::PopErrorScopeStatus::Success)
+                        value->error = "WebGPU submission validation could not complete";
+                    else if (type != wgpu::ErrorType::NoError)
+                        value->error.assign(message.data, message.length);
+                    value->validationDone = true;
+                });
+        }
+    };
+
     bool Ready() const noexcept
     {
         return commandsDone && validationDone;
@@ -138,8 +165,8 @@ WebGpuComputeQueue::~WebGpuComputeQueue()
 rhi::SubmissionTicket WebGpuComputeQueue::Submit(const Recorder &record, rhi::ComputeSubmissionResources resources)
 {
     Collect();
-    if (m_pending.size() == m_capacity)
-        Wait(m_pending.front()->ticket);
+    if (const auto blocker = GetCapacityPredecessor(); blocker.IsValid())
+        Wait(blocker);
     return Record(record, std::move(resources));
 }
 
@@ -148,7 +175,7 @@ std::optional<rhi::SubmissionTicket> WebGpuComputeQueue::TrySubmit(const Recorde
                                                                    const Admission &admit)
 {
     Collect();
-    if (m_pending.size() == m_capacity || (admit && !admit()))
+    if (m_pendingCompute == m_capacity || (admit && !admit()))
         return std::nullopt;
     return Record(record, resources);
 }
@@ -159,26 +186,7 @@ rhi::SubmissionTicket WebGpuComputeQueue::Record(const Recorder &record, rhi::Co
     auto completion = std::make_shared<Completion>();
     completion->ticket = {m_device.GetDeviceId(), rhi::QueueRole::Compute, m_submitted + 1};
     completion->resources = std::move(resources);
-    // WebGPU reports command validation asynchronously. Command completion
-    // alone must not publish a failed packet as a successful compute value.
-    struct ValidationScope
-    {
-        wgpu::Device device;
-        std::shared_ptr<Completion> completion;
-        ~ValidationScope()
-        {
-            device.PopErrorScope(
-                wgpu::CallbackMode::AllowSpontaneous,
-                [value = completion](wgpu::PopErrorScopeStatus status, wgpu::ErrorType type, wgpu::StringView message) {
-                    if (status != wgpu::PopErrorScopeStatus::Success)
-                        value->error = "WebGPU compute validation could not complete";
-                    else if (type != wgpu::ErrorType::NoError)
-                        value->error.assign(message.data, message.length);
-                    value->validationDone = true;
-                });
-        }
-    } validation{m_device.NativeDevice(), completion};
-    validation.device.PushErrorScope(wgpu::ErrorFilter::Validation);
+    Completion::ValidationScope validation(m_device.NativeDevice(), completion);
     m_device.ClearError();
     RecordingContext context(m_device, m_submitted);
     if (!record(context))
@@ -187,6 +195,29 @@ rhi::SubmissionTicket WebGpuComputeQueue::Record(const Recorder &record, rhi::Co
     if (!m_device.LastError().empty())
         throw std::runtime_error(m_device.LastError());
     completion->uploadStagingBytes = context.UploadStagingBytes();
+    const auto ticket = Enqueue(completion, commands);
+    ++m_pendingCompute;
+    for (uint64_t index = 0; index < context.UploadAllocations(); ++index) {
+        RecordStagingAllocation();
+        RecordHostMap();
+    }
+    RecordSubmission(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+    return ticket;
+}
+
+rhi::SubmissionTicket WebGpuComputeQueue::SubmitGraphics(const std::function<wgpu::CommandBuffer()> &record,
+                                                        std::shared_ptr<void> retained)
+{
+    auto completion = std::make_shared<Completion>();
+    completion->ticket = {m_device.GetDeviceId(), rhi::QueueRole::Graphics, m_submitted + 1};
+    completion->resources.retained = std::move(retained);
+    Completion::ValidationScope validation(m_device.NativeDevice(), completion);
+    return Enqueue(completion, record());
+}
+
+rhi::SubmissionTicket WebGpuComputeQueue::Enqueue(const std::shared_ptr<Completion> &completion,
+                                                wgpu::CommandBuffer commands)
+{
     m_pending.push_back(completion);
     m_device.NativeQueue().Submit(1, &commands);
     m_submitted = completion->ticket.serial;
@@ -195,19 +226,14 @@ rhi::SubmissionTicket WebGpuComputeQueue::Record(const Recorder &record, rhi::Co
                                                    completion->status = status;
                                                    completion->commandsDone = true;
                                                });
-    for (uint64_t index = 0; index < context.UploadAllocations(); ++index) {
-        RecordStagingAllocation();
-        RecordHostMap();
-    }
-    RecordSubmission(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
     return completion->ticket;
 }
 
 void WebGpuComputeQueue::RequireTicket(rhi::SubmissionTicket ticket) const
 {
-    if (ticket.device != m_device.GetDeviceId() || ticket.queue != rhi::QueueRole::Compute || !ticket.IsValid() ||
-        ticket.serial > m_submitted)
-        throw std::invalid_argument("Compute completion does not belong to this WebGPU queue");
+    if (ticket.device != m_device.GetDeviceId() || !ticket.IsValid() || ticket.serial > m_submitted ||
+        (ticket.queue != rhi::QueueRole::Compute && ticket.queue != rhi::QueueRole::Graphics))
+        throw std::invalid_argument("Completion does not belong to this WebGPU queue");
 }
 
 void WebGpuComputeQueue::Wait(rhi::SubmissionTicket ticket)
@@ -253,7 +279,9 @@ void WebGpuComputeQueue::Collect()
         if (!completion->error.empty())
             throw std::runtime_error(completion->error);
         if (completion->status != wgpu::QueueWorkDoneStatus::Success)
-            throw std::runtime_error("WebGPU compute submission failed");
+            throw std::runtime_error("WebGPU submission failed");
+        if (completion->ticket.queue == rhi::QueueRole::Compute)
+            --m_pendingCompute;
         m_completed = completion->ticket.serial;
         if (completion->resources.receipt)
             completion->resources.receipt->complete = true;
@@ -276,12 +304,16 @@ rhi::GpuTimestampFrame WebGpuComputeQueue::GetProfile() const
 
 uint64_t WebGpuComputeQueue::GetPendingSubmissionCount() const noexcept
 {
-    return m_pending.size();
+    return m_pendingCompute;
 }
 
 rhi::SubmissionTicket WebGpuComputeQueue::GetCapacityPredecessor() const noexcept
 {
-    return m_pending.size() == m_capacity ? m_pending.front()->ticket : rhi::SubmissionTicket{};
+    if (m_pendingCompute < m_capacity)
+        return {};
+    return (*std::find_if(m_pending.begin(), m_pending.end(), [](const auto &value) {
+        return value->ticket.queue == rhi::QueueRole::Compute;
+    }))->ticket;
 }
 
 uint64_t WebGpuComputeQueue::GetRetainedUploadBytes() const noexcept

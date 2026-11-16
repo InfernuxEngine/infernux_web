@@ -100,9 +100,11 @@ bool WebScreenUIRenderer::Initialize(WebGpuRhiDevice &device, WebSceneRenderer &
     m_queue = device.NativeQueue();
     m_materials = std::make_unique<WebUIMaterialCache>();
     m_materials->Initialize(m_device, m_queue,
-                            [&scene](const std::string &guid, const MaterialTextureSampler *sampler) {
+                            [&scene, &device](const std::string &guid, const MaterialTextureSampler *sampler) {
                                 const auto texture = scene.ResolveSampledTexture(guid, sampler);
-                                return WebUIMaterialCache::Texture{texture.view, texture.sampler};
+                                return texture ? WebUIMaterialCache::Texture{device.GetNativeTextureView(texture->GetView()),
+                                                                            device.GetNativeSampler(texture->GetSampler())}
+                                               : WebUIMaterialCache::Texture{};
                             });
     m_context = ImGui::GetCurrentContext();
     if (!m_context) {

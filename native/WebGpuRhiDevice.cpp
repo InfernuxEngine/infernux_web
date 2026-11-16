@@ -1398,9 +1398,20 @@ void WebGpuRhiDevice::CopyBuffer(void *raw, rhi::BufferHandle source, rhi::Buffe
     auto &context = *static_cast<WebGpuTransferCommandContext *>(raw);
     const auto *src = context.device->Resolve(context.device->m_buffers, source);
     const auto *dst = context.device->Resolve(context.device->m_buffers, destination);
-    if (src && dst)
-        context.encoder.CopyBufferToBuffer(src->buffer, region.sourceOffset, dst->buffer, region.destinationOffset,
-                                           region.byteSize);
+    if (!src || !dst)
+        return;
+    if (src == dst) {
+        // WebGPU requires distinct buffers even for disjoint range copies.
+        wgpu::BufferDescriptor descriptor;
+        descriptor.size = region.byteSize;
+        descriptor.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst;
+        const auto temporary = context.device->m_device.CreateBuffer(&descriptor);
+        context.encoder.CopyBufferToBuffer(src->buffer, region.sourceOffset, temporary, 0, region.byteSize);
+        context.encoder.CopyBufferToBuffer(temporary, 0, dst->buffer, region.destinationOffset, region.byteSize);
+        return;
+    }
+    context.encoder.CopyBufferToBuffer(src->buffer, region.sourceOffset, dst->buffer, region.destinationOffset,
+                                       region.byteSize);
 }
 
 bool WebGpuRhiDevice::UpdateBuffer(void *raw, rhi::BufferHandle destination, uint64_t offset, const void *data,
@@ -1474,10 +1485,6 @@ bool WebGpuRhiDevice::CopyTextureBuffer(void *raw, rhi::TextureHandle texture, r
     const auto rowBytes = region.bytesPerRow
                               ? region.bytesPerRow
                               : region.width * rhi::TextureBufferCopyRegion::TexelBytes(image->desc.format);
-    if ((region.height > 1 || region.bytesPerRow) && rowBytes % 256 != 0) {
-        context.device->SetError("WebGPU command texture copies require a 256-byte row stride");
-        return false;
-    }
     wgpu::TexelCopyBufferInfo copyBuffer;
     copyBuffer.buffer = buffer->buffer;
     copyBuffer.layout.offset = region.bufferOffset;
@@ -1489,10 +1496,28 @@ bool WebGpuRhiDevice::CopyTextureBuffer(void *raw, rhi::TextureHandle texture, r
     copyTexture.origin = {0, 0, region.textureLayer};
     copyTexture.aspect = ToWebAspect(region.aspect);
     wgpu::Extent3D size{region.width, region.height, 1};
-    if (toBuffer)
-        context.encoder.CopyTextureToBuffer(&copyTexture, &copyBuffer, &size);
-    else
-        context.encoder.CopyBufferToTexture(&copyBuffer, &copyTexture, &size);
+    const auto copy = [&]() {
+        if (toBuffer)
+            context.encoder.CopyTextureToBuffer(&copyTexture, &copyBuffer, &size);
+        else
+            context.encoder.CopyBufferToTexture(&copyBuffer, &copyTexture, &size);
+    };
+    if ((region.height == 1 && !region.bytesPerRow) || rowBytes % 256 == 0) {
+        copy();
+    } else if (region.aspect == rhi::TextureAspect::Color) {
+        // Each one-row copy has an implicit stride and writes the exact packed
+        // range. The caller's logical layout is identical on both devices.
+        copyBuffer.layout.bytesPerRow = wgpu::kCopyStrideUndefined;
+        size.height = 1;
+        for (uint32_t row = 0; row < region.height; ++row) {
+            copyBuffer.layout.offset = region.bufferOffset + uint64_t(row) * rowBytes;
+            copyTexture.origin.y = row;
+            copy();
+        }
+    } else {
+        context.device->SetError("WebGPU packed depth transfer requires whole-image row alignment");
+        return false;
+    }
     return true;
 }
 

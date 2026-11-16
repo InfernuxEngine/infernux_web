@@ -2,6 +2,11 @@
 #include "WebGpuRhiDevice.h"
 
 #include <function/renderer/RenderGraphSchedule.h>
+#include <function/renderer/RenderGraphTemporalHistory.h>
+#include <function/renderer/RenderGraphTransfer.h>
+#include <function/renderer/RenderGraphWork.h>
+#include <function/renderer/rhi/RhiBuffer.h>
+#include <function/renderer/rhi/RhiComputeKernel.h>
 #include <function/renderer/MaterialPassPipeline.h>
 #include <function/renderer/SceneDepthResolver.h>
 #include <function/renderer/TextureRegionRenderer.h>
@@ -24,6 +29,12 @@ struct WebRenderGraph::Impl
         FullscreenParameters parameters;
         std::vector<FullscreenResourceInput> inputs;
         std::vector<uint32_t> viewLightInputs;
+        struct HistoryInput
+        {
+            uint32_t index;
+            const GraphTextureDesc *texture;
+        };
+        std::vector<HistoryInput> historyInputs;
         std::vector<std::string> parameterNames;
         std::string parameterBlock;
         uint64_t parameterRevision = 0;
@@ -37,13 +48,27 @@ struct WebRenderGraph::Impl
         std::vector<Fullscreen> fullscreen;
         std::vector<std::string> resolvedInputs;
         std::vector<std::string> resolves;
+        std::vector<std::pair<int, std::string>> historyColors;
+        std::string historyResolve;
+        Texture particleDepth;
     };
 
     WebGpuRhiDevice &device;
+    rhi::ComputeHost *computeHost;
     FullscreenRenderer fullscreen;
     std::shared_ptr<const RenderGraphDescription> graph;
     std::unordered_map<std::string, Texture> textures;
     std::unordered_map<std::string, Texture> resolved;
+    std::unordered_map<std::string, GraphTemporalHistory> histories;
+    std::shared_ptr<RenderGraphWorkStorage> workStorage;
+    RenderGraphResults results;
+    uint64_t historyEpoch = 0;
+    bool historyReset = true;
+    std::vector<uint32_t> eventPasses;
+    std::vector<const GraphBufferDesc *> liveBufferInputs;
+    GraphBufferContents bufferContents;
+    std::unordered_set<std::string> bufferWrites;
+    std::unordered_map<std::string, std::shared_ptr<rhi::BufferResource>> transientBuffers;
     std::vector<Pass> passes;
     std::vector<uint32_t> order;
     std::unordered_map<std::string, WebGpuRasterPass> colorResolves;
@@ -56,10 +81,12 @@ struct WebRenderGraph::Impl
     std::shared_ptr<const rhi::RenderTextureGeneration> cameraTarget;
     std::unordered_map<uint32_t, std::unique_ptr<TextureRegionRenderer>> regionRenderers;
     glm::vec4 cameraRect{0, 0, 1, 1};
+    bool sampleParticleDepth = false;
     size_t cameraClearIndex = SIZE_MAX;
     uint32_t width = 0, height = 0, samples = 0;
 
-    Impl(WebGpuRhiDevice &rhi, std::shared_ptr<FullscreenRendererHost> host) : device(rhi)
+    Impl(WebGpuRhiDevice &rhi, std::shared_ptr<FullscreenRendererHost> host, rhi::ComputeHost *compute)
+        : device(rhi), computeHost(compute)
     {
         fullscreen.Initialize(std::move(host));
     }
@@ -125,40 +152,161 @@ struct WebRenderGraph::Impl
         return texture;
     }
 
+    const GraphTextureDesc &TextureDescription(const std::string &name) const
+    {
+        return *std::find_if(graph->textures.begin(), graph->textures.end(),
+                             [&](const auto &item) { return item.name == name; });
+    }
+
+    static bool IsHistory(const GraphTextureDesc &texture)
+    {
+        return texture.role == GraphTextureRole::TemporalRead || texture.role == GraphTextureRole::TemporalWrite;
+    }
+
+    void RecordHistoryBindings(wgpu::CommandEncoder encoder)
+    {
+        if (histories.empty())
+            return;
+        for (const auto &[key, history] : histories) {
+            auto read = history.Read();
+            textures.at(history.readName) = read->color;
+            textures.at(history.writeName) = history.Write()->color;
+            if (history.valid)
+                continue;
+            rhi::RasterPassDescription init;
+            init.width = history.width;
+            init.height = history.height;
+            init.colorCount = 1;
+            init.colors[0].view = read->color->GetView();
+            init.colors[0].format = read->color->GetFormat();
+            init.colors[0].load = rhi::AttachmentLoad::Clear;
+            WebGpuRasterPass native;
+            device.PrepareRasterPass(init, native);
+            auto pass = encoder.BeginRenderPass(&native.descriptor);
+            pass.End();
+        }
+        for (const auto index : order) {
+            auto &pass = passes[index];
+            if (pass.historyColors.empty() && pass.historyResolve.empty())
+                continue;
+            for (const auto &[slot, name] : pass.historyColors)
+                pass.raster.colors[slot].view = textures.at(name)->GetView();
+            if (!pass.historyResolve.empty())
+                pass.raster.colors[0].resolve = textures.at(pass.historyResolve)->GetView();
+            device.PrepareRasterPass(pass.raster, pass.native);
+            pass.native.descriptor.label = graph->passes[index].name.c_str();
+        }
+    }
+
+    rhi::BufferHandle GetBuffer(const std::string &name) const
+    {
+        const auto owner = workStorage->buffers.find(name);
+        return owner != workStorage->buffers.end() ? owner->second->GetBuffer()
+                                                  : transientBuffers.at(name)->GetBuffer();
+    }
+
+    void PrepareBuffers()
+    {
+        if (std::all_of(graph->buffers.begin(), graph->buffers.end(),
+                        [](const auto &buffer) { return buffer.viewLightList; })) {
+            workStorage.reset();
+            transientBuffers.clear();
+            bufferWrites.clear();
+            return;
+        }
+        if (!computeHost)
+            throw std::logic_error("A graph with buffers requires the renderer's compute host");
+        const RenderGraphWorkStorage empty;
+        auto next = PrepareRenderGraphWork(*computeHost, *graph, workStorage ? *workStorage : empty);
+        if (!next)
+            throw std::runtime_error("Could not allocate graph work storage");
+        workStorage = std::make_shared<RenderGraphWorkStorage>(std::move(*next));
+        workStorage->Publish();
+        bufferWrites = FindGraphBufferWrites(*graph);
+        transientBuffers.clear();
+        for (const auto &buffer : graph->buffers) {
+            if (buffer.viewLightList || workStorage->buffers.count(buffer.name))
+                continue;
+            rhi::BufferDesc desc;
+            desc.byteSize = buffer.byteSize;
+            desc.usage = static_cast<rhi::BufferUsageFlags>(buffer.usage);
+            auto handle = device.CreateBuffer(desc);
+            if (!handle.IsValid())
+                throw std::runtime_error("Could not allocate graph buffer: " + buffer.name);
+            transientBuffers.emplace(buffer.name, std::make_shared<rhi::BufferResource>(device, handle, desc.byteSize));
+        }
+    }
+
+    const GraphPassDesc &EffectivePass(size_t index) const
+    {
+        const auto &pass = graph->passes[index];
+        return cameraClear && cameraClear->name == pass.name ? *cameraClear : pass;
+    }
+
     void CompileSchedule()
     {
         RenderGraphIdentitySource identity;
-        std::unordered_map<std::string, GraphResourceHandle> resources;
-        for (const auto &texture : graph->textures)
-            resources.emplace(texture.name, GraphResourceHandle{identity.Current(), uint32_t(resources.size()), 0});
-        for (const auto &buffer : graph->buffers)
-            resources.emplace(buffer.name, GraphResourceHandle{identity.Current(), uint32_t(resources.size()), 0});
+        std::unordered_map<std::string, uint32_t> resources;
+        std::vector<GraphResourceHandle> versions;
+        const auto newResource = [&]() {
+            const auto id = static_cast<uint32_t>(versions.size());
+            versions.push_back({identity.Current(), id, 0});
+            return id;
+        };
+        std::unordered_map<rhi::TextureHandle, uint32_t, rhi::HandleHash<rhi::TextureTag>> imageIds;
+        std::unordered_map<rhi::BufferHandle, uint32_t, rhi::HandleHash<rhi::BufferTag>> bufferIds;
+        std::unordered_set<uint32_t> exports;
+        std::unordered_map<std::string_view, const GraphBufferDesc *> inputs;
+        const auto resourceId = [&](auto &ids, auto handle) {
+            const auto existing = ids.find(handle);
+            if (existing != ids.end())
+                return existing->second;
+            return ids.emplace(handle, newResource()).first->second;
+        };
+        for (const auto &texture : graph->textures) {
+            const auto id = resourceId(imageIds, textures.at(texture.name)->GetTexture());
+            resources.emplace(texture.name, id);
+            if (texture.role == GraphTextureRole::Persistent || texture.role == GraphTextureRole::TemporalWrite ||
+                texture.IsViewAttachment())
+                exports.insert(id);
+        }
+        for (const auto &buffer : graph->buffers) {
+            const auto id = buffer.viewLightList ? newResource() : resourceId(bufferIds, GetBuffer(buffer.name));
+            resources.emplace(buffer.name, id);
+            if (buffer.exportLayout)
+                exports.insert(id);
+            const auto &storage = ResolveGraphBufferStorage(*graph, buffer);
+            if (storage.input)
+                inputs.emplace(buffer.name, &storage);
+        }
+
         std::vector<GraphSchedulePass> declarations(graph->passes.size());
+        std::vector<std::vector<const GraphBufferDesc *>> inputReads(graph->passes.size());
+        liveBufferInputs.clear();
+        const auto addInput = [&](const std::string &name, auto &reads) {
+            if (const auto found = inputs.find(name); found != inputs.end())
+                reads.push_back(found->second);
+        };
+        for (const auto &buffer : graph->buffers)
+            if (buffer.exportLayout)
+                addInput(buffer.name, liveBufferInputs);
         const auto shadow = ResolveGraphShadowTexture(*graph);
         for (size_t index = 0; index < graph->passes.size(); ++index) {
-            const auto &source = cameraClear && cameraClear->name == graph->passes[index].name
-                                     ? *cameraClear : graph->passes[index];
+            const auto &source = EffectivePass(index);
             auto &pass = declarations[index];
             pass.sideEffect = source.sideEffect;
-            for (const auto &name : source.readTextures)
-                pass.reads.push_back({resources.at(name)});
-            if (!shadow.empty())
-                for (const auto &command : source.commands)
-                    if (command.fullscreenProgram && command.fullscreenProgram->UsesViewBinding(0)) {
-                        pass.reads.push_back({resources.at(shadow)});
-                        break;
-                    }
-            const auto write = [&](const std::string &name, bool retain) {
-                auto &resource = resources.at(name);
-                pass.reads.push_back({resource, retain});
-                ++resource.version;
-                pass.writes.push_back(resource);
-                const auto texture = std::find_if(graph->textures.begin(), graph->textures.end(),
-                    [&](const auto &item) { return item.name == name; });
-                if (texture != graph->textures.end())
-                    pass.externalWrite |= texture->role == GraphTextureRole::Persistent ||
-                                          texture->role == GraphTextureRole::TemporalWrite;
+            std::unordered_map<uint32_t, bool> writes;
+            const auto read = [&](const std::string &name) {
+                pass.reads.push_back({versions[resources.at(name)]});
+                addInput(name, inputReads[index]);
             };
+            const auto write = [&](const std::string &name, bool retain) {
+                const auto id = resources.at(name);
+                auto [entry, inserted] = writes.try_emplace(id, retain);
+                entry->second |= retain;
+            };
+            for (const auto &name : source.readTextures)
+                read(name);
             for (const auto &[slot, name] : source.writeColors)
                 write(name, !source.clearColor);
             if (!source.writeDepth.empty())
@@ -166,29 +314,58 @@ struct WebRenderGraph::Impl
             if (!source.resolveColor.empty())
                 write(source.resolveColor, false);
             for (const auto &access : source.bufferAccesses) {
-                if (access.type == GraphBufferAccessType::StorageWrite ||
-                    access.type == GraphBufferAccessType::TransferWrite)
+                if (access.type == GraphBufferAccessType::StorageWrite || access.type == GraphBufferAccessType::TransferWrite)
                     write(access.resource, true);
                 else
-                    pass.reads.push_back({resources.at(access.resource)});
+                    read(access.resource);
             }
-            for (const auto &command : source.commands) {
-                if (!command.sourceResource.empty() && resources.count(command.sourceResource))
-                    pass.reads.push_back({resources.at(command.sourceResource)});
-                if (command.CopiesToTexture())
-                    write(command.destinationResource, false);
+            if (const auto *command = source.PrimaryCommand()) {
+                if (!shadow.empty() && command->fullscreenProgram && command->fullscreenProgram->UsesViewBinding(0))
+                    read(shadow);
+                for (const auto &[name, resource] : command->inputBindings)
+                    read(resource);
+                if (!command->sourceResource.empty())
+                    read(command->sourceResource);
+                if (!command->destinationResource.empty())
+                    write(command->destinationResource, true);
+                if (command->type == GraphCommandType::ComputeWork) {
+                    const auto &work = *FindGraphWorkBinding(*graph, command->workBinding);
+                    const auto names = GraphWorkSlotNames(*graph, work);
+                    for (const auto &dispatch : work.recipe->GetDispatches()) {
+                        for (const auto &binding : dispatch.bindings) {
+                            const auto &name = names[binding.range.slot];
+                            const auto bits = static_cast<uint8_t>(binding.access);
+                            if (bits & static_cast<uint8_t>(rhi::ComputeBufferAccess::Read))
+                                read(name);
+                            if (bits & static_cast<uint8_t>(rhi::ComputeBufferAccess::Write))
+                                write(name, true);
+                        }
+                        if (dispatch.indirectArguments)
+                            read(names[dispatch.indirectArguments->slot]);
+                    }
+                }
+            }
+            for (const auto &[id, retain] : writes) {
+                auto &version = versions[id];
+                pass.reads.push_back({version, retain});
+                ++version.version;
+                pass.writes.push_back(version);
+                pass.externalWrite |= exports.count(id) != 0;
             }
         }
-        auto schedule = CompileRenderGraphSchedule(declarations, resources.at(graph->outputTexture));
+        auto schedule = CompileRenderGraphSchedule(declarations, versions[resources.at(graph->outputTexture)]);
         if (!schedule.unresolved.empty())
             throw std::invalid_argument("Render graph contains a dependency cycle: " + graph->name);
         order = std::move(schedule.order);
+        for (const auto index : order)
+            for (const auto *input : inputReads[index])
+                if (std::find(liveBufferInputs.begin(), liveBufferInputs.end(), input) == liveBufferInputs.end())
+                    liveBufferInputs.push_back(input);
     }
 
     void CompileRaster(size_t index, const rhi::RenderViewContext &view)
     {
-        const auto &source = cameraClear && cameraClear->name == graph->passes[index].name
-                                 ? *cameraClear : graph->passes[index];
+        const auto &source = EffectivePass(index);
         if (cameraClear && cameraClear->name == source.name)
             cameraClearIndex = index;
         auto &pass = passes[index];
@@ -203,21 +380,17 @@ struct WebRenderGraph::Impl
             attachment.load = source.clearColor ? rhi::AttachmentLoad::Clear : rhi::AttachmentLoad::Load;
             attachment.clear = {source.clearColorR, source.clearColorG, source.clearColorB, source.clearColorA};
             pass.raster.colorCount = std::max(pass.raster.colorCount, uint32_t(slot + 1));
+            if (IsHistory(TextureDescription(name)))
+                pass.historyColors.emplace_back(slot, name);
         }
-        if (!source.resolveColor.empty())
+        if (!source.resolveColor.empty()) {
             pass.raster.colors[0].resolve = textures.at(source.resolveColor)->GetView();
-        std::string depth = source.writeDepth;
-        if (depth.empty())
-            for (const auto &name : source.readTextures)
-                if (rhi::IsDepthFormat(textures.at(name)->GetFormat())) {
-                    const auto sampled = std::any_of(source.commands.begin(), source.commands.end(),
-                        [&](const auto &command) { return command.BindsResource(name); });
-                    if (sampled)
-                        continue;
-                    depth = name;
-                    pass.raster.depth.readOnly = true;
-                    break;
-                }
+            if (IsHistory(TextureDescription(source.resolveColor)))
+                pass.historyResolve = source.resolveColor;
+        }
+        const auto *readOnlyDepth = ResolveGraphReadOnlyDepth(*graph, source);
+        const auto &depth = readOnlyDepth ? readOnlyDepth->name : source.writeDepth;
+        pass.raster.depth.readOnly = readOnlyDepth != nullptr;
         if (!depth.empty()) {
             const auto &texture = textures.at(depth);
             auto &attachment = pass.raster.depth;
@@ -227,6 +400,13 @@ struct WebRenderGraph::Impl
             attachment.clear = source.clearDepthValue;
         }
         const auto &materialPass = pass.material = ResolveMaterialPass(*graph, source, view);
+        const auto *draw = source.PrimaryCommand();
+        if (sampleParticleDepth && readOnlyDepth && draw && draw->type == GraphCommandType::DrawRenderers &&
+            (draw->shaderTarget == ShaderCompileTarget::Forward || draw->shaderTarget == ShaderCompileTarget::ForwardPlus)) {
+            pass.particleDepth = SampledTexture(depth, false, view);
+            if (resolved.count(depth))
+                pass.resolvedInputs.push_back(depth);
+        }
         pass.fullscreen.resize(source.commands.size());
         for (size_t commandIndex = 0; commandIndex < source.commands.size(); ++commandIndex) {
             const auto &command = source.commands[commandIndex];
@@ -264,9 +444,7 @@ struct WebRenderGraph::Impl
                     if (buffer->viewLightList)
                         prepared.viewLightInputs.push_back(uint32_t(prepared.inputs.size()));
                     else {
-                        if (!buffer->computeBuffer)
-                            throw std::invalid_argument("Graph buffer has no execution storage: " + buffer->name);
-                        input.buffer = buffer->computeBuffer->GetBuffer();
+                        input.buffer = GetBuffer(buffer->name);
                         input.byteOffset = buffer->byteOffset;
                         input.byteSize = buffer->byteSize;
                     }
@@ -276,6 +454,9 @@ struct WebRenderGraph::Impl
                 const bool rawSamples = std::any_of(program->code->resources.begin(), program->code->resources.end(),
                     [&](const auto &resource) { return resource.name == name && resource.binding.multisampled; });
                 const auto texture = SampledTexture(binding->second, rawSamples, view);
+                const auto &textureDesc = TextureDescription(binding->second);
+                if (IsHistory(textureDesc))
+                    prepared.historyInputs.push_back({static_cast<uint32_t>(prepared.inputs.size()), &textureDesc});
                 if (!rawSamples && resolved.count(binding->second))
                     pass.resolvedInputs.push_back(binding->second);
                 FullscreenResourceInput input;
@@ -441,22 +622,38 @@ struct WebRenderGraph::Impl
     }
 };
 
-WebRenderGraph::WebRenderGraph(WebGpuRhiDevice &device, std::shared_ptr<FullscreenRendererHost> host)
-    : m_impl(std::make_unique<Impl>(device, std::move(host)))
+WebRenderGraph::WebRenderGraph(WebGpuRhiDevice &device, std::shared_ptr<FullscreenRendererHost> host,
+                               rhi::ComputeHost *computeHost)
+    : m_impl(std::make_unique<Impl>(device, std::move(host), computeHost))
 {
 }
-WebRenderGraph::~WebRenderGraph() = default;
+WebRenderGraph::~WebRenderGraph()
+{
+    m_impl->results.Cancel("render view was destroyed");
+}
 
-RenderViewAccess WebRenderGraph::GetResourceAccess() const
+RenderViewAccess WebRenderGraph::GetResourceAccess(const std::vector<MaterialTextureRead> &materialReads) const
 {
     const auto &s = *m_impl;
     RenderViewAccess access;
     access.viewId = s.view.id;
+    access.admitted = !AppendPendingGraphBufferResults(access, s.liveBufferInputs);
+    const auto addRead = [&](const rhi::TextureResource *resource, bool requireWrite) {
+        const auto found = std::find_if(access.reads.begin(), access.reads.end(),
+                                        [&](const auto &read) { return read.texture == resource; });
+        if (found == access.reads.end())
+            access.reads.emplace_back(resource, requireWrite);
+        else
+            found->requiresProducer |= requireWrite;
+    };
     if (const auto &output = s.viewport.Output()) {
         access.writes.push_back(output->color.get());
         if (output->multisampleColor)
             access.writes.push_back(output->multisampleColor.get());
-        if (output->depth)
+        if (output->depth && std::any_of(s.order.begin(), s.order.end(), [&](uint32_t index) {
+                const auto &name = s.graph->passes[index].writeDepth;
+                return !name.empty() && s.TextureDescription(name).IsViewDepth();
+            }))
             access.writes.push_back(output->depth.get());
     }
     for (const auto &texture : s.graph->textures) {
@@ -475,23 +672,37 @@ RenderViewAccess WebRenderGraph::GetResourceAccess() const
                 return s.graph->passes[index].ReadsTexture(texture.name);
             });
         if (reads)
-            access.reads.emplace_back(resource, texture.requireCurrentWrite);
+            addRead(resource, texture.requireCurrentWrite);
     }
+    for (const auto &read : materialReads)
+        if (!HasLocalGraphTextureProducer(*s.graph, read))
+            addRead(read.generation->color.get(), false);
     return access;
 }
 
 bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, const rhi::RenderViewContext &view,
                              const ImportTexture &imports, const std::optional<GraphPassDesc> &cameraClear,
-                             std::shared_ptr<const rhi::RenderTextureGeneration> output, const glm::vec4 &rect)
+                             std::shared_ptr<const rhi::RenderTextureGeneration> output, const glm::vec4 &rect, bool sampleParticleDepth)
 {
     auto &s = *m_impl;
+    const bool sameAssets = !imports || std::all_of(graph->textures.begin(), graph->textures.end(), [&](const auto &texture) {
+        if (texture.role != GraphTextureRole::Asset)
+            return true;
+        const auto current = s.textures.find(texture.name);
+        return current != s.textures.end() && current->second == imports(texture);
+    });
     const bool sameClear = s.cameraClear.has_value() == cameraClear.has_value() &&
         (!cameraClear || (s.cameraClear->name == cameraClear->name &&
                          s.cameraClear->clearColor == cameraClear->clearColor &&
                          s.cameraClear->clearDepth == cameraClear->clearDepth));
+    const bool protectedWrites = s.workStorage && std::any_of(s.bufferWrites.begin(), s.bufferWrites.end(),
+        [&](const auto &name) {
+            const auto found = s.workStorage->buffers.find(name);
+            return found != s.workStorage->buffers.end() && found->second->GetAllocation()->IsReadProtected();
+        });
     if (s.graph == graph && s.width == view.width && s.height == view.height && s.view.samples == view.samples &&
         s.view.colorFormat == view.colorFormat && s.view.depthFormat == view.depthFormat &&
-        s.view.revision == view.revision && s.viewport.Output() == output && s.cameraRect == rect && sameClear) {
+        s.view.revision == view.revision && s.viewport.Output() == output && s.cameraRect == rect && sameClear && sameAssets && s.sampleParticleDepth == sampleParticleDepth && !protectedWrites) {
         if (cameraClear && s.cameraClearIndex != SIZE_MAX) {
             const std::array<float, 4> color{cameraClear->clearColorR, cameraClear->clearColorG,
                                                cameraClear->clearColorB, cameraClear->clearColorA};
@@ -506,8 +717,22 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
         }
         return false;
     }
-    if (!ValidateRenderGraphDescription(*graph, view))
+    s.bufferContents.clear();
+    if (cameraClear && RequiresGraphBufferProof(*graph)) {
+        auto effective = *graph;
+        const auto pass = std::find_if(effective.passes.begin(), effective.passes.end(),
+                                       [&](const auto &item) { return item.name == cameraClear->name; });
+        *pass = *cameraClear;
+        if (!ValidateRenderGraphDescription(effective, view, &s.bufferContents))
+            throw std::invalid_argument("Invalid render graph publication: " + graph->name);
+    } else if (!ValidateRenderGraphDescription(*graph, view, &s.bufferContents)) {
         throw std::invalid_argument("Invalid render graph publication: " + graph->name);
+    }
+    const bool topologyChanged = !s.graph || (s.graph != graph && !RenderGraphTopologyEquals(*s.graph, *graph));
+    const bool resetHistory = s.width != view.width || s.height != view.height || s.viewport.Output() != output ||
+                              s.cameraRect != rect || topologyChanged;
+    if (topologyChanged || (graph->sourceRevision && graph->sourceRevision != s.graph->sourceRevision))
+        s.results.Reset("render graph definition changed");
     s.graph = std::move(graph);
     s.width = view.width;
     s.height = view.height;
@@ -515,6 +740,7 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
     s.view = view;
     s.cameraClear = cameraClear;
     s.cameraRect = rect;
+    s.sampleParticleDepth = sampleParticleDepth;
     if (output && FindGraphOutputTextureAlias(*s.graph, *output))
         throw std::invalid_argument("A camera target attachment cannot also be imported as a persistent graph resource");
     s.viewport.Prepare(s.device, "camera/viewport/" + std::to_string(view.id), std::move(output), rect);
@@ -522,15 +748,21 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
     for (auto &[key, renderer] : s.regionRenderers)
         renderer->ClearBindings();
     s.cameraClearIndex = SIZE_MAX;
-    s.CompileSchedule();
     s.passes.clear();
     s.textures.clear();
     s.resolved.clear();
     s.colorResolves.clear();
     s.finalResolves.clear();
     s.depthResolver.Destroy();
+    PrepareGraphTemporalHistory(s.histories, s.device, *s.graph, s.width, s.height);
+    if (resetHistory)
+        InvalidateHistory();
     for (const auto &description : s.graph->textures) {
         Texture texture = s.CameraAttachment(description);
+        if (Impl::IsHistory(description)) {
+            const auto &history = s.histories.at(description.temporalKey);
+            texture = (description.role == GraphTextureRole::TemporalRead ? history.Read() : history.Write())->color;
+        }
         if (!texture && imports)
             texture = imports(description);
         if (!texture && description.renderTextureGeneration) {
@@ -544,6 +776,12 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
         }
         s.textures.emplace(description.name, std::move(texture));
     }
+    s.PrepareBuffers();
+    s.CompileSchedule();
+    s.eventPasses.clear();
+    for (const auto index : s.order)
+        if (!s.graph->passes[index].events.empty())
+            s.eventPasses.push_back(index);
     s.passes.resize(s.graph->passes.size());
     for (const auto index : s.order)
         if (s.graph->passes[index].type == GraphPassType::Raster)
@@ -588,11 +826,12 @@ void WebRenderGraph::UpdateParameters(const std::vector<GraphParameterBlockUpdat
 }
 
 void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
-                              const RecordRaster &raster, const RecordWork &work)
+                            const RecordRaster &raster)
 {
     auto &s = *m_impl;
     s.fullscreen.ResetPool();
     s.RestoreViewport(encoder);
+    s.RecordHistoryBindings(encoder);
     for (const auto index : s.order) {
         const auto &source = s.graph->passes[index];
         auto &prepared = s.passes[index];
@@ -611,31 +850,122 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
                         input.byteOffset = view.canonicalLights.offset;
                         input.byteSize = view.canonicalLights.byteSize;
                     }
+                    for (const auto &binding : program.historyInputs) {
+                        auto &input = program.inputs[binding.index];
+                        const auto &texture = s.textures.at(binding.texture->name);
+                        input.view = texture->GetView();
+                        input.sampler = texture->GetSampler();
+                        input.historyValid = binding.texture->role == GraphTextureRole::TemporalRead &&
+                                             s.histories.at(binding.texture->temporalKey).valid;
+                    }
                     s.fullscreen.DrawProgram(commands, program.pipeline, program.inputs.data(), program.parameters, nullptr, view);
                 } else
-                    raster(pass, command, prepared.raster, prepared.material);
+                    raster(pass, command, prepared.raster, prepared.material, prepared.particleDepth.get());
             }
             pass.End();
-        } else {
-            for (const auto &command : source.commands) {
-                if (command.type == GraphCommandType::CopyTexture) {
-                    const auto &from = s.textures.at(command.sourceResource);
-                    const auto &to = s.textures.at(command.destinationResource);
-                    rhi::TextureCopyRegion region;
-                    const auto extent = ResolveGraphPassExtent(*s.graph, source, s.width, s.height);
-                    region.width = command.copyWidth ? command.copyWidth : extent.first;
-                    region.height = command.copyHeight ? command.copyHeight : extent.second;
-                    region.depth = 1;
-                    WebGpuTransferCommandContext context;
-                    auto commands = s.device.MakeTransferCommandEncoder(context, encoder);
-                    commands.CopyTexture(from->GetTexture(), to->GetTexture(), region);
-                } else if (command.type != GraphCommandType::Present)
-                    work(encoder, command);
+        } else if (const auto *command = source.PrimaryCommand()) {
+            if (command->type == GraphCommandType::ComputeWork) {
+                auto pass = encoder.BeginComputePass();
+                WebGpuComputeCommandContext context;
+                auto commands = s.device.MakeComputeCommandEncoder(context, pass);
+                const auto &instance = *s.workStorage->instances.at(command->workBinding);
+                for (const auto &dispatch : instance.GetDispatches())
+                    if (!dispatch.RecordOne(commands))
+                        throw std::runtime_error("Prepared graph work could not record: " + source.name);
+                pass.End();
+            } else if (source.type == GraphPassType::Copy) {
+                WebGpuTransferCommandContext context;
+                auto commands = s.device.MakeTransferCommandEncoder(context, encoder);
+                const auto buffer = [&](const std::string &name) -> const GraphBufferDesc & {
+                    return *std::find_if(s.graph->buffers.begin(), s.graph->buffers.end(),
+                                         [&](const auto &item) { return item.name == name; });
+                };
+                switch (command->type) {
+                case GraphCommandType::CopyBuffer: {
+                    const auto &from = buffer(command->sourceResource);
+                    const auto &to = buffer(command->destinationResource);
+                    commands.CopyBuffer(s.GetBuffer(from.name), s.GetBuffer(to.name),
+                                        GraphBufferCopyRegion(*command, from, to));
+                    break;
+                }
+                case GraphCommandType::CopyTexture: {
+                    const auto &from = s.textures.at(command->sourceResource);
+                    const auto &to = s.textures.at(command->destinationResource);
+                    const auto &fromDesc = s.TextureDescription(command->sourceResource);
+                    const auto &toDesc = s.TextureDescription(command->destinationResource);
+                    const auto region = GraphTextureCopyRegion(fromDesc, toDesc, s.view);
+                    s.CopyRegion(encoder, from, to, 0, 0, 0, 0, region.width, region.height,
+                                 static_cast<rhi::SampleCount>(fromDesc.EffectiveSamples(s.samples)));
+                    break;
+                }
+                case GraphCommandType::CopyTextureToBuffer:
+                case GraphCommandType::CopyBufferToTexture: {
+                    const bool toBuffer = command->type == GraphCommandType::CopyTextureToBuffer;
+                    const auto &imageName = toBuffer ? command->sourceResource : command->destinationResource;
+                    const auto &value = buffer(toBuffer ? command->destinationResource : command->sourceResource);
+                    const auto &texture = s.textures.at(imageName);
+                    const auto region = GraphTextureBufferCopyRegion(*command, s.TextureDescription(imageName), value, s.view);
+                    const auto handle = s.GetBuffer(value.name);
+                    const bool copied = toBuffer ? commands.CopyTextureToBuffer(texture->GetTexture(), handle, region)
+                                                 : commands.CopyBufferToTexture(handle, texture->GetTexture(), region);
+                    if (!copied)
+                        throw std::runtime_error("Graph texture-buffer copy failed: " + s.device.LastError());
+                    break;
+                }
+                default:
+                    throw std::logic_error("Unexpected command in a graph copy pass");
+                }
             }
         }
     }
     s.RecordResolves(encoder, s.finalResolves);
     s.PublishOutput(encoder, Output());
+}
+
+std::shared_ptr<void> WebRenderGraph::RetainWorkStorage() const
+{
+    return m_impl->workStorage;
+}
+
+std::shared_ptr<GraphBufferCapture> WebRenderGraph::CaptureBuffer(const std::string &name)
+{
+    if (!m_impl->graph)
+        throw std::invalid_argument("The selected view has not prepared a render graph");
+    return m_impl->results.CaptureBuffer(*m_impl->graph, m_impl->view.id, name);
+}
+
+std::shared_ptr<GraphFramePublication>
+WebRenderGraph::PreparePublication(const GraphEventInterests &interests,
+                                  const std::function<std::shared_ptr<GraphEventViewSample>()> &sample)
+{
+    auto &s = *m_impl;
+    if (!s.workStorage && s.eventPasses.empty())
+        return {};
+    const RenderGraphWorkStorage empty;
+    return s.results.Prepare(*s.graph, s.workStorage ? *s.workStorage : empty, s.bufferContents, s.bufferWrites,
+                             s.eventPasses, interests, s.view.id, s.historyEpoch, sample);
+}
+
+void WebRenderGraph::AcceptHistory()
+{
+    m_impl->historyReset = false;
+    for (auto &[key, history] : m_impl->histories)
+        history.Accept();
+}
+
+void WebRenderGraph::InvalidateHistory() noexcept
+{
+    if (!m_impl->historyReset) {
+        ++m_impl->historyEpoch;
+        m_impl->historyReset = true;
+    }
+    for (auto &[key, history] : m_impl->histories)
+        history.Invalidate();
+}
+
+const RenderGraphDescription &WebRenderGraph::Description() const noexcept
+{
+    return *m_impl->graph;
 }
 
 WebRenderGraph::Texture WebRenderGraph::GetTexture(const std::string &name) const

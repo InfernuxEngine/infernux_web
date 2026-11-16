@@ -22,6 +22,7 @@
 #include <core/config/EngineConfig.h>
 #include <function/audio/AudioClipLoader.h>
 #include <function/renderer/gui/InxTextGeometry.h>
+#include <function/renderer/particle/ParticleGpuPublicationStatus.h>
 #include <function/resources/AssetDatabase/AssetDatabase.h>
 #include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/resources/InxFileLoader/InxDefaultLoader.hpp>
@@ -35,6 +36,7 @@
 #include <function/resources/ShaderAsset/ShaderLoader.h>
 #include <function/scene/SceneManager.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #endif
 
 #include <array>
@@ -56,6 +58,7 @@ namespace
 infernux::web::WebParticleRuntime *g_particleRuntime = nullptr;
 infernux::web::WebScreenUIRenderer *g_screenUIRenderer = nullptr;
 infernux::web::WebSceneRenderer *g_sceneRenderer = nullptr;
+infernux::web::WebGraphServices *g_graphServices = nullptr;
 infernux::rhi::ComputeHost *g_computeHost = nullptr;
 infernux::FrameWorkOwner *g_frameWork = nullptr;
 bool g_textInputActive = false;
@@ -99,6 +102,57 @@ PyObject *AcquireComputeHost(PyObject *, PyObject *)
 PyObject *GetFrameWork(PyObject *, PyObject *)
 {
     return pybind11::cast(g_frameWork, pybind11::return_value_policy::reference).release().ptr();
+}
+
+PyObject *CaptureGraphBuffer(PyObject *, PyObject *arguments)
+{
+    unsigned long long camera;
+    const char *name;
+    if (!PyArg_ParseTuple(arguments, "Ks:_capture_graph_buffer", &camera, &name))
+        return nullptr;
+    try {
+        return pybind11::cast(g_graphServices->capture(camera, name)).release().ptr();
+    } catch (const std::exception &error) {
+        PyErr_SetString(PyExc_RuntimeError, error.what());
+        return nullptr;
+    }
+}
+
+PyObject *WatchGraphEvents(PyObject *, PyObject *value)
+{
+    try {
+        const auto label = pybind11::cast<std::string>(pybind11::handle(value));
+        auto &interest = g_graphServices->interests[label];
+        auto active = interest.lock();
+        if (!active) {
+            active = std::make_shared<infernux::GraphEventInterest>();
+            interest = active;
+        }
+        return pybind11::cast(std::move(active)).release().ptr();
+    } catch (const std::exception &error) {
+        PyErr_SetString(PyExc_RuntimeError, error.what());
+        return nullptr;
+    }
+}
+
+PyObject *TakeGraphEvents(PyObject *, PyObject *)
+{
+    infernux::GraphEventQueue events;
+    events.splice(events.end(), g_graphServices->events);
+    return pybind11::cast(std::move(events)).release().ptr();
+}
+
+PyObject *IsGraphSubmissionCompleted(PyObject *, PyObject *value)
+{
+    try {
+        const auto [device, queue, serial] = pybind11::cast<
+            std::tuple<infernux::rhi::DeviceId, uint8_t, infernux::rhi::SubmissionSerial>>(pybind11::handle(value));
+        return PyBool_FromLong(g_computeHost->Queue().IsComplete(
+            {device, static_cast<infernux::rhi::QueueRole>(queue), serial}));
+    } catch (const std::exception &error) {
+        PyErr_SetString(PyExc_RuntimeError, error.what());
+        return nullptr;
+    }
 }
 
 struct ScreenUITextureLoad
@@ -259,6 +313,23 @@ PyObject *ConfigurePhysics(PyObject *, PyObject *arguments)
 #endif
 }
 
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+PyObject *ParticlePublicationResult(std::string error)
+{
+    using infernux::particle::GpuParticlePublicationStatus;
+    try {
+        const auto status =
+            error.empty() ? GpuParticlePublicationStatus::Published : GpuParticlePublicationStatus::Failed;
+        return pybind11::make_tuple(status, error).release().ptr();
+    } catch (pybind11::error_already_set &failure) {
+        failure.restore();
+        return nullptr;
+    } catch (const std::exception &failure) {
+        PyErr_SetString(PyExc_RuntimeError, failure.what());
+        return nullptr;
+    }
+}
+
 PyObject *ReplaceGpuParticleGraph(PyObject *, PyObject *arguments)
 {
     unsigned long long graphId = 0;
@@ -266,10 +337,9 @@ PyObject *ReplaceGpuParticleGraph(PyObject *, PyObject *arguments)
     PyObject *removeIds = nullptr;
     if (!PyArg_ParseTuple(arguments, "KOO:_replace_gpu_particle_graph", &graphId, &programs, &removeIds))
         return nullptr;
-    const std::string error = g_particleRuntime
-                                  ? g_particleRuntime->ReplaceGraph(static_cast<uint64_t>(graphId), programs, removeIds)
-                                  : "WebGPU particle runtime is not initialized";
-    return PyUnicode_FromString(error.c_str());
+    return ParticlePublicationResult(
+        g_particleRuntime ? g_particleRuntime->ReplaceGraph(static_cast<uint64_t>(graphId), programs, removeIds)
+                          : "WebGPU particle runtime is not initialized");
 }
 
 PyObject *ReplaceGpuParticleGraphs(PyObject *, PyObject *arguments)
@@ -277,39 +347,19 @@ PyObject *ReplaceGpuParticleGraphs(PyObject *, PyObject *arguments)
     PyObject *graphs = nullptr;
     if (!PyArg_ParseTuple(arguments, "O:_replace_gpu_particle_graphs", &graphs))
         return nullptr;
-    if (!g_particleRuntime)
-        return PyUnicode_FromString("WebGPU particle runtime is not initialized");
-    PyObject *sequence = PySequence_Fast(graphs, "particle graphs must be a sequence");
-    if (!sequence)
-        return nullptr;
-    std::string error;
-    for (Py_ssize_t index = 0; error.empty() && index < PySequence_Fast_GET_SIZE(sequence); ++index) {
-        PyObject *graph = PySequence_Fast_GET_ITEM(sequence, index);
-        if (!PyDict_Check(graph)) {
-            error = "WebGPU particle graph batch entries must be dictionaries";
-            break;
-        }
-        unsigned long long graphId = PyLong_AsUnsignedLongLong(PyDict_GetItemString(graph, "graph_instance_id"));
-        if (PyErr_Occurred()) {
-            PyErr_Clear();
-            error = "WebGPU particle graph batch identity is invalid";
-            break;
-        }
-        error = g_particleRuntime->ReplaceGraph(static_cast<uint64_t>(graphId), PyDict_GetItemString(graph, "programs"),
-                                                PyDict_GetItemString(graph, "remove_ids"));
-    }
-    Py_DECREF(sequence);
-    return PyUnicode_FromString(error.c_str());
+    return ParticlePublicationResult(g_particleRuntime ? g_particleRuntime->ReplaceGraphs(graphs)
+                                                       : "WebGPU particle runtime is not initialized");
 }
+#endif
 
 PyObject *UpdateGpuParticleParameters(PyObject *, PyObject *arguments)
 {
     unsigned long long graphId = 0;
-    PyObject *words = nullptr;
-    if (!PyArg_ParseTuple(arguments, "KO:_update_gpu_particle_parameters", &graphId, &words))
+    PyObject *updates = nullptr;
+    if (!PyArg_ParseTuple(arguments, "KO:_update_gpu_particle_parameters", &graphId, &updates))
         return nullptr;
     const std::string error = g_particleRuntime
-                                  ? g_particleRuntime->UpdateParameters(static_cast<uint64_t>(graphId), words)
+                                  ? g_particleRuntime->UpdateParameters(static_cast<uint64_t>(graphId), updates)
                                   : "WebGPU particle runtime is not initialized";
     return PyUnicode_FromString(error.c_str());
 }
@@ -840,6 +890,10 @@ PyMethodDef kMethods[] = {
     {"_load_render_texture", LoadRenderTexture, METH_O, "Acquire the shared imported target owner."},
     {"acquire_compute_host", AcquireComputeHost, METH_NOARGS, "Borrow the renderer's WebGPU compute services."},
     {"frame_work", GetFrameWork, METH_NOARGS, "Borrow the browser frame's native work owner."},
+    {"_capture_graph_buffer", CaptureGraphBuffer, METH_VARARGS, nullptr},
+    {"_watch_graph_events", WatchGraphEvents, METH_O, nullptr},
+    {"_take_graph_events", TakeGraphEvents, METH_NOARGS, nullptr},
+    {"_is_graph_submission_completed", IsGraphSubmissionCompleted, METH_O, nullptr},
 #endif
     {"read_entry", ReadPackageEntry, METH_VARARGS,
      "Read and validate one entry from the native Infernux Player container."},
@@ -848,8 +902,10 @@ PyMethodDef kMethods[] = {
      "Install the immutable cooked GUID catalog and runtime asset loaders."},
     {"configure_physics", ConfigurePhysics, METH_VARARGS,
      "Apply validated project physics settings before the Web physics world is created."},
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
     {"_replace_gpu_particle_graph", ReplaceGpuParticleGraph, METH_VARARGS, nullptr},
     {"_replace_gpu_particle_graphs", ReplaceGpuParticleGraphs, METH_VARARGS, nullptr},
+#endif
     {"_update_gpu_particle_parameters", UpdateGpuParticleParameters, METH_VARARGS, nullptr},
     {"_begin_gpu_particle_batch", BeginGpuParticleBatch, METH_VARARGS, nullptr},
     {"_set_gpu_particle_emitter_playing", SetGpuParticleEmitterPlaying, METH_VARARGS, nullptr},
@@ -908,6 +964,11 @@ void InfernuxWebSetScreenUIRenderer(infernux::web::WebScreenUIRenderer *renderer
 void InfernuxWebSetSceneRenderer(infernux::web::WebSceneRenderer *renderer) noexcept
 {
     g_sceneRenderer = renderer;
+}
+
+void InfernuxWebSetGraphServices(infernux::web::WebGraphServices *services) noexcept
+{
+    g_graphServices = services;
 }
 
 void InfernuxWebSetComputeHost(infernux::rhi::ComputeHost *host) noexcept

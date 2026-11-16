@@ -21,6 +21,8 @@ class WebGpuComputeQueue final : public rhi::ComputeQueue
     [[nodiscard]] std::optional<rhi::SubmissionTicket> TrySubmit(const Recorder &record,
                                                                  const rhi::ComputeSubmissionResources &resources = {},
                                                                  const Admission &admit = {}) override;
+    [[nodiscard]] rhi::SubmissionTicket SubmitGraphics(const std::function<wgpu::CommandBuffer()> &record,
+                                                       std::shared_ptr<void> retained);
     void Wait(rhi::SubmissionTicket ticket) override;
     [[nodiscard]] bool WaitFor(rhi::SubmissionTicket ticket, uint64_t timeoutNanoseconds) override;
     [[nodiscard]] bool IsComplete(rhi::SubmissionTicket ticket) override;
@@ -34,12 +36,14 @@ class WebGpuComputeQueue final : public rhi::ComputeQueue
   private:
     struct Completion;
     [[nodiscard]] rhi::SubmissionTicket Record(const Recorder &record, rhi::ComputeSubmissionResources resources);
+    rhi::SubmissionTicket Enqueue(const std::shared_ptr<Completion> &completion, wgpu::CommandBuffer commands);
     void RequireTicket(rhi::SubmissionTicket ticket) const;
 
     WebGpuRhiDevice &m_device;
     uint32_t m_capacity;
     rhi::SubmissionSerial m_submitted = 0;
     rhi::SubmissionSerial m_completed = 0;
+    uint32_t m_pendingCompute = 0;
     std::deque<std::shared_ptr<Completion>> m_pending;
 };
 
