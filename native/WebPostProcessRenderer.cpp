@@ -93,6 +93,7 @@ struct WebPostProcessRenderer::Impl
         std::vector<FullscreenResourceInput> inputs;
         std::vector<Texture> sources;
         Texture target;
+        WebGpuRasterPass raster;
     };
 
     explicit Impl(WebGpuRhiDevice &rhi, rhi::PixelFormat format, uint32_t samples)
@@ -237,6 +238,20 @@ struct WebPostProcessRenderer::Impl
         display = Program(Effect::Display, {}, {{"source_tex", color}},
                           {{"target_is_srgb", rhi::IsSrgbFormat(surfaceFormat)}});
         CompileSchedule();
+        // Prepare only after the vector has its final storage: native
+        // attachment pointers refer to each pass's own cached arrays.
+        for (auto &pass : passes) {
+            rhi::RasterPassDescription raster;
+            raster.width = pass.target->width;
+            raster.height = pass.target->height;
+            raster.colorCount = 1;
+            auto &color = raster.colors[0];
+            color.view = pass.target->color->GetView();
+            color.format = pass.target->color->GetFormat();
+            color.load = rhi::AttachmentLoad::Clear;
+            color.clear = {0, 0, 0, 1};
+            device.PrepareRasterPass(raster, pass.raster);
+        }
     }
 
     void CompileSchedule()
@@ -416,15 +431,7 @@ bool WebPostProcessRenderer::Prepare(wgpu::CommandEncoder encoder)
     impl.renderer.ResetPool();
     for (const auto index : impl.executionOrder) {
         const auto &prepared = impl.passes[index];
-        wgpu::RenderPassColorAttachment attachment{};
-        attachment.view = impl.device.GetNativeTextureView(prepared.target->color->GetView());
-        attachment.loadOp = wgpu::LoadOp::Clear;
-        attachment.storeOp = wgpu::StoreOp::Store;
-        attachment.clearValue = {0.0, 0.0, 0.0, 1.0};
-        wgpu::RenderPassDescriptor descriptor{};
-        descriptor.colorAttachmentCount = 1;
-        descriptor.colorAttachments = &attachment;
-        auto pass = encoder.BeginRenderPass(&descriptor);
+        auto pass = encoder.BeginRenderPass(&prepared.raster.descriptor);
         impl.Draw(pass, prepared);
         pass.End();
     }

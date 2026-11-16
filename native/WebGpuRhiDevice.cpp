@@ -1099,6 +1099,55 @@ INFERNUX_WEB_RELEASE(ComputePipeline, m_computePipelines, m_freeComputePipeline)
 
 #undef INFERNUX_WEB_RELEASE
 
+void WebGpuRhiDevice::PrepareRasterPass(const rhi::RasterPassDescription &description, WebGpuRasterPass &result) const
+{
+    if (description.colorCount > description.colors.size())
+        throw std::invalid_argument("Raster pass exceeds the color attachment limit");
+    result = {};
+    for (uint32_t i = 0; i < description.colorCount; ++i) {
+        const auto &source = description.colors[i];
+        auto &attachment = result.colors[i];
+        attachment.view = GetNativeTextureView(source.view);
+        attachment.resolveTarget = GetNativeTextureView(source.resolve);
+        attachment.loadOp = source.load == rhi::AttachmentLoad::Clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
+        attachment.storeOp =
+            source.store == rhi::AttachmentStore::Store ? wgpu::StoreOp::Store : wgpu::StoreOp::Discard;
+        std::array<double, 4> clear;
+        for (size_t channel = 0; channel < clear.size(); ++channel)
+            clear[channel] =
+                rhi::IsIntegerFormat(source.format)
+                    ? double(static_cast<uint32_t>(std::clamp(double{source.clear[channel]}, 0.0, double{UINT32_MAX})))
+                    : double{source.clear[channel]};
+        attachment.clearValue = {clear[0], clear[1], clear[2], clear[3]};
+    }
+    result.descriptor.colorAttachmentCount = description.colorCount;
+    result.descriptor.colorAttachments = description.colorCount ? result.colors.data() : nullptr;
+    const auto &depth = description.depth;
+    if (depth.view.IsValid()) {
+        auto &attachment = result.depth;
+        attachment.view = GetNativeTextureView(depth.view);
+        attachment.depthReadOnly = depth.readOnly;
+        attachment.depthClearValue = depth.clear;
+        // WebGPU requires absent load/store operations for read-only aspects.
+        // A zero-initialized native descriptor has Undefined, not Load/Store.
+        if (!depth.readOnly) {
+            attachment.depthLoadOp =
+                depth.load == rhi::AttachmentLoad::Clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
+            attachment.depthStoreOp =
+                depth.store == rhi::AttachmentStore::Store ? wgpu::StoreOp::Store : wgpu::StoreOp::Discard;
+        }
+        if (rhi::IsStencilFormat(depth.format)) {
+            attachment.stencilReadOnly = depth.readOnly;
+            attachment.stencilClearValue = depth.clearStencil;
+            if (!depth.readOnly) {
+                attachment.stencilLoadOp = attachment.depthLoadOp;
+                attachment.stencilStoreOp = attachment.depthStoreOp;
+            }
+        }
+        result.descriptor.depthStencilAttachment = &attachment;
+    }
+}
+
 rhi::GraphicsCommandEncoder WebGpuRhiDevice::MakeGraphicsCommandEncoder(WebGpuGraphicsCommandContext &context,
                                                                         wgpu::RenderPassEncoder pass) noexcept
 {

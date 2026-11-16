@@ -110,6 +110,7 @@ struct WebSceneRenderer::Impl
         Buffer camera, globals, lighting, canonicalLights, models, skins, bones, instances;
         std::vector<Buffer> shadowCameras, shadowParameters;
         Texture shadow;
+        WebGpuRasterPass shadowPass;
         std::unordered_map<RenderDrawIdentity, Material, RenderDrawIdentityHash> materials;
     };
     std::unordered_map<uint64_t, ViewResources> views;
@@ -542,8 +543,15 @@ bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uin
     s.clear = {background.r, background.g, background.b, background.a};
     s.current = &s.views[view.cameraId];
     s.current->lastFrame = s.frameIndex;
-    if (!s.current->shadow)
+    if (!s.current->shadow) {
         s.current->shadow = s.Attachment(Impl::shadowResolution, Impl::shadowResolution, 1, true);
+        rhi::RasterPassDescription raster;
+        raster.width = raster.height = Impl::shadowResolution;
+        raster.depth.view = s.current->shadow->GetView();
+        raster.depth.format = s.current->shadow->GetFormat();
+        raster.depth.load = rhi::AttachmentLoad::Clear;
+        s.device->PrepareRasterPass(raster, s.current->shadowPass);
+    }
     s.draws.clear();
     s.modelValues.clear();
     s.skinValues.clear();
@@ -628,14 +636,7 @@ bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uin
     });
     // Every shadow type uses the engine's atlas assignment and authored shadow
     // pass. Alpha clipping, deformation and skinning therefore match the color pass.
-    wgpu::RenderPassDepthStencilAttachment attachment{};
-    attachment.view = s.device->GetNativeTextureView(s.current->shadow->GetView());
-    attachment.depthLoadOp = wgpu::LoadOp::Clear;
-    attachment.depthStoreOp = wgpu::StoreOp::Store;
-    attachment.depthClearValue = 0.0;
-    wgpu::RenderPassDescriptor descriptor{};
-    descriptor.depthStencilAttachment = &attachment;
-    auto pass = encoder.BeginRenderPass(&descriptor);
+    auto pass = encoder.BeginRenderPass(&s.current->shadowPass.descriptor);
     WebGpuGraphicsCommandContext context;
     auto commands = s.device->MakeGraphicsCommandEncoder(context, pass);
     for (uint32_t i = 0; i < shadows.views.size(); ++i) {

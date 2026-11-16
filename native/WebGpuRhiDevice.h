@@ -2,6 +2,7 @@
 
 #include <function/renderer/rhi/RhiCommand.h>
 #include <function/renderer/rhi/RhiDevice.h>
+#include <function/renderer/rhi/RhiRasterPass.h>
 #include <function/renderer/rhi/RhiTexture.h>
 #include <function/renderer/rhi/RhiUpload.h>
 
@@ -25,6 +26,13 @@ inline constexpr uint32_t WebPushConstantBinding = rhi::RootConstantBinding;
 }
 
 class WebGpuRhiDevice;
+
+struct WebGpuRasterPass
+{
+    std::array<wgpu::RenderPassColorAttachment, rhi::RasterPassDescription::MaxColorTargets> colors{};
+    wgpu::RenderPassDepthStencilAttachment depth{};
+    wgpu::RenderPassDescriptor descriptor{};
+};
 
 struct WebGpuGraphicsCommandContext final
 {
@@ -98,6 +106,7 @@ class WebGpuRhiDevice final : public rhi::Device
     void Release(rhi::GraphicsPipelineHandle handle) noexcept override;
     void Release(rhi::ComputePipelineHandle handle) noexcept override;
 
+    void PrepareRasterPass(const rhi::RasterPassDescription &description, WebGpuRasterPass &result) const;
     [[nodiscard]] rhi::GraphicsCommandEncoder MakeGraphicsCommandEncoder(WebGpuGraphicsCommandContext &context,
                                                                          wgpu::RenderPassEncoder pass) noexcept;
     [[nodiscard]] rhi::ComputeCommandEncoder MakeComputeCommandEncoder(WebGpuComputeCommandContext &context,
