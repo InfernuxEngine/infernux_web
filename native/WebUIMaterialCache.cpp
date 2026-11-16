@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -185,21 +184,23 @@ void WebUIMaterialCache::PrepareProgram(Prepared &result, const std::shared_ptr<
 {
     result.code = code;
     result.world = world;
-    const auto vertex = std::find_if(code->entries.begin(), code->entries.end(),
-                                     [](const auto &entry) { return entry.stage == rhi::ShaderStage::Vertex; });
-    result.rootBytes = vertex->rootConstants->byteSize;
-    std::set<std::array<uint32_t, 2>> used;
-    for (const auto &entry : code->entries)
-        used.insert(entry.bindings.begin(), entry.bindings.end());
+    std::vector<ShaderStageSelection> stages;
+    for (uint32_t index = 0; index < code->entries.size(); ++index)
+        stages.push_back({*code, index});
+    const auto linked = LinkShaderStages(stages);
+    result.rootBytes = linked.rootConstants->byteSize;
     std::vector<wgpu::BindGroupLayoutEntry> entries;
-    for (const auto &resource : code->resources) {
-        if (resource.set != 0 || resource.binding.binding == rhi::RootConstantBinding ||
-            !used.count({resource.set, resource.binding.binding}))
+    for (const auto &resource : linked.resources) {
+        if (resource.set != 0 || resource.binding.binding == rhi::RootConstantBinding)
             continue;
         result.resources.push_back(resource);
         wgpu::BindGroupLayoutEntry entry;
         entry.binding = resource.binding.binding;
-        entry.visibility = wgpu::ShaderStage::Fragment;
+        entry.visibility = wgpu::ShaderStage::None;
+        if (rhi::HasShaderStage(resource.binding.visibility, rhi::ShaderStage::Vertex))
+            entry.visibility |= wgpu::ShaderStage::Vertex;
+        if (rhi::HasShaderStage(resource.binding.visibility, rhi::ShaderStage::Fragment))
+            entry.visibility |= wgpu::ShaderStage::Fragment;
         switch (resource.binding.type) {
         case rhi::BindingType::UniformBuffer:
             entry.buffer.type = wgpu::BufferBindingType::Uniform;
