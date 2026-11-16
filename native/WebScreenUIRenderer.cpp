@@ -1,6 +1,9 @@
 #include "WebScreenUIRenderer.h"
+#include "WebGpuRhiDevice.h"
 #include "WebSceneRenderer.h"
 #include "WebTextureUpload.h"
+#include <function/renderer/MaterialSamplerState.h>
+#include <function/renderer/TextureUploadBuilder.h>
 #include <function/scene/Camera.h>
 
 #include "InfernuxWebHostModule.h"
@@ -32,64 +35,6 @@ constexpr float kPi = 3.14159265358979323846f;
 
 void CommandBoundary(const ImDrawList *, const ImDrawCmd *)
 {
-}
-
-wgpu::SamplerDescriptor UISamplerDescriptor(const std::string &filterMode, const std::string &wrapMode, int anisoLevel,
-                                            const MaterialTextureSampler &override)
-{
-    wgpu::SamplerDescriptor descriptor;
-    const wgpu::AddressMode inheritedAddress = wrapMode == "repeat"   ? wgpu::AddressMode::Repeat
-                                               : wrapMode == "mirror" ? wgpu::AddressMode::MirrorRepeat
-                                                                      : wgpu::AddressMode::ClampToEdge;
-    const auto address = [inheritedAddress](MaterialSamplerAddress value) {
-        switch (value) {
-        case MaterialSamplerAddress::Repeat:
-            return wgpu::AddressMode::Repeat;
-        case MaterialSamplerAddress::Clamp:
-            return wgpu::AddressMode::ClampToEdge;
-        case MaterialSamplerAddress::Mirror:
-            return wgpu::AddressMode::MirrorRepeat;
-        case MaterialSamplerAddress::Inherit:
-            return inheritedAddress;
-        }
-        return inheritedAddress;
-    };
-    descriptor.addressModeU = address(override.addressU);
-    descriptor.addressModeV = address(override.addressV);
-    descriptor.addressModeW = address(override.addressW);
-    const bool point = filterMode == "point";
-    const auto filter = [point](MaterialSamplerFilter value) {
-        switch (value) {
-        case MaterialSamplerFilter::Nearest:
-            return wgpu::FilterMode::Nearest;
-        case MaterialSamplerFilter::Linear:
-            return wgpu::FilterMode::Linear;
-        case MaterialSamplerFilter::Inherit:
-            return point ? wgpu::FilterMode::Nearest : wgpu::FilterMode::Linear;
-        }
-        return wgpu::FilterMode::Linear;
-    };
-    descriptor.minFilter = filter(override.minFilter);
-    descriptor.magFilter = filter(override.magFilter);
-    const uint16_t assetAnisotropy =
-        point ? 1u : static_cast<uint16_t>(std::clamp(anisoLevel < 0 ? 16 : anisoLevel, 1, 16));
-    const bool assetMipLinear = filterMode == "trilinear" || assetAnisotropy > 1u;
-    switch (override.mipFilter) {
-    case MaterialSamplerFilter::Nearest:
-        descriptor.mipmapFilter = wgpu::MipmapFilterMode::Nearest;
-        break;
-    case MaterialSamplerFilter::Linear:
-        descriptor.mipmapFilter = wgpu::MipmapFilterMode::Linear;
-        break;
-    case MaterialSamplerFilter::Inherit:
-        descriptor.mipmapFilter = assetMipLinear ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
-        break;
-    }
-    const bool fullyLinear = descriptor.minFilter == wgpu::FilterMode::Linear &&
-                             descriptor.magFilter == wgpu::FilterMode::Linear &&
-                             descriptor.mipmapFilter == wgpu::MipmapFilterMode::Linear;
-    descriptor.maxAnisotropy = fullyLinear ? assetAnisotropy : 1u;
-    return descriptor;
 }
 
 uint64_t GrowCapacity(uint64_t required)
@@ -148,17 +93,18 @@ WebScreenUIRenderer::~WebScreenUIRenderer()
     }
 }
 
-bool WebScreenUIRenderer::Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::TextureFormat colorFormat,
+bool WebScreenUIRenderer::Initialize(WebGpuRhiDevice &device, wgpu::TextureFormat colorFormat,
                                      wgpu::TextureFormat worldColorFormat, uint32_t worldSampleCount,
                                      WebSceneRenderer &scene)
 {
-    m_device = device;
-    m_queue = queue;
+    m_rhi = &device;
+    m_device = device.NativeDevice();
+    m_queue = device.NativeQueue();
     m_colorFormat = colorFormat;
     m_worldColorFormat = worldColorFormat;
     m_worldSampleCount = worldSampleCount;
     m_materials = std::make_unique<WebUIMaterialCache>();
-    m_materials->Initialize(device, queue, colorFormat, worldColorFormat, worldSampleCount,
+    m_materials->Initialize(m_device, m_queue, colorFormat, worldColorFormat, worldSampleCount,
                             [&scene](const std::string &guid, const MaterialTextureSampler *sampler) {
                                 const auto texture = scene.ResolveSampledTexture(guid, sampler);
                                 return WebUIMaterialCache::Texture{texture.view, texture.sampler};
@@ -185,32 +131,37 @@ bool WebScreenUIRenderer::Initialize(wgpu::Device device, wgpu::Queue queue, wgp
     m_overlay = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData());
     m_world = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData());
 
-    wgpu::TextureDescriptor textureDescriptor;
-    textureDescriptor.dimension = wgpu::TextureDimension::e2D;
-    textureDescriptor.size = {static_cast<uint32_t>(atlasWidth), static_cast<uint32_t>(atlasHeight), 1};
-    textureDescriptor.format = wgpu::TextureFormat::RGBA8Unorm;
-    textureDescriptor.mipLevelCount = 1;
-    textureDescriptor.sampleCount = 1;
-    textureDescriptor.usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding;
-    m_fontTexture = m_device.CreateTexture(&textureDescriptor);
-    m_fontWidth = static_cast<uint32_t>(atlasWidth);
-    m_fontHeight = static_cast<uint32_t>(atlasHeight);
-    m_fontView = m_fontTexture ? m_fontTexture.CreateView() : wgpu::TextureView{};
-    wgpu::TexelCopyTextureInfo destination;
-    destination.texture = m_fontTexture;
-    wgpu::TexelCopyBufferLayout layout;
-    layout.bytesPerRow = static_cast<uint32_t>(atlasWidth * 4);
-    layout.rowsPerImage = static_cast<uint32_t>(atlasHeight);
-    const wgpu::Extent3D extent{static_cast<uint32_t>(atlasWidth), static_cast<uint32_t>(atlasHeight), 1};
-    m_queue.WriteTexture(&destination, pixels, static_cast<size_t>(atlasWidth * atlasHeight * 4), &layout, &extent);
+    return UploadFontAtlas() && CreatePipelineAndFontAtlas();
+}
 
-    wgpu::SamplerDescriptor samplerDescriptor;
-    samplerDescriptor.addressModeU = wgpu::AddressMode::ClampToEdge;
-    samplerDescriptor.addressModeV = wgpu::AddressMode::ClampToEdge;
-    samplerDescriptor.minFilter = wgpu::FilterMode::Linear;
-    samplerDescriptor.magFilter = wgpu::FilterMode::Linear;
-    m_fontSampler = m_device.CreateSampler(&samplerDescriptor);
-    return m_fontTexture && m_fontView && m_fontSampler && CreatePipelineAndFontAtlas();
+bool WebScreenUIRenderer::UploadFontAtlas()
+{
+    unsigned char *pixels = nullptr;
+    int width = 0, height = 0;
+    ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    if (!pixels || width < 1 || height < 1)
+        return false;
+    const size_t rowPitch = static_cast<size_t>(width) * 4;
+    const size_t bytes = rowPitch * height;
+    rhi::TextureSubresourceUpload mip{
+        pixels, bytes, 0, 0, 1, static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1, rowPitch, bytes};
+    rhi::TextureUploadRequest upload;
+    upload.texture.width = static_cast<uint32_t>(width);
+    upload.texture.height = static_cast<uint32_t>(height);
+    upload.texture.format = rhi::PixelFormat::RGBA8UNorm;
+    upload.texture.usage = rhi::TextureUsageFlags::Sampled | rhi::TextureUsageFlags::TransferDestination;
+    upload.sampler = MaterialSamplerDescription("bilinear", "clamp", 1, 1, m_rhi->GetCapabilities());
+    upload.subresources = &mip;
+    upload.subresourceCount = 1;
+    auto resource = m_rhi->UploadTexture(upload);
+    if (!resource)
+        return false;
+    m_fontTexture =
+        std::make_shared<const rhi::TextureGpuView>("ui-font-atlas", ++m_textureRevision, std::move(resource));
+    m_fontView = m_rhi->GetNativeTextureView(m_fontTexture->GetView());
+    m_fontSampler = m_rhi->GetNativeSampler(m_fontTexture->GetSampler());
+    m_materialSamplers.clear();
+    return true;
 }
 
 bool WebScreenUIRenderer::ConfigureSampleCount(uint32_t sampleCount)
@@ -229,38 +180,8 @@ bool WebScreenUIRenderer::RefreshFontAtlas()
     if (!m_fontAtlasDirty || !m_context || !m_device || !m_queue || !m_textureLayout)
         return true;
     ImGui::SetCurrentContext(m_context);
-    unsigned char *pixels = nullptr;
-    int atlasWidth = 0;
-    int atlasHeight = 0;
-    ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&pixels, &atlasWidth, &atlasHeight);
-    if (!pixels || atlasWidth < 1 || atlasHeight < 1)
+    if (!UploadFontAtlas())
         return false;
-
-    const uint32_t width = static_cast<uint32_t>(atlasWidth);
-    const uint32_t height = static_cast<uint32_t>(atlasHeight);
-    if (!m_fontTexture || width != m_fontWidth || height != m_fontHeight) {
-        wgpu::TextureDescriptor textureDescriptor;
-        textureDescriptor.dimension = wgpu::TextureDimension::e2D;
-        textureDescriptor.size = {width, height, 1};
-        textureDescriptor.format = wgpu::TextureFormat::RGBA8Unorm;
-        textureDescriptor.mipLevelCount = 1;
-        textureDescriptor.sampleCount = 1;
-        textureDescriptor.usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding;
-        m_fontTexture = m_device.CreateTexture(&textureDescriptor);
-        m_fontView = m_fontTexture ? m_fontTexture.CreateView() : wgpu::TextureView{};
-        m_fontWidth = width;
-        m_fontHeight = height;
-    }
-    if (!m_fontTexture || !m_fontView)
-        return false;
-
-    wgpu::TexelCopyTextureInfo destination;
-    destination.texture = m_fontTexture;
-    wgpu::TexelCopyBufferLayout layout;
-    layout.bytesPerRow = width * 4;
-    layout.rowsPerImage = height;
-    const wgpu::Extent3D extent{width, height, 1};
-    m_queue.WriteTexture(&destination, pixels, static_cast<size_t>(width) * height * 4, &layout, &extent);
 
     std::array<wgpu::BindGroupEntry, 2> groupEntries{};
     groupEntries[0].binding = 0;
@@ -320,16 +241,20 @@ std::pair<wgpu::Sampler, std::string> WebScreenUIRenderer::ResolveMaterialSample
                              static_cast<uint8_t>(override->addressV), static_cast<uint8_t>(override->addressW)})
         key.push_back(static_cast<char>('0' + value));
     if (const auto cached = m_materialSamplers.find(key); cached != m_materialSamplers.end())
-        return {cached->second, key};
+        return {m_rhi->GetNativeSampler(cached->second->GetSampler()), key};
     const std::string filterMode = textureId == kFontTextureId ? "bilinear" : texture->second.filterMode;
     const std::string wrapMode = textureId == kFontTextureId ? "clamp" : texture->second.wrapMode;
     const int anisoLevel = textureId == kFontTextureId ? 1 : texture->second.anisoLevel;
-    auto descriptor = UISamplerDescriptor(filterMode, wrapMode, anisoLevel, *override);
-    descriptor.lodMaxClamp = static_cast<float>(textureId == kFontTextureId ? 0 : texture->second.mipLevels - 1);
-    const auto sampler = m_device.CreateSampler(&descriptor);
-    if (!sampler)
+    const auto source = textureId == kFontTextureId ? m_fontTexture : texture->second.resource;
+    const auto mipCount = textureId == kFontTextureId ? 1u : texture->second.mipLevels;
+    const auto descriptor =
+        MaterialSamplerDescription(filterMode, wrapMode, anisoLevel, mipCount, m_rhi->GetCapabilities(), *override);
+    auto publication = rhi::WithTextureSampler(*m_rhi, source, descriptor);
+    if (!publication)
         throw std::runtime_error("WebGPU rejected UI material texture sampler: " + binding.materialGuid);
-    return {m_materialSamplers.emplace(key, sampler).first->second, key};
+    const auto sampler = m_rhi->GetNativeSampler(publication->GetSampler());
+    m_materialSamplers.emplace(key, std::move(publication));
+    return {sampler, key};
 }
 
 ImDrawList *WebScreenUIRenderer::DrawList(int list) const
@@ -613,51 +538,23 @@ uint64_t WebScreenUIRenderer::UploadTexture(const TextureCpuData &source, uint64
             return 0;
     }
     const TextureCpuData &texture = decoded ? *decoded : source;
-    const wgpu::TextureFormat format = ToWebTextureFormat(texture.format);
-    if (format == wgpu::TextureFormat::Undefined)
+    const auto sampler = MaterialSamplerDescription(
+        filterMode, wrapMode, anisoLevel, static_cast<uint32_t>(texture.mipLevels.size()), m_rhi->GetCapabilities());
+    TextureUploadBatch batch(texture, sampler);
+    auto resource = m_rhi->UploadTexture(batch.GetRequest());
+    if (!resource)
         return 0;
-    if (texture.mipLevels.size() > std::numeric_limits<uint32_t>::max())
-        return 0;
-    const TextureMipLevel &baseMip = texture.mipLevels.front();
-    for (const TextureMipLevel &mip : texture.mipLevels)
-        if (mip.width == 0 || mip.height == 0 || mip.depth != 1 || mip.byteOffset > texture.bytes.size() ||
-            mip.byteSize > texture.bytes.size() - mip.byteOffset || mip.rowPitch > std::numeric_limits<uint32_t>::max())
-            return 0;
-
-    wgpu::TextureDescriptor descriptor;
-    descriptor.dimension = wgpu::TextureDimension::e2D;
-    descriptor.size = {baseMip.width, baseMip.height, 1};
-    descriptor.format = format;
-    descriptor.mipLevelCount = static_cast<uint32_t>(texture.mipLevels.size());
-    descriptor.sampleCount = 1;
-    descriptor.usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding;
+    const uint64_t id = replaceTextureId > kFontTextureId ? replaceTextureId : m_nextTextureId++;
     GPUTexture gpu;
+    gpu.resource = std::make_shared<const rhi::TextureGpuView>("ui:" + std::to_string(id), ++m_textureRevision,
+                                                               std::move(resource));
+    gpu.view = m_rhi->GetNativeTextureView(gpu.resource->GetView());
+    gpu.sampler = m_rhi->GetNativeSampler(gpu.resource->GetSampler());
     gpu.filterMode = filterMode;
     gpu.wrapMode = wrapMode;
     gpu.anisoLevel = anisoLevel;
-    gpu.mipLevels = descriptor.mipLevelCount;
+    gpu.mipLevels = batch.GetRequest().texture.mipLevels;
     gpu.srgb = TextureFormatIsSrgb(texture.format);
-    gpu.texture = m_device.CreateTexture(&descriptor);
-    gpu.view = gpu.texture ? gpu.texture.CreateView() : wgpu::TextureView{};
-
-    auto samplerDescriptor = UISamplerDescriptor(filterMode, wrapMode, anisoLevel, {});
-    samplerDescriptor.lodMaxClamp = static_cast<float>(descriptor.mipLevelCount - 1);
-    gpu.sampler = m_device.CreateSampler(&samplerDescriptor);
-    if (!gpu.texture || !gpu.view || !gpu.sampler)
-        return 0;
-
-    for (uint32_t level = 0; level < descriptor.mipLevelCount; ++level) {
-        const TextureMipLevel &mip = texture.mipLevels[level];
-        wgpu::TexelCopyTextureInfo destination;
-        destination.texture = gpu.texture;
-        destination.mipLevel = level;
-        wgpu::TexelCopyBufferLayout layout;
-        layout.bytesPerRow = static_cast<uint32_t>(mip.rowPitch);
-        layout.rowsPerImage = mip.height;
-        const wgpu::Extent3D extent{mip.width, mip.height, 1};
-        m_queue.WriteTexture(&destination, texture.bytes.data() + mip.byteOffset, static_cast<size_t>(mip.byteSize),
-                             &layout, &extent);
-    }
 
     std::array<wgpu::BindGroupEntry, 2> entries{};
     entries[0].binding = 0;
@@ -672,7 +569,6 @@ uint64_t WebScreenUIRenderer::UploadTexture(const TextureCpuData &source, uint64
     if (!gpu.group)
         return 0;
 
-    const uint64_t id = replaceTextureId > kFontTextureId ? replaceTextureId : m_nextTextureId++;
     if (replaceTextureId > kFontTextureId)
         m_materialSamplers.clear();
     m_textures.insert_or_assign(id, std::move(gpu));

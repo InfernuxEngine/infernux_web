@@ -2,6 +2,8 @@
 
 #include <function/renderer/rhi/RhiCommand.h>
 #include <function/renderer/rhi/RhiDevice.h>
+#include <function/renderer/rhi/RhiTexture.h>
+#include <function/renderer/rhi/RhiUpload.h>
 
 #include <webgpu/webgpu_cpp.h>
 
@@ -81,6 +83,9 @@ class WebGpuRhiDevice final : public rhi::Device
     [[nodiscard]] rhi::ComputePipelineHandle CreateComputePipeline(const rhi::ComputePipelineDesc &desc) override;
 
     bool WriteBuffer(rhi::BufferHandle handle, uint64_t offset, const void *data, uint64_t byteSize) override;
+    /// Queue imported mip payloads before subsequent draws. Browser queue writes
+    /// capture their input bytes immediately; no CPU completion wait is needed.
+    [[nodiscard]] std::shared_ptr<rhi::TextureResource> UploadTexture(const rhi::TextureUploadRequest &request);
     [[nodiscard]] bool ReadBuffer(rhi::BufferHandle handle, uint64_t offset, void *data, uint64_t byteSize) override;
 
     void Release(rhi::BufferHandle handle) noexcept override;
@@ -104,6 +109,7 @@ class WebGpuRhiDevice final : public rhi::Device
     /// produced by backend-neutral compute systems.
     [[nodiscard]] wgpu::Buffer GetNativeBuffer(rhi::BufferHandle handle) const noexcept;
     [[nodiscard]] wgpu::TextureView GetNativeTextureView(rhi::TextureViewHandle handle) const noexcept;
+    [[nodiscard]] wgpu::Sampler GetNativeSampler(rhi::SamplerHandle handle) const noexcept;
     [[nodiscard]] wgpu::Device NativeDevice() const noexcept
     {
         return m_device;

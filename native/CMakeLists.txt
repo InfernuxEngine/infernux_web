@@ -210,6 +210,7 @@ add_executable(InfernuxWebPlayerHost
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/particle/ParticleGpuContinuationRuntime.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/particle/ParticleGpuRuntime.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/FullscreenRenderer.cpp"
+    "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/TextureUploadBuilder.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/RenderPoseBuffer.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/shader/DeviceShaderProgram.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/renderer/rhi/RhiComputeBuffer.cpp"

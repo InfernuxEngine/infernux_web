@@ -3,7 +3,9 @@
 #include "WebTextureUpload.h"
 
 #include <core/types/ColorSpace.h>
+#include <function/renderer/MaterialSamplerState.h>
 #include <function/renderer/RendererParameterBlock.h>
+#include <function/renderer/TextureUploadBuilder.h>
 #include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/resources/InxMaterial/InxMaterial.h>
 #include <function/resources/InxTexture/InxTexture.h>
@@ -425,98 +427,16 @@ WebSceneRenderer::GPUTexture WebSceneRenderer::UploadMaterialTexture(const Textu
             return gpu;
         upload = &*decoded;
     }
-    const wgpu::TextureFormat format = ToWebTextureFormat(upload->format);
-    const TextureMipLevel &baseMip = upload->mipLevels.front();
-    if (format == wgpu::TextureFormat::Undefined || baseMip.width == 0 || baseMip.height == 0 ||
-        upload->mipLevels.size() > std::numeric_limits<uint32_t>::max())
-        return gpu;
-    for (const TextureMipLevel &mip : upload->mipLevels) {
-        if (mip.width == 0 || mip.height == 0 || mip.depth != 1 || mip.byteOffset > upload->bytes.size() ||
-            mip.byteSize > upload->bytes.size() - mip.byteOffset || mip.rowPitch > std::numeric_limits<uint32_t>::max())
-            return {};
-    }
-
-    wgpu::TextureDescriptor descriptor;
-    descriptor.dimension = wgpu::TextureDimension::e2D;
-    descriptor.size = {baseMip.width, baseMip.height, 1};
-    descriptor.format = format;
-    descriptor.mipLevelCount = static_cast<uint32_t>(upload->mipLevels.size());
-    descriptor.sampleCount = 1;
-    descriptor.usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding;
-    gpu.texture = m_device.CreateTexture(&descriptor);
-    gpu.view = gpu.texture ? gpu.texture.CreateView() : wgpu::TextureView{};
-    wgpu::SamplerDescriptor samplerDescriptor;
-    const wgpu::AddressMode addressMode = wrapMode == "clamp"    ? wgpu::AddressMode::ClampToEdge
-                                          : wrapMode == "mirror" ? wgpu::AddressMode::MirrorRepeat
-                                                                 : wgpu::AddressMode::Repeat;
-    const auto address = [addressMode](MaterialSamplerAddress value) {
-        switch (value) {
-        case MaterialSamplerAddress::Repeat:
-            return wgpu::AddressMode::Repeat;
-        case MaterialSamplerAddress::Clamp:
-            return wgpu::AddressMode::ClampToEdge;
-        case MaterialSamplerAddress::Mirror:
-            return wgpu::AddressMode::MirrorRepeat;
-        case MaterialSamplerAddress::Inherit:
-            return addressMode;
-        }
-        return addressMode;
-    };
-    samplerDescriptor.addressModeU = address(sampler.addressU);
-    samplerDescriptor.addressModeV = address(sampler.addressV);
-    samplerDescriptor.addressModeW = address(sampler.addressW);
-    const bool point = filterMode == "point";
-    const auto filter = [point](MaterialSamplerFilter value) {
-        switch (value) {
-        case MaterialSamplerFilter::Nearest:
-            return wgpu::FilterMode::Nearest;
-        case MaterialSamplerFilter::Linear:
-            return wgpu::FilterMode::Linear;
-        case MaterialSamplerFilter::Inherit:
-            return point ? wgpu::FilterMode::Nearest : wgpu::FilterMode::Linear;
-        }
-        return wgpu::FilterMode::Nearest;
-    };
-    const uint16_t assetAnisotropy =
-        point ? 1u : static_cast<uint16_t>(std::clamp(anisoLevel < 0 ? 16 : anisoLevel, 1, 16));
-    samplerDescriptor.minFilter = filter(sampler.minFilter);
-    samplerDescriptor.magFilter = filter(sampler.magFilter);
-    const bool assetMipLinear = filterMode == "trilinear" || assetAnisotropy > 1u;
-    switch (sampler.mipFilter) {
-    case MaterialSamplerFilter::Nearest:
-        samplerDescriptor.mipmapFilter = wgpu::MipmapFilterMode::Nearest;
-        break;
-    case MaterialSamplerFilter::Linear:
-        samplerDescriptor.mipmapFilter = wgpu::MipmapFilterMode::Linear;
-        break;
-    case MaterialSamplerFilter::Inherit:
-        samplerDescriptor.mipmapFilter =
-            assetMipLinear ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
-        break;
-    }
-    const bool fullyLinear = samplerDescriptor.minFilter == wgpu::FilterMode::Linear &&
-                             samplerDescriptor.magFilter == wgpu::FilterMode::Linear &&
-                             samplerDescriptor.mipmapFilter == wgpu::MipmapFilterMode::Linear;
-    const uint16_t anisotropy = fullyLinear ? assetAnisotropy : 1u;
-    samplerDescriptor.lodMaxClamp = static_cast<float>(upload->mipLevels.size() - 1u);
-    samplerDescriptor.maxAnisotropy = anisotropy;
-    gpu.sampler = m_device.CreateSampler(&samplerDescriptor);
-    if (!gpu.texture || !gpu.view || !gpu.sampler)
+    const auto samplerDesc =
+        MaterialSamplerDescription(filterMode, wrapMode, anisoLevel, static_cast<uint32_t>(upload->mipLevels.size()),
+                                   m_rhi->GetCapabilities(), sampler);
+    TextureUploadBatch batch(*upload, samplerDesc);
+    gpu.resource = m_rhi->UploadTexture(batch.GetRequest());
+    if (!gpu.resource)
         return {};
-
-    for (uint32_t mipLevel = 0; mipLevel < upload->mipLevels.size(); ++mipLevel) {
-        const TextureMipLevel &mip = upload->mipLevels[mipLevel];
-        wgpu::TexelCopyTextureInfo destination;
-        destination.texture = gpu.texture;
-        destination.mipLevel = mipLevel;
-        wgpu::TexelCopyBufferLayout layout;
-        layout.bytesPerRow = static_cast<uint32_t>(mip.rowPitch);
-        layout.rowsPerImage = mip.height;
-        const wgpu::Extent3D extent{mip.width, mip.height, 1};
-        m_queue.WriteTexture(&destination, upload->bytes.data() + mip.byteOffset, static_cast<size_t>(mip.byteSize),
-                             &layout, &extent);
-    }
-    gpu.mipLevels = static_cast<uint32_t>(upload->mipLevels.size());
+    gpu.view = m_rhi->GetNativeTextureView(gpu.resource->GetView());
+    gpu.sampler = m_rhi->GetNativeSampler(gpu.resource->GetSampler());
+    gpu.mipLevels = batch.GetRequest().texture.mipLevels;
     return gpu;
 }
 

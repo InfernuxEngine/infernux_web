@@ -349,6 +349,7 @@ WebGpuRhiDevice::WebGpuRhiDevice(wgpu::Device device, wgpu::Queue queue, uint32_
     m_capabilities.limits.maxPushConstantBytes = 256;
     // The sample_index fragment builtin is part of core WebGPU.
     m_capabilities.features.sampleRateShading = true;
+    m_capabilities.features.samplerAnisotropy = true;
     m_capabilities.limits.maxBindingLayouts = limits.maxBindGroups;
     m_capabilities.limits.maxSampledTexturesPerStage = limits.maxSampledTexturesPerShaderStage;
     m_capabilities.limits.maxStorageBuffersPerStage = limits.maxStorageBuffersPerShaderStage;
@@ -587,6 +588,43 @@ rhi::TextureViewHandle WebGpuRhiDevice::CreateTextureView(const rhi::TextureView
         return {};
     }
     return Register<rhi::TextureViewHandle>(m_textureViews, m_freeTextureView, {std::move(view)});
+}
+
+std::shared_ptr<rhi::TextureResource> WebGpuRhiDevice::UploadTexture(const rhi::TextureUploadRequest &request)
+{
+    uint64_t residentBytes = 0;
+    for (uint32_t index = 0; index < request.subresourceCount; ++index)
+        residentBytes += request.subresources[index].byteSize;
+    const auto texture = CreateTexture(request.texture);
+    if (!texture.IsValid())
+        return {};
+    auto viewDesc = request.view;
+    viewDesc.texture = texture;
+    const auto view = CreateTextureView(viewDesc);
+    const auto sampler = CreateSampler(request.sampler);
+    auto resource = std::make_shared<rhi::TextureResource>(*this, texture, view, sampler, residentBytes,
+                                                           request.texture.format, viewDesc);
+    if (!view.IsValid() || !sampler.IsValid())
+        return {};
+    const auto &native = Resolve(m_textures, texture)->texture;
+    for (uint32_t index = 0; index < request.subresourceCount; ++index) {
+        const auto &mip = request.subresources[index];
+        if (mip.rowPitch == 0 || mip.rowPitch > std::numeric_limits<uint32_t>::max() ||
+            mip.slicePitch / mip.rowPitch > std::numeric_limits<uint32_t>::max()) {
+            SetError("imported texture stride exceeds the WebGPU upload range");
+            return {};
+        }
+        wgpu::TexelCopyTextureInfo destination;
+        destination.texture = native;
+        destination.mipLevel = mip.mipLevel;
+        destination.origin.z = mip.baseLayer;
+        wgpu::TexelCopyBufferLayout layout;
+        layout.bytesPerRow = static_cast<uint32_t>(mip.rowPitch);
+        layout.rowsPerImage = static_cast<uint32_t>(mip.slicePitch / mip.rowPitch);
+        const wgpu::Extent3D extent{mip.width, mip.height, mip.depth * mip.layerCount};
+        m_queue.WriteTexture(&destination, mip.data, mip.byteSize, &layout, &extent);
+    }
+    return resource;
 }
 
 rhi::SamplerHandle WebGpuRhiDevice::CreateSampler(const rhi::SamplerDesc &desc)
@@ -1098,6 +1136,12 @@ wgpu::TextureView WebGpuRhiDevice::GetNativeTextureView(rhi::TextureViewHandle h
 {
     const auto *payload = Resolve(m_textureViews, handle);
     return payload ? payload->view : wgpu::TextureView{};
+}
+
+wgpu::Sampler WebGpuRhiDevice::GetNativeSampler(rhi::SamplerHandle handle) const noexcept
+{
+    const auto *payload = Resolve(m_samplers, handle);
+    return payload ? payload->sampler : wgpu::Sampler{};
 }
 
 wgpu::Buffer WebGpuRhiDevice::CreatePushConstantBuffer(uint32_t byteSize, const void *data)

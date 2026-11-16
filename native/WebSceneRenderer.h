@@ -4,6 +4,7 @@
 #include "WebTextureAssetLoad.h"
 
 #include <function/renderer/RenderWorld.h>
+#include <function/renderer/rhi/RhiTexture.h>
 #include <function/resources/InxMaterial/MaterialProperty.h>
 #include <function/scene/SceneRenderExtractor.h>
 #include <webgpu/webgpu_cpp.h>
@@ -138,7 +139,7 @@ class WebSceneRenderer final
 
     struct GPUTexture
     {
-        wgpu::Texture texture;
+        std::shared_ptr<rhi::TextureResource> resource;
         wgpu::TextureView view;
         wgpu::Sampler sampler;
         uint32_t mipLevels = 0;

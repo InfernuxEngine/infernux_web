@@ -1,6 +1,7 @@
 #pragma once
 
 #include "WebUIMaterialCache.h"
+#include <function/renderer/rhi/RhiTexture.h>
 #include <glm/mat4x4.hpp>
 #include <glm/vec4.hpp>
 #include <imgui.h>
@@ -26,6 +27,7 @@ struct MaterialTextureSampler;
 namespace infernux::web
 {
 class WebSceneRenderer;
+class WebGpuRhiDevice;
 
 /// Engine-owned Screen UI consumer for the WebGPU Player.
 ///
@@ -38,8 +40,8 @@ class WebScreenUIRenderer final
     WebScreenUIRenderer();
     ~WebScreenUIRenderer();
 
-    bool Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::TextureFormat colorFormat,
-                    wgpu::TextureFormat worldColorFormat, uint32_t worldSampleCount, WebSceneRenderer &scene);
+    bool Initialize(WebGpuRhiDevice &device, wgpu::TextureFormat colorFormat, wgpu::TextureFormat worldColorFormat,
+                    uint32_t worldSampleCount, WebSceneRenderer &scene);
     bool ConfigureSampleCount(uint32_t sampleCount);
     void StageFrame(const EngineGlobalsUBO &frame, uint32_t width, uint32_t height);
     void BeginFrame(uint32_t width, uint32_t height);
@@ -131,7 +133,7 @@ class WebScreenUIRenderer final
 
     struct GPUTexture
     {
-        wgpu::Texture texture;
+        std::shared_ptr<const rhi::TextureGpuView> resource;
         wgpu::TextureView view;
         wgpu::Sampler sampler;
         wgpu::BindGroup group;
@@ -147,8 +149,10 @@ class WebScreenUIRenderer final
     [[nodiscard]] std::pair<wgpu::Sampler, std::string> ResolveMaterialSampler(const MaterialBinding &binding,
                                                                                uint64_t textureId);
     bool RefreshFontAtlas();
+    bool UploadFontAtlas();
     bool EnsureBuffer(wgpu::Buffer &buffer, uint64_t &capacity, uint64_t required, wgpu::BufferUsage usage);
 
+    WebGpuRhiDevice *m_rhi = nullptr;
     wgpu::Device m_device;
     wgpu::Queue m_queue;
     wgpu::TextureFormat m_colorFormat = wgpu::TextureFormat::Undefined;
@@ -163,11 +167,10 @@ class WebScreenUIRenderer final
     wgpu::TextureFormat m_worldColorFormat = wgpu::TextureFormat::Undefined;
     uint32_t m_worldSampleCount = 1;
     wgpu::BindGroup m_fontGroup;
-    wgpu::Texture m_fontTexture;
+    std::shared_ptr<const rhi::TextureGpuView> m_fontTexture;
     wgpu::TextureView m_fontView;
     wgpu::Sampler m_fontSampler;
-    uint32_t m_fontWidth = 0;
-    uint32_t m_fontHeight = 0;
+    uint64_t m_textureRevision = 0;
     struct ScreenBuffers
     {
         wgpu::Buffer vertex, index, constants;
@@ -175,7 +178,7 @@ class WebScreenUIRenderer final
     };
     std::array<ScreenBuffers, 2> m_screenBuffers;
     std::unordered_map<uint64_t, GPUTexture> m_textures;
-    std::unordered_map<std::string, wgpu::Sampler> m_materialSamplers;
+    std::unordered_map<std::string, std::shared_ptr<const rhi::TextureGpuView>> m_materialSamplers;
     uint64_t m_nextTextureId = 2;
     ImGuiContext *m_context = nullptr;
     ImDrawList *m_camera = nullptr;

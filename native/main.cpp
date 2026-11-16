@@ -1164,7 +1164,7 @@ void StartSurface()
         InfernuxWebAbortStartup("Scene rendering initialization failed");
         return;
     }
-    if (!g_screenUIRenderer.Initialize(g_device, g_queue, g_surfaceFormat, sceneColorFormat, sceneSampleCount,
+    if (!g_screenUIRenderer.Initialize(*g_rhi, g_surfaceFormat, sceneColorFormat, sceneSampleCount,
                                        g_sceneRenderer)) {
         std::fprintf(stderr, "INFERNUX_WEB_SCREEN_UI_INITIALIZATION_FAILED\n");
         InfernuxWebAbortStartup("Screen UI initialization failed");
