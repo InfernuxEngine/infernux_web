@@ -346,6 +346,32 @@ WebRenderGraph::WebRenderGraph(WebGpuRhiDevice &device, std::shared_ptr<Fullscre
 }
 WebRenderGraph::~WebRenderGraph() = default;
 
+RenderViewAccess WebRenderGraph::GetResourceAccess() const
+{
+    const auto &s = *m_impl;
+    RenderViewAccess access;
+    access.viewId = s.view.id;
+    for (const auto &texture : s.graph->textures) {
+        if (texture.role != GraphTextureRole::Persistent)
+            continue;
+        const auto *resource = s.textures.at(texture.name).get();
+        const auto writes = std::any_of(s.order.begin(), s.order.end(), [&](uint32_t index) {
+            return s.graph->passes[index].WritesTexture(texture.name);
+        });
+        if (writes) {
+            access.writes.push_back(resource);
+            continue;
+        }
+        const auto reads = texture.name == s.graph->outputTexture ||
+            std::any_of(s.order.begin(), s.order.end(), [&](uint32_t index) {
+                return s.graph->passes[index].ReadsTexture(texture.name);
+            });
+        if (reads)
+            access.reads.emplace_back(resource, texture.requireCurrentWrite);
+    }
+    return access;
+}
+
 bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, const rhi::RenderViewContext &view,
                              const ImportTexture &imports, const std::optional<GraphPassDesc> &cameraClear)
 {

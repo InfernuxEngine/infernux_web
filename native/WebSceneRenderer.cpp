@@ -79,6 +79,7 @@ struct WebSceneRenderer::Impl
     SceneRenderer culler;
     RenderWorldSnapshot world;
     std::shared_ptr<const RenderWorldFrame> frame;
+    std::shared_ptr<const RenderViewData> view;
     SceneLightCollector lights;
     std::shared_ptr<const lighting::ForwardPlusGridPipeline> gridProgram;
     Buffer dummy;
@@ -316,7 +317,7 @@ struct WebSceneRenderer::Impl
     {
         auto &result = current->materials[draw.identity];
         const auto &material = *draw.material;
-        const bool invertCulling = frame->PrimaryView().invertCulling;
+        const bool invertCulling = view->invertCulling;
         if (result.artifact != material.GetSelectedShaderArtifact() || !(result.state == material.GetRenderState()) ||
             result.invertCulling != invertCulling) {
             result = {};
@@ -481,7 +482,7 @@ struct WebSceneRenderer::Impl
         if (command.type == GraphCommandType::DrawShadowCasters)
             descriptor.target = ShaderCompileTarget::Shadow;
         else
-            descriptor.invertCulling = frame->PrimaryView().invertCulling;
+            descriptor.invertCulling = view->invertCulling;
         auto &program = draw.material->programs[&command];
         if (!program.pipeline || program.artifact != material->GetSelectedShaderArtifact() ||
             !(program.state == material->GetRenderState()) || program.pass != descriptor) {
@@ -595,19 +596,15 @@ std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, 
 {
     auto &s = *m_impl;
     camera.SetScreenDimensions(width, height);
-    s.width = camera.GetPixelWidth();
-    s.height = camera.GetPixelHeight();
     (void)s.extractor.ExtractCameraFrame(s.world, &camera);
-    s.frame = s.world.Acquire();
-    const auto &view = s.frame->PrimaryView();
-    s.current = &s.views[view.cameraId];
-    s.current->lastFrame = s.frameIndex;
+    const auto frame = s.world.Acquire();
+    const auto &view = frame->PrimaryView();
     RenderViewCaptureServices services;
     services.culler = &s.culler;
     services.includeShadowCasters = s.shadowsEnabled;
     services.prepareMaterial = [](const auto &material) { ShaderLoader::PrepareMaterial(*material); };
     services.acquireProgram = [](const auto &name) { return LoadFullscreenProgram(name, ShaderCodeTarget::Wgsl); };
-    ScriptableRenderContext context(s.frame, view, std::move(services));
+    ScriptableRenderContext context(frame, view, std::move(services));
     pipeline.RenderSelectedView(context, context.GetView());
     return context.CapturePlan();
 }
@@ -615,7 +612,13 @@ std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, 
 void WebSceneRenderer::Prepare(const RenderViewPlan &plan, const WebRenderGraph &graph)
 {
     auto &s = *m_impl;
-    const auto &view = s.frame->PrimaryView();
+    s.frame = plan.world;
+    s.view = plan.view;
+    const auto &view = *s.view;
+    s.current = &s.views[view.cameraId];
+    s.current->lastFrame = s.frameIndex;
+    s.width = view.pixelWidth;
+    s.height = view.pixelHeight;
     const uint32_t width = s.width, height = s.height;
     if (s.current->graph != plan.graph) {
         s.current->materials.clear();
@@ -738,7 +741,7 @@ void WebSceneRenderer::RecordPreparation(wgpu::CommandEncoder encoder)
     auto &s = *m_impl;
     if (!s.current->usesGrid)
         return;
-    const auto &view = s.frame->PrimaryView();
+    const auto &view = *s.view;
     lighting::ForwardPlusGridConstants constants{};
     std::memcpy(constants.viewProjection, &view.viewProjection[0][0], sizeof(constants.viewProjection));
     constants.viewportAndProjectionScale[2] = std::abs(view.projection[0][0]);
@@ -782,7 +785,7 @@ void WebSceneRenderer::Record(wgpu::RenderPassEncoder pass, const GraphCommandDe
         s.orderedDraws.push_back(index);
     }
     if (command.sortMode == "back_to_front") {
-        const auto &view = s.frame->PrimaryView();
+        const auto &view = *s.view;
         for (const auto index : s.orderedDraws)
             if (s.draws[index].source.devicePose.value)
                 throw std::invalid_argument("Device poses require a device-side transparent sort");
@@ -811,7 +814,7 @@ void WebSceneRenderer::Record(wgpu::RenderPassEncoder pass, const GraphCommandDe
 
 const RenderViewData &WebSceneRenderer::View() const noexcept
 {
-    return m_impl->frame->PrimaryView();
+    return *m_impl->view;
 }
 
 rhi::BindingLayoutHandle WebSceneRenderer::ViewLayout() const noexcept

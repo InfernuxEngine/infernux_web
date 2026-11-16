@@ -891,12 +891,15 @@ void Frame()
             pass.SetViewport(rect.x, rect.y, rect.z, rect.w, 0, 1);
             pass.SetScissorRect(rect.x, rect.y, rect.z, rect.w);
             infernux::FullscreenPipelineKey key;
-            key.shaderName = displayEncoded ? "infernux/internal/fullscreen_copy" : "infernux/internal/display_encode";
+            key.shaderName = displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
             key.program = g_presentRenderer.AcquireProgram(key.shaderName);
             key.colorFormat = format;
             key.useDynamicRendering = true;
             const auto &pipeline = g_presentRenderer.EnsurePipeline(key);
-            const auto values = infernux::FullscreenRenderer::PrepareParameters(*key.program, {});
+            const auto values = infernux::FullscreenRenderer::PrepareParameters(*key.program, displayEncoded
+                ? std::vector<std::pair<std::string, infernux::ShaderParameterValue>>{}
+                : std::vector<std::pair<std::string, infernux::ShaderParameterValue>>{
+                    {"target_is_srgb", infernux::ShaderParameterValue(infernux::rhi::IsSrgbFormat(format))}});
             const auto output = graph.Output();
             infernux::FullscreenResourceInput input;
             input.view = output->GetView(); input.format = output->GetFormat(); input.sampler = output->GetSampler();
@@ -909,6 +912,16 @@ void Frame()
         const auto cameras = scene ? scene->GetActiveGameCameras(nullptr) : std::vector<infernux::Camera *>{};
         bool rendered = false;
         g_presentRenderer.ResetPool();
+        struct CapturedCamera
+        {
+            infernux::Camera *camera;
+            std::shared_ptr<const infernux::RenderViewPlan> plan;
+            CameraGraph *state;
+        };
+        std::vector<CapturedCamera> captured;
+        std::vector<infernux::RenderViewAccess> accesses;
+        captured.reserve(cameras.size());
+        accesses.reserve(cameras.size());
         for (auto *camera : cameras) {
             if (g_splashActive || g_webGpuValidationFailed)
                 break;
@@ -917,12 +930,12 @@ void Frame()
                 continue;
             if (!plan->graph)
                 throw std::runtime_error("Render pipeline submitted a view without its graph");
-            auto &state = g_cameraGraphs[g_sceneRenderer.View().cameraId];
+            auto &state = g_cameraGraphs[plan->view->cameraId];
             state.lastFrame = g_shaderFrameIndex;
             if (!state.graph) {
                 state.graph = std::make_unique<infernux::web::WebRenderGraph>(*g_rhi, g_fullscreenHost);
             }
-            const auto &cameraView = g_sceneRenderer.View();
+            const auto &cameraView = *plan->view;
             const auto output = cameraView.outputGeneration;
             const auto outputRevision = output ? output->revision : 0;
             if (state.source != plan->graph || state.outputRevision != outputRevision) {
@@ -945,6 +958,22 @@ void Frame()
                 infernux::ResolveGraphCameraClear(*state.description, cameraView.clearFlags,
                     inx::color::SrgbToLinear(cameraView.backgroundColor)));
             state.graph->UpdateParameters(plan->parameters);
+            auto access = state.graph->GetResourceAccess();
+            access.writes.push_back(output ? static_cast<const void *>(output->color.get()) : &g_cameraGraphs);
+            if (output && output->depth)
+                access.writes.push_back(output->depth.get());
+            accesses.push_back(std::move(access));
+            captured.push_back({camera, plan, &state});
+        }
+        const auto schedule = infernux::RenderViewSchedule::Build(accesses);
+        for (const auto index : schedule.order) {
+            const auto &capture = captured[index];
+            auto *camera = capture.camera;
+            const auto &plan = capture.plan;
+            auto &state = *capture.state;
+            const auto &cameraView = *plan->view;
+            const auto output = cameraView.outputGeneration;
+            g_lastSampleCount = state.description->msaaSamples > 0 ? uint32_t(state.description->msaaSamples) : 1;
             g_sceneRenderer.Prepare(*plan, *state.graph);
             g_sceneRenderer.RecordPreparation(encoder);
             if (!g_particleRuntime.ConfigureSampleCount(static_cast<infernux::rhi::SampleCount>(g_lastSampleCount)))

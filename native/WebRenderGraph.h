@@ -3,6 +3,7 @@
 #include <function/renderer/FullscreenRenderer.h>
 #include <function/renderer/MaterialPassPipeline.h>
 #include <function/renderer/RenderGraphDescription.h>
+#include <function/renderer/RenderViewSchedule.h>
 #include <function/renderer/rhi/RhiRasterPass.h>
 #include <function/renderer/rhi/RenderViewContext.h>
 #include <functional>
@@ -36,6 +37,7 @@ class WebRenderGraph final
     [[nodiscard]] Texture GetTexture(const std::string &name) const;
     [[nodiscard]] Texture Output() const;
     [[nodiscard]] const std::vector<uint32_t> &ExecutionOrder() const noexcept;
+    [[nodiscard]] RenderViewAccess GetResourceAccess() const;
 
   private:
     struct Impl;
