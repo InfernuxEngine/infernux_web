@@ -35,7 +35,8 @@ class WebRenderGraph final
                                              const rhi::RasterPassDescription &, const MaterialPassPipelineDescriptor &,
                                              const rhi::TextureResource *)>;
     explicit WebRenderGraph(WebGpuRhiDevice &device, std::shared_ptr<FullscreenRendererHost> fullscreenHost,
-                            rhi::ComputeHost *computeHost = nullptr);
+                            rhi::ComputeHost *computeHost = nullptr,
+                            std::shared_ptr<FullscreenPipelineCache> pipelines = {});
     ~WebRenderGraph();
     /// Compile only when topology or view extent changes. External texture
     /// generations are part of that publication, never looked up while drawing.

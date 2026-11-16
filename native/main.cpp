@@ -43,6 +43,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <unordered_map>
 
@@ -129,7 +130,14 @@ class FullscreenHost final : public infernux::FullscreenRendererHost
     { return infernux::LoadFullscreenProgram(name, infernux::ShaderCodeTarget::Wgsl); }
 };
 std::shared_ptr<FullscreenHost> g_fullscreenHost;
+std::shared_ptr<infernux::FullscreenPipelineCache> g_fullscreenPipelines;
 infernux::FullscreenRenderer g_presentRenderer;
+struct ScreenCopy
+{
+    infernux::FullscreenPipelineEntry pipeline;
+    infernux::FullscreenParameters parameters;
+};
+std::array<std::optional<ScreenCopy>, 2> g_screenCopies;
 struct CameraGraph
 {
     std::unique_ptr<infernux::web::WebRenderGraph> graph;
@@ -887,6 +895,19 @@ void Frame()
         const auto present = [&](const infernux::web::WebRenderGraph &graph, bool displayEncoded,
                                  const infernux::FullscreenViewResources &resources, wgpu::TextureView destination,
                                  infernux::rhi::PixelFormat format, const glm::uvec4 &rect, bool clear) {
+            auto &copy = g_screenCopies[displayEncoded];
+            if (!copy) {
+                infernux::FullscreenPipelineKey key;
+                key.shaderName = displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
+                key.program = g_fullscreenPipelines->AcquireProgram(key.shaderName);
+                key.colorFormat = format;
+                key.useDynamicRendering = true;
+                std::vector<std::pair<std::string, infernux::ShaderParameterValue>> parameters;
+                if (!displayEncoded)
+                    parameters.emplace_back("target_is_srgb", infernux::rhi::IsSrgbFormat(format));
+                copy.emplace(ScreenCopy{g_fullscreenPipelines->EnsurePipeline(key),
+                                        infernux::FullscreenRenderer::PrepareParameters(*key.program, parameters)});
+            }
             wgpu::RenderPassColorAttachment attachment{};
             attachment.view = destination;
             attachment.loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
@@ -897,22 +918,12 @@ void Frame()
             auto pass = encoder.BeginRenderPass(&description);
             pass.SetViewport(rect.x, rect.y, rect.z, rect.w, 0, 1);
             pass.SetScissorRect(rect.x, rect.y, rect.z, rect.w);
-            infernux::FullscreenPipelineKey key;
-            key.shaderName = displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
-            key.program = g_presentRenderer.AcquireProgram(key.shaderName);
-            key.colorFormat = format;
-            key.useDynamicRendering = true;
-            const auto &pipeline = g_presentRenderer.EnsurePipeline(key);
-            const auto values = infernux::FullscreenRenderer::PrepareParameters(*key.program, displayEncoded
-                ? std::vector<std::pair<std::string, infernux::ShaderParameterValue>>{}
-                : std::vector<std::pair<std::string, infernux::ShaderParameterValue>>{
-                    {"target_is_srgb", infernux::ShaderParameterValue(infernux::rhi::IsSrgbFormat(format))}});
             const auto output = graph.Output();
             infernux::FullscreenResourceInput input;
             input.view = output->GetView(); input.format = output->GetFormat(); input.sampler = output->GetSampler();
             infernux::web::WebGpuGraphicsCommandContext context;
             auto commands = g_rhi->MakeGraphicsCommandEncoder(context, pass);
-            g_presentRenderer.DrawProgram(commands, pipeline, &input, values, nullptr, resources);
+            g_presentRenderer.DrawProgram(commands, copy->pipeline, &input, copy->parameters, nullptr, resources);
             pass.End();
         };
         auto *scene = infernux::SceneManager::Instance().GetActiveScene();
@@ -934,7 +945,7 @@ void Frame()
         for (auto *camera : cameras) {
             if (g_splashActive || g_webGpuValidationFailed)
                 break;
-            const auto plan = g_sceneRenderer.Capture(g_width, g_height, *camera, *g_renderPipeline);
+            const auto plan = g_sceneRenderer.Capture(g_width, g_height, *camera, *g_renderPipeline, *g_fullscreenPipelines);
             if (plan->state == infernux::RenderViewPlanState::Skipped)
                 continue;
             if (!plan->graph)
@@ -942,7 +953,8 @@ void Frame()
             auto &state = g_cameraGraphs[plan->view->cameraId];
             state.lastFrame = g_shaderFrameIndex;
             if (!state.graph) {
-                state.graph = std::make_unique<infernux::web::WebRenderGraph>(*g_rhi, g_fullscreenHost, g_computeHost.get());
+                state.graph = std::make_unique<infernux::web::WebRenderGraph>(
+                    *g_rhi, g_fullscreenHost, g_computeHost.get(), g_fullscreenPipelines);
             }
             const auto &cameraView = *plan->view;
             if (cameraView.isMainCamera)
@@ -1194,7 +1206,8 @@ void StartSurface()
     g_renderPipeline = pipeline.cast<infernux::RenderPipelineCallback *>();
     g_renderPipelineOwner = pipeline.release().ptr();
     g_fullscreenHost = std::make_shared<FullscreenHost>();
-    g_presentRenderer.Initialize(g_fullscreenHost);
+    g_fullscreenPipelines = std::make_shared<infernux::FullscreenPipelineCache>(g_fullscreenHost);
+    g_presentRenderer.Initialize(g_fullscreenHost, g_fullscreenPipelines);
     if (!g_sceneRenderer.Initialize(*g_rhi)) {
         std::fprintf(stderr, "INFERNUX_WEBGPU_SCENE_PIPELINE_FAILED\n");
         InfernuxWebAbortStartup("Scene rendering initialization failed");

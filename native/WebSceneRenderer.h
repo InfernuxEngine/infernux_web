@@ -36,11 +36,13 @@ class WebSceneRenderer final
     std::shared_ptr<const rhi::TextureResource> ResolveGraphTextureAsset(const std::string &guid);
     void StageFrame(const EngineGlobalsUBO &frame);
     std::shared_ptr<const RenderViewPlan> Capture(uint32_t width, uint32_t height, Camera &camera,
-                                                   RenderPipelineCallback &pipeline);
+                                                  RenderPipelineCallback &pipeline,
+                                                  const FullscreenPipelineCache &programs);
     [[nodiscard]] std::vector<MaterialTextureRead> CollectMaterialTextureReads(const RenderViewPlan &plan,
                                                                               const WebRenderGraph &graph) const;
     void Prepare(const RenderViewPlan &plan, WebRenderGraph &graph);
     void AcceptView();
+    [[nodiscard]] bool HasPreviousViewSample() const noexcept;
     [[nodiscard]] std::shared_ptr<GraphEventViewSample> CaptureViewSample() const;
     void RecordPreparation(wgpu::CommandEncoder encoder);
     void Record(wgpu::RenderPassEncoder pass, const GraphCommandDesc &command,

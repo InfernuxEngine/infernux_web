@@ -320,6 +320,7 @@ struct WebParticleRuntime::State
         bool playing = true;
         bool resetPending = false;
         bool drawReady = false;
+        bool exportedThisFrame = false;
         particle::GpuParticleTransforms transforms{};
         std::vector<FrameRequest> pending;
         std::unique_ptr<particle::ParticleGpuRuntime> runtime;
@@ -891,6 +892,7 @@ bool WebParticleRuntime::RecordCompute(wgpu::CommandEncoder commandEncoder)
                     m_state->error = "WebGPU particle rendering export failed";
                     return false;
                 }
+                currentEmitter->exportedThisFrame = true;
             }
             currentEmitter->drawReady = request.render;
         }
@@ -901,8 +903,10 @@ bool WebParticleRuntime::RecordCompute(wgpu::CommandEncoder commandEncoder)
 
 void WebParticleRuntime::NotifySubmission() noexcept
 {
-    for (const auto &[_, emitter] : m_state->emitters)
+    for (const auto &[_, emitter] : m_state->emitters) {
         emitter->runtime->NotifySubmission(true);
+        emitter->exportedThisFrame = false;
+    }
 }
 
 bool WebParticleRuntime::RequiresSceneDepth(uint32_t cameraMask, int32_t queueMin, int32_t queueMax) const noexcept
@@ -924,8 +928,10 @@ bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, const RenderViewDa
                                 int32_t queueMin, int32_t queueMax, rhi::TextureViewHandle sceneDepth,
                                 bool sceneDepthIsDepth)
 {
-    if (!m_state->rhi || !pass || target.colorFormats.size() != 1 ||
-        (target.target != ShaderCompileTarget::Forward && target.target != ShaderCompileTarget::ForwardPlus))
+    const bool color =
+        target.target == ShaderCompileTarget::Forward || target.target == ShaderCompileTarget::ForwardPlus;
+    const bool motion = target.target == ShaderCompileTarget::Motion;
+    if (!m_state->rhi || !pass || target.colorFormats.size() != 1 || (!color && !motion))
         return false;
 
     const glm::mat4 cameraToWorld = glm::inverse(view.view);
@@ -937,6 +943,8 @@ bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, const RenderViewDa
     const auto &projection = view.projection;
     constants.depthReconstruct = {projection[2][2], projection[3][2], projection[2][3], projection[3][3]};
     constants.alignmentReference = {view.position.x, view.position.y, view.position.z, 0.0f};
+    const uint32_t motionFlags =
+        motion && !m_state->scene->HasPreviousViewSample() ? particle::GpuParticleViewConstants::MotionReset : 0u;
 
     WebGpuGraphicsCommandContext context;
     const auto encoder = m_state->rhi->MakeGraphicsCommandEncoder(context, pass);
@@ -945,11 +953,14 @@ bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, const RenderViewDa
         if (!emitter->Visible(view.cullingMask))
             continue;
         constants.objectData[2] = emitter->ownerLayerMask;
+        constants.objectData[3] = motionFlags;
+        if (motion && !emitter->exportedThisFrame)
+            constants.objectData[3] |= particle::GpuParticleViewConstants::MotionUseCurrentPosition;
         for (const auto &output : emitter->outputs) {
             const auto queue = output->RenderQueue();
             if (queue < queueMin || queue > queueMax)
                 continue;
-            const auto depth = output->RequiresSceneDepth() ? sceneDepth : rhi::TextureViewHandle{};
+            const auto depth = color && output->RequiresSceneDepth() ? sceneDepth : rhi::TextureViewHandle{};
             if (output->RecordDraw(encoder, target, emitter->runtime->IndirectBuffer(), constants, bindings, {}, depth,
                                    sceneDepthIsDepth))
                 drew = true;

@@ -85,10 +85,11 @@ struct WebRenderGraph::Impl
     size_t cameraClearIndex = SIZE_MAX;
     uint32_t width = 0, height = 0, samples = 0;
 
-    Impl(WebGpuRhiDevice &rhi, std::shared_ptr<FullscreenRendererHost> host, rhi::ComputeHost *compute)
+    Impl(WebGpuRhiDevice &rhi, std::shared_ptr<FullscreenRendererHost> host, rhi::ComputeHost *compute,
+         std::shared_ptr<FullscreenPipelineCache> pipelines)
         : device(rhi), computeHost(compute)
     {
-        fullscreen.Initialize(std::move(host));
+        fullscreen.Initialize(std::move(host), std::move(pipelines));
     }
 
     Texture Allocate(const GraphTextureDesc &source, const rhi::RenderViewContext &view, bool storage = false)
@@ -623,8 +624,8 @@ struct WebRenderGraph::Impl
 };
 
 WebRenderGraph::WebRenderGraph(WebGpuRhiDevice &device, std::shared_ptr<FullscreenRendererHost> host,
-                               rhi::ComputeHost *computeHost)
-    : m_impl(std::make_unique<Impl>(device, std::move(host), computeHost))
+                               rhi::ComputeHost *computeHost, std::shared_ptr<FullscreenPipelineCache> pipelines)
+    : m_impl(std::make_unique<Impl>(device, std::move(host), computeHost, std::move(pipelines)))
 {
 }
 WebRenderGraph::~WebRenderGraph()

@@ -4,7 +4,6 @@
 #include <function/resources/ShaderAsset/SlangCompiler.h>
 #include "WebRenderGraph.h"
 #include <function/renderer/RendererSelection.h>
-#include <function/resources/ShaderAsset/FullscreenProgramAsset.h>
 #include "WebIndexPacking.h"
 #include "WebTextureAssetLoad.h"
 #include "WebTextureUpload.h"
@@ -685,7 +684,8 @@ std::shared_ptr<const rhi::TextureResource> WebSceneRenderer::ResolveGraphTextur
 }
 
 std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, uint32_t height,
-                                                               Camera &camera, RenderPipelineCallback &pipeline)
+                                                              Camera &camera, RenderPipelineCallback &pipeline,
+                                                              const FullscreenPipelineCache &programs)
 {
     auto &s = *m_impl;
     camera.SetScreenDimensions(width, height);
@@ -700,7 +700,7 @@ std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, 
     services.culler = &s.culler;
     services.includeShadowCasters = s.shadowsEnabled;
     services.prepareMaterial = [](const auto &material) { ShaderLoader::PrepareMaterial(*material); };
-    services.acquireProgram = [](const auto &name) { return LoadFullscreenProgram(name, ShaderCodeTarget::Wgsl); };
+    services.acquireProgram = [&programs](const auto &name) { return programs.AcquireProgram(name); };
     ScriptableRenderContext context(frame, view, std::move(services));
     pipeline.RenderSelectedView(context, context.GetView());
     return context.CapturePlan();
@@ -928,6 +928,11 @@ void WebSceneRenderer::AcceptView()
         resources.motion.CommitFrame();
     if (resources.graph->temporalJitter)
         resources.temporalSample = (resources.temporalSample + 1u) % kTemporalJitterSampleCount;
+}
+
+bool WebSceneRenderer::HasPreviousViewSample() const noexcept
+{
+    return m_impl->current && m_impl->current->acceptedView;
 }
 
 std::shared_ptr<GraphEventViewSample> WebSceneRenderer::CaptureViewSample() const
