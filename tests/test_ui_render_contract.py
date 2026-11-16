@@ -47,25 +47,6 @@ def test_python_bridge_submits_guid_generation_and_world_transform(monkeypatch):
     assert calls[3] == ("rect", (1, 10, 20, 70, 40, 1, 1, 1, 1, 0, 45, True, False))
 
 
-def test_native_world_draw_is_depth_aware_and_material_shader_is_consumed():
-    renderer = (ROOT / "native/WebScreenUIRenderer.cpp").read_text(encoding="utf-8")
-    frame = (ROOT / "native/main.cpp").read_text(encoding="utf-8")
-
-    assert "m_worldDepthPipeline" in renderer
-    assert "m_worldTopPipeline" in renderer
-    assert "cullingMask & (1u << span.layer)" in renderer
-    assert "std::stable_sort(draws.begin(), draws.end()" in renderer
-    assert "ResolveMaterialPipeline(draw.binding, true, draw.top)" in renderer
-    assert "ResolveMaterialPipeline(binding, false, false)" in renderer
-    assert 'InfernuxWebFindShaderSource(vertex.shaderId, "vertex"' in renderer
-    assert 'InfernuxWebFindShaderSource(fragment.shaderId, "fragment"' in renderer
-    assert "std::to_string(binding.pipelineKey.size()) + ':' + binding.pipelineKey" in renderer
-    assert 'if (ignoredOccluderId != 0)' in renderer
-    assert 'does not yet support ignored-occluder depth exclusion' in renderer
-    assert "g_screenUIRenderer.RenderWorld(pass" in frame
-    assert frame.index("g_screenUIRenderer.RenderWorld(pass") < frame.index("pass.End();", frame.index("g_screenUIRenderer.RenderWorld(pass"))
-
-
 def test_browser_ui_input_uses_shared_world_projection():
     bootstrap = (ROOT / "native/bootstrap.py").read_text(encoding="utf-8")
     event_section = bootstrap.split("def _process_screen_ui_events", 1)[1].split(

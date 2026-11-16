@@ -1,5 +1,10 @@
 #include "WebSceneRenderer.h"
 #include "WebGpuRhiDevice.h"
+#include <function/renderer/lighting/ForwardPlusLightGrid.h>
+#include <function/resources/ShaderAsset/SlangCompiler.h>
+#include "WebRenderGraph.h"
+#include <function/renderer/RendererSelection.h>
+#include <function/resources/ShaderAsset/FullscreenProgramAsset.h>
 #include "WebIndexPacking.h"
 #include "WebTextureAssetLoad.h"
 #include "WebTextureUpload.h"
@@ -33,7 +38,7 @@ namespace infernux::web
 namespace
 {
 using Buffer = std::shared_ptr<rhi::BufferResource>;
-using Texture = std::shared_ptr<rhi::TextureResource>;
+using Texture = std::shared_ptr<const rhi::TextureResource>;
 
 std::string SamplerIdentity(const MaterialTextureSampler &sampler)
 {
@@ -62,13 +67,12 @@ UniformBufferObject CameraUniform(const RenderViewData &view)
 struct WebSceneRenderer::Impl
 {
     WebGpuRhiDevice *device = nullptr;
-    rhi::PixelFormat colorFormat = rhi::PixelFormat::Undefined;
-    uint32_t samples = 1, width = 0, height = 0;
-    static constexpr uint32_t shadowResolution = 2048;
+    rhi::BindingLayoutHandle viewLayout;
+    uint32_t width = 0, height = 0;
+    uint32_t shadowResolution = 0;
     Texture depth;
     Texture white, black, normal;
-    wgpu::Color clear{};
-    bool skyEnabled = true, shadowsEnabled = true, prepared = false, reported = false;
+    bool skyEnabled = true, shadowsEnabled = true;
     uint64_t frameIndex = 0;
     EngineGlobalsUBO frameGlobals;
     SceneRenderExtractor extractor;
@@ -76,6 +80,7 @@ struct WebSceneRenderer::Impl
     RenderWorldSnapshot world;
     std::shared_ptr<const RenderWorldFrame> frame;
     SceneLightCollector lights;
+    std::shared_ptr<const lighting::ForwardPlusGridPipeline> gridProgram;
     Buffer dummy;
     std::vector<glm::mat4> modelValues, boneValues;
     std::vector<GPUSkinInstanceData> skinValues;
@@ -104,7 +109,13 @@ struct WebSceneRenderer::Impl
         RenderState state;
         bool invertCulling = false;
         uint64_t lastFrame = 0;
-        std::unique_ptr<SceneMaterialPass> forward, shadow;
+        struct Program {
+            std::shared_ptr<const ShaderProgramArtifact> artifact;
+            RenderState state;
+            MaterialPassPipelineDescriptor pass;
+            std::unique_ptr<SceneMaterialPass> pipeline;
+        };
+        std::unordered_map<const GraphCommandDesc *, Program> programs;
     };
     struct ViewResources
     {
@@ -112,7 +123,12 @@ struct WebSceneRenderer::Impl
         Buffer camera, globals, lighting, canonicalLights, models, skins, bones, instances;
         std::vector<Buffer> shadowCameras, shadowParameters;
         Texture shadow;
-        WebGpuRasterPass shadowPass;
+        rhi::BindGroupHandle fullscreenGroup;
+        std::array<rhi::BufferHandle, 6> fullscreenBuffers{};
+        std::unique_ptr<lighting::ForwardPlusLightGrid> grid;
+        bool usesGrid = false;
+        rhi::TextureViewHandle fullscreenShadow;
+        std::shared_ptr<const RenderGraphDescription> graph;
         std::unordered_map<RenderDrawIdentity, Material, RenderDrawIdentityHash> materials;
     };
     std::unordered_map<uint64_t, ViewResources> views;
@@ -130,7 +146,50 @@ struct WebSceneRenderer::Impl
         bool sky = false, ready = false;
     };
     std::vector<Draw> draws;
-    std::vector<size_t> transparentDraws;
+    std::vector<size_t> orderedDraws;
+
+    ~Impl()
+    {
+        if (!device)
+            return;
+        for (auto &[id, view] : views)
+            device->Release(view.fullscreenGroup);
+        device->Release(viewLayout);
+    }
+
+    void PrepareFullscreenView()
+    {
+        const std::array<Buffer, 6> buffers{current->canonicalLights, dummy, dummy,
+                                           current->lighting, current->camera, current->camera};
+        std::array<rhi::BufferHandle, 6> handles;
+        for (size_t index = 0; index < buffers.size(); ++index)
+            handles[index] = buffers[index]->GetBuffer();
+        if (current->usesGrid) {
+            handles[1] = current->grid->Frame(0).headers;
+            handles[2] = current->grid->Frame(0).lightMasks;
+        }
+        if (handles == current->fullscreenBuffers && current->fullscreenShadow == current->shadow->GetView())
+            return;
+        device->Release(current->fullscreenGroup);
+        rhi::BindGroupDesc group;
+        group.layout = viewLayout;
+        group.textureCount = 2;
+        group.textures[0] = {0, rhi::BindingType::SampledTexture, current->shadow->GetView(), {}, true};
+        group.textures[1] = {6, rhi::BindingType::Sampler, {}, current->shadow->GetSampler(), false};
+        const std::array<uint32_t, 6> bindings{1, 2, 3, 4, 5, 7};
+        for (size_t index = 0; index < buffers.size(); ++index) {
+            const auto &buffer = buffers[index];
+            group.buffers[group.bufferCount++] = {bindings[index], index < 3 ? rhi::BindingType::StorageBuffer
+                                                                           : rhi::BindingType::UniformBuffer,
+                                                  handles[index], 0, buffer->GetByteSize()};
+            if (current->usesGrid && (index == 1 || index == 2))
+                group.buffers[group.bufferCount - 1].byteSize = index == 1
+                    ? current->grid->Frame(0).headerCapacityBytes : current->grid->Frame(0).maskCapacityBytes;
+        }
+        current->fullscreenGroup = device->CreateBindGroup(group);
+        current->fullscreenBuffers = handles;
+        current->fullscreenShadow = current->shadow->GetView();
+    }
 
     void Upload(Buffer &buffer, const void *data, uint64_t bytes, rhi::BufferUsageFlags usage)
     {
@@ -264,21 +323,7 @@ struct WebSceneRenderer::Impl
             result.artifact = material.GetSelectedShaderArtifact();
             result.state = material.GetRenderState();
             result.invertCulling = invertCulling;
-            MaterialPassPipelineDescriptor pass;
-            pass.colorFormats = {colorFormat};
-            pass.depthFormat = rhi::PixelFormat::D32SFloat;
-            pass.samples = static_cast<rhi::SampleCount>(samples);
-            pass.invertCulling = invertCulling;
-            result.forward = std::make_unique<SceneMaterialPass>(*device, result.artifact, result.state, pass);
-            const bool hasShadow =
-                std::any_of(result.artifact->variants.begin(), result.artifact->variants.end(),
-                            [](const auto &variant) { return variant.target == ShaderCompileTarget::Shadow; });
-            if (!sky && hasShadow) {
-                pass.target = ShaderCompileTarget::Shadow;
-                pass.colorFormats.clear();
-                pass.samples = rhi::SampleCount::One;
-                result.shadow = std::make_unique<SceneMaterialPass>(*device, result.artifact, result.state, pass);
-            }
+
         }
         result.lastFrame = frameIndex;
         return result;
@@ -373,7 +418,12 @@ struct WebSceneRenderer::Impl
                 return true;
             case 2:
             case 3:
-                addOwned(dummy);
+                if (current->usesGrid) {
+                    const auto &grid = current->grid->Frame(0);
+                    addBuffer(binding.binding == 2 ? grid.headers : grid.lightMasks,
+                              binding.binding == 2 ? grid.headerCapacityBytes : grid.maskCapacityBytes);
+                } else
+                    addOwned(dummy);
                 return true;
             case 4:
                 addOwned(current->lighting);
@@ -418,10 +468,36 @@ struct WebSceneRenderer::Impl
         }
         throw std::invalid_argument("Unsupported scene resource: " + resource.name);
     }
-    void RecordDraw(const rhi::GraphicsCommandEncoder &commands, const Draw &draw, uint32_t shadowView = UINT32_MAX)
+    void RecordDraw(const rhi::GraphicsCommandEncoder &commands, const Draw &draw,
+                    const GraphCommandDesc &command, MaterialPassPipelineDescriptor descriptor,
+                    uint32_t shadowView = UINT32_MAX)
     {
-        auto &program = shadowView == UINT32_MAX ? draw.material->forward : draw.material->shadow;
-        program->Bind(commands, shadowView == UINT32_MAX ? 0 : shadowView);
+        const auto material = command.rendererSelection ? command.rendererSelection->Material()
+                              : command.overrideMaterialValue ? command.overrideMaterialValue : draw.source.material;
+        auto parameters = command.overrideMaterialValue ? nullptr : draw.source.parameterBlock;
+        if (command.rendererSelection)
+            parameters = *command.rendererSelection->Find(draw.source.identity);
+        descriptor.target = command.shaderTarget;
+        if (command.type == GraphCommandType::DrawShadowCasters)
+            descriptor.target = ShaderCompileTarget::Shadow;
+        else
+            descriptor.invertCulling = frame->PrimaryView().invertCulling;
+        auto &program = draw.material->programs[&command];
+        if (!program.pipeline || program.artifact != material->GetSelectedShaderArtifact() ||
+            !(program.state == material->GetRenderState()) || program.pass != descriptor) {
+            program.artifact = material->GetSelectedShaderArtifact();
+            program.state = material->GetRenderState();
+            program.pass = descriptor;
+            program.pipeline = std::make_unique<SceneMaterialPass>(*device, program.artifact, program.state, descriptor);
+        }
+        const uint32_t slot = shadowView == UINT32_MAX ? 0 : shadowView;
+        Draw bound = draw;
+        bound.source.material = material;
+        bound.source.parameterBlock = parameters;
+        if (!program.pipeline->Prepare(material, parameters,
+                [&](const auto &resource, auto &group) { return BindResources(bound, shadowView, resource, group); }, slot))
+            return;
+        program.pipeline->Bind(commands, slot);
         commands.BindVertexBuffer(0, draw.vertexBuffer, 0, draw.vertexBytes);
         commands.BindIndexBuffer(draw.indices->GetBuffer(), draw.indexFormat == MeshIndexFormat::UInt16
                                                                 ? rhi::IndexFormat::Uint16
@@ -435,12 +511,26 @@ WebSceneRenderer::WebSceneRenderer() : m_impl(std::make_unique<Impl>())
 }
 WebSceneRenderer::~WebSceneRenderer() = default;
 
-bool WebSceneRenderer::Initialize(WebGpuRhiDevice &device, rhi::PixelFormat colorFormat, uint32_t samples)
+bool WebSceneRenderer::Initialize(WebGpuRhiDevice &device)
 {
     auto &s = *m_impl;
     s.device = &device;
-    s.colorFormat = colorFormat;
-    s.samples = samples;
+    rhi::BindingLayoutDesc viewLayout;
+    viewLayout.entryCount = 8;
+    for (uint32_t binding = 0; binding < 8; ++binding) {
+        auto &entry = viewLayout.entries[binding];
+        entry.binding = binding;
+        entry.visibility = rhi::ShaderStage::Fragment;
+        entry.type = binding == 0 ? rhi::BindingType::SampledTexture
+                                 : binding <= 3 ? rhi::BindingType::StorageBuffer
+                                 : binding == 6 ? rhi::BindingType::Sampler : rhi::BindingType::UniformBuffer;
+        entry.depthRead = binding == 0;
+        entry.readOnlyStorage = binding >= 1 && binding <= 3;
+    }
+    viewLayout.entries[5].visibility = rhi::ShaderStage::Vertex | rhi::ShaderStage::Fragment;
+    viewLayout.entries[6].samplerType = rhi::SamplerBindingType::NonFiltering;
+    viewLayout.entries[7].visibility = rhi::ShaderStage::Vertex;
+    s.viewLayout = device.CreateBindingLayout(viewLayout);
     s.extractor.SetMaterialPreparation(
         [](const std::shared_ptr<InxMaterial> &material) { ShaderLoader::PrepareMaterial(*material); });
     const auto solid = [&](std::array<uint8_t, 4> pixel, bool srgb) {
@@ -459,40 +549,6 @@ bool WebSceneRenderer::Initialize(WebGpuRhiDevice &device, rhi::PixelFormat colo
     s.Upload(s.dummy, zero.data(), sizeof(zero), rhi::BufferUsageFlags::Storage);
     return true;
 }
-void WebSceneRenderer::Resize(uint32_t width, uint32_t height)
-{
-    auto &s = *m_impl;
-    if (s.depth && s.width == width && s.height == height)
-        return;
-    s.depth = s.Attachment(width, height, s.samples, false);
-    s.width = width;
-    s.height = height;
-}
-bool WebSceneRenderer::ConfigureSampleCount(uint32_t samples)
-{
-    auto &s = *m_impl;
-    if (samples == s.samples)
-        return true;
-    s.samples = samples;
-    for (auto &[id, view] : s.views)
-        view.materials.clear();
-    s.depth.reset();
-    if (s.width && s.height)
-        Resize(s.width, s.height);
-    return true;
-}
-bool WebSceneRenderer::HasDepthTarget() const noexcept
-{
-    return bool(m_impl->depth);
-}
-wgpu::TextureView WebSceneRenderer::GetDepthView() const noexcept
-{
-    return m_impl->depth ? m_impl->device->GetNativeTextureView(m_impl->depth->GetView()) : wgpu::TextureView{};
-}
-wgpu::Color WebSceneRenderer::GetClearColor() const noexcept
-{
-    return m_impl->clear;
-}
 void WebSceneRenderer::StageFrame(const EngineGlobalsUBO &frame)
 {
     auto &s = *m_impl;
@@ -505,11 +561,16 @@ void WebSceneRenderer::StageFrame(const EngineGlobalsUBO &frame)
             it = it->second.lastFrame + 1 < s.frameIndex ? values.erase(it) : std::next(it);
     };
     retireUnused(s.geometry);
-    retireUnused(s.views);
+    for (auto it = s.views.begin(); it != s.views.end();) {
+        if (it->second.lastFrame + 1 < s.frameIndex) {
+            s.device->Release(it->second.fullscreenGroup);
+            it = s.views.erase(it);
+        } else
+            ++it;
+    }
     for (auto &[id, view] : s.views)
         retireUnused(view.materials);
     s.current = nullptr;
-    s.prepared = false;
 }
 void WebSceneRenderer::SetSkyEnabledForDiagnostics(bool enabled) noexcept
 {
@@ -529,39 +590,56 @@ WebSceneRenderer::SampledTexture WebSceneRenderer::ResolveSampledTexture(const s
                  : SampledTexture{};
 }
 
-bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uint32_t height, Camera *camera)
+std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, uint32_t height,
+                                                               Camera &camera, RenderPipelineCallback &pipeline)
 {
     auto &s = *m_impl;
-    s.prepared = false;
-    if (!camera)
-        return false;
-    camera->SetAspectRatio(float(width) / float(height));
-    (void)s.extractor.ExtractCameraFrame(s.world, camera);
+    camera.SetScreenDimensions(width, height);
+    s.width = camera.GetPixelWidth();
+    s.height = camera.GetPixelHeight();
+    (void)s.extractor.ExtractCameraFrame(s.world, &camera);
     s.frame = s.world.Acquire();
     const auto &view = s.frame->PrimaryView();
-    if (!view.valid)
-        return false;
-    const auto background = inx::color::SrgbToLinear(view.backgroundColor);
-    s.clear = {background.r, background.g, background.b, background.a};
     s.current = &s.views[view.cameraId];
     s.current->lastFrame = s.frameIndex;
-    if (!s.current->shadow) {
-        s.current->shadow = s.Attachment(Impl::shadowResolution, Impl::shadowResolution, 1, true);
-        rhi::RasterPassDescription raster;
-        raster.width = raster.height = Impl::shadowResolution;
-        raster.depth.view = s.current->shadow->GetView();
-        raster.depth.format = s.current->shadow->GetFormat();
-        raster.depth.load = rhi::AttachmentLoad::Clear;
-        s.device->PrepareRasterPass(raster, s.current->shadowPass);
+    RenderViewCaptureServices services;
+    services.culler = &s.culler;
+    services.includeShadowCasters = s.shadowsEnabled;
+    services.prepareMaterial = [](const auto &material) { ShaderLoader::PrepareMaterial(*material); };
+    services.acquireProgram = [](const auto &name) { return LoadFullscreenProgram(name, ShaderCodeTarget::Wgsl); };
+    ScriptableRenderContext context(s.frame, view, std::move(services));
+    pipeline.RenderSelectedView(context, context.GetView());
+    return context.CapturePlan();
+}
+
+void WebSceneRenderer::Prepare(const RenderViewPlan &plan, const WebRenderGraph &graph)
+{
+    auto &s = *m_impl;
+    const auto &view = s.frame->PrimaryView();
+    const uint32_t width = s.width, height = s.height;
+    if (s.current->graph != plan.graph) {
+        s.current->materials.clear();
+        s.current->graph = plan.graph;
     }
+    s.shadowResolution = 0;
+    for (const auto &texture : plan.graph->textures)
+        if (texture.IsViewDepth())
+            s.depth = graph.GetTexture(texture.name);
+    for (const auto &pass : plan.graph->passes)
+        for (const auto &command : pass.commands)
+            if (command.type == GraphCommandType::DrawShadowCasters) {
+                s.current->shadow = graph.GetTexture(pass.writeDepth);
+                s.shadowResolution = ResolveGraphPassExtent(*plan.graph, pass, width, height).first;
+            }
+    if (!s.current->shadow)
+        s.current->shadow = s.Attachment(1, 1, 1, true);
     s.draws.clear();
     s.modelValues.clear();
     s.skinValues.clear();
     s.instanceValues.clear();
     s.boneValues.assign(1, glm::mat4(1));
-    const auto culled = s.culler.CullAndBuildForView(view, s.frame, s.shadowsEnabled);
-    const auto &visible = culled.visibleDrawCallsRef ? *culled.visibleDrawCallsRef : culled.visibleDrawCalls;
-    const auto &casters = culled.shadowDrawCallsRef ? *culled.shadowDrawCallsRef : culled.shadowDrawCalls;
+    const auto &visible = plan.culling.visibleRenderers.DrawCalls();
+    const auto &casters = plan.culling.shadowCasters.DrawCalls();
     std::unordered_set<RenderDrawIdentity, RenderDrawIdentityHash> visibleDraws;
     visibleDraws.reserve(visible.size());
     for (const auto &draw : visible) {
@@ -576,6 +654,8 @@ bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uin
             s.AddDraw(shadowOnly);
         }
     }
+    for (const auto &draw : plan.draws)
+        s.AddDraw(draw);
     if (s.skyEnabled && view.clearFlags == CameraClearFlags::Skybox && s.frame->Lighting()->skyboxMaterial) {
         DrawCall sky;
         sky.material = s.frame->Lighting()->skyboxMaterial;
@@ -602,14 +682,39 @@ bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uin
     auto globals = s.frameGlobals;
     globals.screenParams = {float(width), float(height), 1.0f / width, 1.0f / height};
     globals.projectionParams = viewport.projectionParams;
+    globals.viewOptions = {view.dithering ? 1u : 0u, view.stopNaNs ? 1u : 0u, 1, 0};
     s.Uniform(s.current->globals, globals);
     s.lights.CollectLights(*s.frame->Lighting(), view.position);
-    s.lights.ComputeShadowVP(*s.frame->Lighting(), view, s.shadowsEnabled ? Impl::shadowResolution : 0);
+    s.lights.ComputeShadowVP(*s.frame->Lighting(), view, s.shadowsEnabled ? s.shadowResolution : 0);
     s.lights.BuildShaderLightingUBO();
     s.Uniform(s.current->lighting, s.lights.GetShaderLightingUBO());
     const auto canonical = lighting::BuildCanonicalLightUpload(s.lights.GetCanonicalLightSnapshot());
     s.Upload(s.current->canonicalLights, canonical.bytes.data(), canonical.bytes.size(),
              rhi::BufferUsageFlags::Storage);
+    s.current->usesGrid = GraphUsesForwardPlus(*plan.graph);
+    if (s.current->usesGrid) {
+        if (!s.gridProgram) {
+            const auto code = SlangCompiler::Get().Compile(
+                {"inx_forward_plus_grid", "Infernux/ForwardPlus.compute.py",
+                 std::string(lighting::ForwardPlusLightGrid::ShaderSource())}, {}, {ShaderCodeTarget::Wgsl});
+            s.gridProgram = lighting::ForwardPlusLightGrid::CreateProgram(*s.device, code.targets[0]);
+        }
+        if (!s.current->grid) {
+            s.current->grid = std::make_unique<lighting::ForwardPlusLightGrid>();
+            if (!s.current->grid->Initialize(s.gridProgram, 1))
+                throw std::runtime_error("Forward+ view initialization failed");
+        }
+        if (!s.current->grid->PrepareFrame(0, width, height, canonical.header.countsAndGeneration.y,
+                                           CanonicalLightAffectsGeometry, s.current->canonicalLights->GetBuffer()))
+            throw std::runtime_error("Forward+ view preparation failed");
+        for (const auto &retired : s.current->grid->TakeRetiredResources()) {
+            s.device->Release(retired.bindGroup);
+            s.device->Release(retired.consumerBindGroup);
+            s.device->Release(retired.headers);
+            s.device->Release(retired.lightMasks);
+        }
+    }
+    s.PrepareFullscreenView();
     const auto &shadows = s.lights.GetShadowFrame();
     s.current->shadowCameras.resize(shadows.views.size());
     s.current->shadowParameters.resize(shadows.views.size());
@@ -626,71 +731,105 @@ bool WebSceneRenderer::Prepare(wgpu::CommandEncoder encoder, uint32_t width, uin
         parameters.bias = {shadow.depthBiasTexels, shadow.normalBiasTexels, shadow.worldUnitsPerTexel, shadow.farPlane};
         s.Uniform(s.current->shadowParameters[i], parameters);
     }
-    for (auto &draw : s.draws) {
-        draw.ready = draw.material->forward->Prepare(
-            draw.source.material, draw.source.parameterBlock,
-            [&](const auto &resource, auto &group) { return s.BindResources(draw, UINT32_MAX, resource, group); });
-        if (draw.ready && draw.material->shadow)
-            for (uint32_t i = 0; i < shadows.views.size(); ++i)
-                draw.ready = draw.material->shadow->Prepare(
-                    draw.source.material, draw.source.parameterBlock,
-                    [&](const auto &resource, auto &group) { return s.BindResources(draw, i, resource, group); }, i);
-    }
-    s.transparentDraws.clear();
-    for (size_t i = 0; i < s.draws.size(); ++i) {
-        const auto &draw = s.draws[i];
-        if (draw.ready && !draw.sky && draw.source.frustumVisible && draw.material->state.renderQueue >= 3000) {
-            if (draw.source.devicePose.value)
-                throw std::invalid_argument("Device poses require a device-side transparent sort");
-            s.transparentDraws.push_back(i);
-        }
-    }
-    // The extractor groups materials. Transparency additionally needs the
-    // same left-handed view-depth order used by the native renderer.
-    std::stable_sort(s.transparentDraws.begin(), s.transparentDraws.end(), [&](size_t a, size_t b) {
-        return (view.view * s.draws[a].source.worldMatrix[3]).z > (view.view * s.draws[b].source.worldMatrix[3]).z;
-    });
-    // Every shadow type uses the engine's atlas assignment and authored shadow
-    // pass. Alpha clipping, deformation and skinning therefore match the color pass.
-    auto pass = encoder.BeginRenderPass(&s.current->shadowPass.descriptor);
-    WebGpuGraphicsCommandContext context;
-    auto commands = s.device->MakeGraphicsCommandEncoder(context, pass);
-    for (uint32_t i = 0; i < shadows.views.size(); ++i) {
-        const auto &shadow = shadows.views[i];
-        const auto &rect = shadow.atlas;
-        pass.SetViewport(rect.x + rect.guard, rect.y + rect.guard, rect.InnerSize(), rect.InnerSize(), 0, 1);
-        pass.SetScissorRect(rect.x + rect.guard, rect.y + rect.guard, rect.InnerSize(), rect.InnerSize());
-        for (const auto &draw : s.draws)
-            if (draw.ready && draw.source.castsShadows && draw.material->shadow &&
-                (draw.source.layerMask & shadow.cullingMask))
-                s.RecordDraw(commands, draw, i);
-    }
-    pass.End();
-    s.prepared = true;
-    return true;
 }
 
-bool WebSceneRenderer::RenderPrepared(wgpu::RenderPassEncoder pass)
+void WebSceneRenderer::RecordPreparation(wgpu::CommandEncoder encoder)
 {
     auto &s = *m_impl;
-    if (!s.prepared)
-        return false;
+    if (!s.current->usesGrid)
+        return;
+    const auto &view = s.frame->PrimaryView();
+    lighting::ForwardPlusGridConstants constants{};
+    std::memcpy(constants.viewProjection, &view.viewProjection[0][0], sizeof(constants.viewProjection));
+    constants.viewportAndProjectionScale[2] = std::abs(view.projection[0][0]);
+    constants.viewportAndProjectionScale[3] = std::abs(view.projection[1][1]);
+    auto pass = encoder.BeginComputePass();
+    WebGpuComputeCommandContext context;
+    s.current->grid->Record(0, s.device->MakeComputeCommandEncoder(context, pass), constants);
+    pass.End();
+}
+
+void WebSceneRenderer::Record(wgpu::RenderPassEncoder pass, const GraphCommandDesc &command,
+                               const MaterialPassPipelineDescriptor &pipeline)
+{
+    auto &s = *m_impl;
+    const bool shadow = command.type == GraphCommandType::DrawShadowCasters;
+    const bool sky = command.type == GraphCommandType::DrawSkybox;
+    s.orderedDraws.clear();
+    for (size_t index = 0; index < s.draws.size(); ++index) {
+        const auto &draw = s.draws[index];
+        if (sky != draw.sky || (shadow ? !draw.source.castsShadows : !draw.source.frustumVisible))
+            continue;
+        const auto &source = draw.source.material;
+        if (!sky && (source->GetRenderQueue() < command.queueMin || source->GetRenderQueue() > command.queueMax))
+            continue;
+        if (command.rendererSelection && !command.rendererSelection->Find(draw.source.identity))
+            continue;
+        const auto &tag = source->GetPassTag();
+        if (!sky && !command.passTag.empty() &&
+            ((command.overrideMaterialValue && tag != command.passTag) ||
+             (!command.overrideMaterialValue && !tag.empty() && tag != command.passTag)))
+            continue;
+        const auto &material = command.rendererSelection ? command.rendererSelection->Material()
+                               : command.overrideMaterialValue ? command.overrideMaterialValue : source;
+        const auto &artifact = material->GetSelectedShaderArtifact();
+        if (shadow && !artifact->FindVariant(ShaderCompileTarget::Shadow))
+            continue;
+        const bool deferred = artifact->FindVariant(ShaderCompileTarget::GBuffer) != nullptr;
+        if ((command.materialFilter == GraphMaterialFilter::DeferredCompatible && !deferred) ||
+            (command.materialFilter == GraphMaterialFilter::DeferredUnsupported && deferred))
+            continue;
+        s.orderedDraws.push_back(index);
+    }
+    if (command.sortMode == "back_to_front") {
+        const auto &view = s.frame->PrimaryView();
+        for (const auto index : s.orderedDraws)
+            if (s.draws[index].source.devicePose.value)
+                throw std::invalid_argument("Device poses require a device-side transparent sort");
+        std::stable_sort(s.orderedDraws.begin(), s.orderedDraws.end(), [&](size_t a, size_t b) {
+            return (view.view * s.draws[a].source.worldMatrix[3]).z > (view.view * s.draws[b].source.worldMatrix[3]).z;
+        });
+    }
     WebGpuGraphicsCommandContext context;
     const auto commands = s.device->MakeGraphicsCommandEncoder(context, pass);
-    // The sky writes far depth and is drawn after opaque geometry, before alpha.
-    for (const auto &draw : s.draws)
-        if (draw.ready && !draw.sky && draw.source.frustumVisible && draw.material->state.renderQueue < 3000)
-            s.RecordDraw(commands, draw);
-    for (const auto &draw : s.draws)
-        if (draw.ready && draw.sky)
-            s.RecordDraw(commands, draw);
-    for (const auto index : s.transparentDraws)
-        s.RecordDraw(commands, s.draws[index]);
-    if (!s.reported) {
-        std::printf("INFERNUX_WEB_SCENE_RENDER_READY draws=%zu material=authored executor=rhi shadows=%zu\n",
-                    s.draws.size(), s.lights.GetShadowFrame().views.size());
-        s.reported = true;
+    if (shadow) {
+        const auto &shadows = s.lights.GetShadowFrame();
+        for (uint32_t index = 0; index < shadows.views.size(); ++index) {
+            const auto &light = shadows.views[index];
+            const auto &rect = light.atlas;
+            pass.SetViewport(rect.x + rect.guard, rect.y + rect.guard, rect.InnerSize(), rect.InnerSize(), 0, 1);
+            pass.SetScissorRect(rect.x + rect.guard, rect.y + rect.guard, rect.InnerSize(), rect.InnerSize());
+            for (const auto draw : s.orderedDraws)
+                if (s.draws[draw].source.layerMask & light.cullingMask)
+                    s.RecordDraw(commands, s.draws[draw], command, pipeline, index);
+        }
+    } else {
+        for (const auto index : s.orderedDraws)
+            s.RecordDraw(commands, s.draws[index], command, pipeline);
     }
-    return true;
+}
+
+const RenderViewData &WebSceneRenderer::View() const noexcept
+{
+    return m_impl->frame->PrimaryView();
+}
+
+rhi::BindingLayoutHandle WebSceneRenderer::ViewLayout() const noexcept
+{
+    return m_impl->viewLayout;
+}
+
+FullscreenViewResources WebSceneRenderer::FullscreenView() const noexcept
+{
+    const auto &view = *m_impl->current;
+    return {{0, rhi::BindingType::UniformBuffer, view.globals->GetBuffer(), 0, sizeof(EngineGlobalsUBO)},
+            view.fullscreenGroup,
+            {1, rhi::BindingType::StorageBuffer, view.canonicalLights->GetBuffer(), 0,
+             view.canonicalLights->GetByteSize()}};
+}
+
+wgpu::TextureView WebSceneRenderer::GetDepthView() const noexcept
+{
+    return m_impl->depth ? m_impl->device->GetNativeTextureView(m_impl->depth->GetView()) : wgpu::TextureView{};
 }
 } // namespace infernux::web

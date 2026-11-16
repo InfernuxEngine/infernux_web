@@ -78,22 +78,17 @@ def test_physics_configuration_preserves_simulation_clock(monkeypatch, tmp_path,
         assert not settings_file.exists()
 
 
-def test_player_session_receives_unscaled_browser_elapsed_time(monkeypatch):
-    compute = types.ModuleType("infernux.compute")
-    collected = []
-    compute._collect_commands = collected.append
-    monkeypatch.setitem(sys.modules, "infernux.compute", compute)
+def test_player_host_receives_unscaled_browser_elapsed_time(monkeypatch):
+    calls = []
     events = types.ModuleType("infernux.engine.runtime_event_queue")
-    events.drain = lambda: None
+    events.drain = lambda: calls.append(("events",))
     monkeypatch.setitem(sys.modules, "infernux.engine.runtime_event_queue", events)
-    ticks = []
     tick = _function("infernux_web_tick", {
-        "_player_session": types.SimpleNamespace(tick=ticks.append, _infernux_compute_host=17),
+        "_player_session": object(),
+        "_player_host": types.SimpleNamespace(prepare_frame=lambda delta: calls.append(("frame", delta))),
         "_web_splash": None, "_player_activated": True, "_frame_count": 0,
         "_complete_pending_audio_activation": lambda: None,
-        "_process_screen_ui_events": lambda delta: None,
-        "_submit_screen_ui": lambda: None,
+        "_submit_screen_ui": lambda: calls.append(("ui",)),
     })
     assert tick(0.4) is False
-    assert ticks == [0.4]
-    assert collected == [17]
+    assert calls == [("frame", 0.4), ("events",), ("ui",)]

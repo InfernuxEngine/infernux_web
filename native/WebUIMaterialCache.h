@@ -1,6 +1,7 @@
 #pragma once
 
 #include <function/renderer/EngineGlobals.h>
+#include <function/renderer/MaterialPassPipeline.h>
 #include <function/renderer/gui/UIRenderTypes.h>
 #include <webgpu/webgpu_cpp.h>
 
@@ -53,29 +54,26 @@ class WebUIMaterialCache final
 
     WebUIMaterialCache();
     ~WebUIMaterialCache();
-    void Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::TextureFormat screenFormat,
-                    wgpu::TextureFormat worldFormat, uint32_t worldSamples, TextureResolver textures);
-    void ConfigureSampleCount(uint32_t samples);
+    void Initialize(wgpu::Device device, wgpu::Queue queue, TextureResolver textures);
     void Prune(const std::unordered_set<std::string> &activeMaterials);
     void StageFrame(const EngineGlobalsUBO &frame, uint32_t width, uint32_t height);
     void StageCamera(Camera &camera);
     [[nodiscard]] const wgpu::BindGroupLayout &GetTextureLayout() const noexcept;
     bool Bind(wgpu::RenderPassEncoder pass, const UIShaderMaterialBinding &binding, bool world, bool alwaysOnTop,
-              const wgpu::Buffer &constants, uint32_t rootOwner, uint32_t dynamicOffset);
+              const wgpu::Buffer &constants, uint32_t rootOwner, uint32_t dynamicOffset,
+              const MaterialPassPipelineDescriptor &target);
 
   private:
     struct Prepared;
     Prepared &Resolve(const UIShaderMaterialBinding &binding, bool world);
     void PrepareProgram(Prepared &result, const std::shared_ptr<const ShaderTargetCode> &code, bool world);
-    [[nodiscard]] wgpu::RenderPipeline CreatePipeline(const Prepared &prepared, bool world, bool alwaysOnTop);
+    [[nodiscard]] wgpu::RenderPipeline CreatePipeline(const Prepared &prepared, bool world, bool alwaysOnTop,
+                                                     const MaterialPassPipelineDescriptor &target);
     [[nodiscard]] bool RefreshTextures(Prepared &prepared);
     [[nodiscard]] wgpu::BindGroup RootGroup(Prepared &prepared, const wgpu::Buffer &constants, uint32_t rootOwner);
 
     wgpu::Device m_device;
     wgpu::Queue m_queue;
-    wgpu::TextureFormat m_screenFormat = wgpu::TextureFormat::Undefined;
-    wgpu::TextureFormat m_worldFormat = wgpu::TextureFormat::Undefined;
-    uint32_t m_worldSamples = 1;
     uint64_t m_frame = 0;
     TextureResolver m_textures;
     EngineGlobalsUBO m_frameGlobals;

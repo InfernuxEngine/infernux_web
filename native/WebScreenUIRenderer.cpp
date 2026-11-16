@@ -93,18 +93,13 @@ WebScreenUIRenderer::~WebScreenUIRenderer()
     }
 }
 
-bool WebScreenUIRenderer::Initialize(WebGpuRhiDevice &device, wgpu::TextureFormat colorFormat,
-                                     wgpu::TextureFormat worldColorFormat, uint32_t worldSampleCount,
-                                     WebSceneRenderer &scene)
+bool WebScreenUIRenderer::Initialize(WebGpuRhiDevice &device, WebSceneRenderer &scene)
 {
     m_rhi = &device;
     m_device = device.NativeDevice();
     m_queue = device.NativeQueue();
-    m_colorFormat = colorFormat;
-    m_worldColorFormat = worldColorFormat;
-    m_worldSampleCount = worldSampleCount;
     m_materials = std::make_unique<WebUIMaterialCache>();
-    m_materials->Initialize(m_device, m_queue, colorFormat, worldColorFormat, worldSampleCount,
+    m_materials->Initialize(m_device, m_queue,
                             [&scene](const std::string &guid, const MaterialTextureSampler *sampler) {
                                 const auto texture = scene.ResolveSampledTexture(guid, sampler);
                                 return WebUIMaterialCache::Texture{texture.view, texture.sampler};
@@ -161,17 +156,6 @@ bool WebScreenUIRenderer::UploadFontAtlas()
     m_fontView = m_rhi->GetNativeTextureView(m_fontTexture->GetView());
     m_fontSampler = m_rhi->GetNativeSampler(m_fontTexture->GetSampler());
     m_materialSamplers.clear();
-    return true;
-}
-
-bool WebScreenUIRenderer::ConfigureSampleCount(uint32_t sampleCount)
-{
-    if (sampleCount != 1 && sampleCount != 4)
-        return false;
-    if (sampleCount == m_worldSampleCount)
-        return true;
-    m_worldSampleCount = sampleCount;
-    m_materials->ConfigureSampleCount(sampleCount);
     return true;
 }
 
@@ -600,7 +584,8 @@ bool WebScreenUIRenderer::EnsureBuffer(wgpu::Buffer &buffer, uint64_t &capacity,
     return static_cast<bool>(buffer);
 }
 
-bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_t width, uint32_t height)
+bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_t width, uint32_t height,
+                                  const MaterialPassPipelineDescriptor &target)
 {
     ImDrawList *draw = DrawList(list);
     if (!pass || !draw || draw->VtxBuffer.empty() || draw->IdxBuffer.empty() || width == 0 || height == 0)
@@ -693,7 +678,7 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
         const uint64_t offset = static_cast<uint64_t>(commandIndex) * constantStride;
         m_queue.WriteBuffer(buffers.constants, offset, &constants, sizeof(constants));
         const uint32_t dynamicOffset = static_cast<uint32_t>(offset);
-        if (!m_materials->Bind(pass, binding, false, false, buffers.constants, uint32_t(list), dynamicOffset))
+        if (!m_materials->Bind(pass, binding, false, false, buffers.constants, uint32_t(list), dynamicOffset, target))
             continue;
         pass.SetBindGroup(3, group->second);
         pass.SetScissorRect(static_cast<uint32_t>(left), static_cast<uint32_t>(top),
@@ -708,13 +693,14 @@ bool WebScreenUIRenderer::Render(wgpu::RenderPassEncoder pass, int list, uint32_
     return true;
 }
 
-bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height)
+bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height,
+                                       const MaterialPassPipelineDescriptor &target, uint32_t layerMask)
 {
     m_materials->StageCamera(camera);
     const auto viewProjection = camera.GetViewProjectionMatrix();
     const auto view = camera.GetViewMatrix();
     const auto projection = camera.GetProjectionMatrix();
-    const auto cullingMask = camera.GetCullingMask();
+    const auto cullingMask = camera.GetCullingMask() & layerMask;
     if (!pass || !m_world || m_worldElements.empty() || width == 0 || height == 0 || m_worldElementOpen) {
         if (!m_reportedWorldCommandState && m_world && (m_world->VtxBuffer.Size > 0 || !m_worldElements.empty())) {
             std::printf("INFERNUX_WEB_WORLD_UI_COMMAND_STATE spans=%zu vertices=%d indices=%d open=%d "
@@ -852,7 +838,7 @@ bool WebScreenUIRenderer::RenderWorld(wgpu::RenderPassEncoder pass, Camera &came
         const uint64_t offset = index * constantStride;
         m_queue.WriteBuffer(m_worldConstantsBuffer, offset, &constants, sizeof(constants));
         const uint32_t dynamicOffset = static_cast<uint32_t>(offset);
-        if (!m_materials->Bind(pass, draw.binding, true, draw.top, m_worldConstantsBuffer, 2, dynamicOffset))
+        if (!m_materials->Bind(pass, draw.binding, true, draw.top, m_worldConstantsBuffer, 2, dynamicOffset, target))
             continue;
         pass.SetBindGroup(3, group->second);
         pass.DrawIndexed(draw.command->ElemCount, 1, draw.command->IdxOffset,

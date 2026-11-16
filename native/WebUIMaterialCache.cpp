@@ -1,4 +1,5 @@
 #include "WebUIMaterialCache.h"
+#include "WebGpuRhiDevice.h"
 
 #include <function/renderer/InxRenderStruct.h>
 #include <function/renderer/shader/DeviceShaderProgram.h>
@@ -79,7 +80,7 @@ struct WebUIMaterialCache::Prepared
     wgpu::Buffer uniform;
     uint64_t uniformBytes = 0, rootBytes = 0;
     wgpu::BindGroupLayout layout;
-    std::array<wgpu::RenderPipeline, 2> pipelines;
+    std::unordered_map<MaterialPassPipelineDescriptor, std::array<wgpu::RenderPipeline, 2>, MaterialPassPipelineDescriptorHash> pipelines;
     std::array<Root, 3> roots;
     bool texturesReady = false, world = false;
 };
@@ -87,14 +88,10 @@ struct WebUIMaterialCache::Prepared
 WebUIMaterialCache::WebUIMaterialCache() = default;
 WebUIMaterialCache::~WebUIMaterialCache() = default;
 
-void WebUIMaterialCache::Initialize(wgpu::Device device, wgpu::Queue queue, wgpu::TextureFormat screenFormat,
-                                    wgpu::TextureFormat worldFormat, uint32_t worldSamples, TextureResolver textures)
+void WebUIMaterialCache::Initialize(wgpu::Device device, wgpu::Queue queue, TextureResolver textures)
 {
     m_device = device;
     m_queue = queue;
-    m_screenFormat = screenFormat;
-    m_worldFormat = worldFormat;
-    m_worldSamples = worldSamples;
     m_textures = std::move(textures);
     m_cameraBuffer = UniformBuffer(device, sizeof(UniformBufferObject));
     m_globalsBuffer = UniformBuffer(device, sizeof(EngineGlobalsUBO));
@@ -121,14 +118,6 @@ void WebUIMaterialCache::Initialize(wgpu::Device device, wgpu::Queue queue, wgpu
         PrepareProgram(*prepared, code, index != 0);
         m_defaults[index] = std::move(prepared);
     }
-}
-
-void WebUIMaterialCache::ConfigureSampleCount(uint32_t samples)
-{
-    m_worldSamples = samples;
-    m_defaults[1]->pipelines = {};
-    for (auto &[key, prepared] : m_prepared)
-        prepared->pipelines = {};
 }
 
 void WebUIMaterialCache::Prune(const std::unordered_set<std::string> &activeMaterials)
@@ -308,7 +297,8 @@ WebUIMaterialCache::Prepared &WebUIMaterialCache::Resolve(const UIShaderMaterial
     return *accepted.first->second;
 }
 
-wgpu::RenderPipeline WebUIMaterialCache::CreatePipeline(const Prepared &prepared, bool world, bool alwaysOnTop)
+wgpu::RenderPipeline WebUIMaterialCache::CreatePipeline(const Prepared &prepared, bool world, bool alwaysOnTop,
+                                                     const MaterialPassPipelineDescriptor &target)
 {
     const auto entry = [&](rhi::ShaderStage stage) -> const ShaderEntryPointCode & {
         return *std::find_if(prepared.code->entries.begin(), prepared.code->entries.end(),
@@ -352,7 +342,7 @@ wgpu::RenderPipeline WebUIMaterialCache::CreatePipeline(const Prepared &prepared
     blend.alpha.srcFactor = wgpu::BlendFactor::One;
     blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
     wgpu::ColorTargetState color;
-    color.format = world ? m_worldFormat : m_screenFormat;
+    color.format = WebGpuRhiDevice::NativeFormat(target.colorFormats.at(0));
     color.blend = &blend;
     color.writeMask = wgpu::ColorWriteMask::All;
     wgpu::FragmentState fragmentState;
@@ -366,9 +356,9 @@ wgpu::RenderPipeline WebUIMaterialCache::CreatePipeline(const Prepared &prepared
     layout.bindGroupLayoutCount = layouts.size();
     layout.bindGroupLayouts = layouts.data();
     wgpu::DepthStencilState depth;
-    depth.format = wgpu::TextureFormat::Depth32Float;
+    depth.format = WebGpuRhiDevice::NativeFormat(target.depthFormat);
     depth.depthWriteEnabled = wgpu::OptionalBool::False;
-    depth.depthCompare = alwaysOnTop ? wgpu::CompareFunction::Always : wgpu::CompareFunction::GreaterEqual;
+    depth.depthCompare = !world || alwaysOnTop ? wgpu::CompareFunction::Always : wgpu::CompareFunction::GreaterEqual;
     wgpu::RenderPipelineDescriptor descriptor;
     descriptor.layout = m_device.CreatePipelineLayout(&layout);
     descriptor.vertex.module = module(vertex);
@@ -378,8 +368,8 @@ wgpu::RenderPipeline WebUIMaterialCache::CreatePipeline(const Prepared &prepared
     descriptor.fragment = &fragmentState;
     descriptor.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
     descriptor.primitive.cullMode = wgpu::CullMode::None;
-    descriptor.multisample.count = world ? m_worldSamples : 1;
-    descriptor.depthStencil = world ? &depth : nullptr;
+    descriptor.multisample.count = static_cast<uint32_t>(target.samples);
+    descriptor.depthStencil = target.depthFormat != rhi::PixelFormat::Undefined ? &depth : nullptr;
     return m_device.CreateRenderPipeline(&descriptor);
 }
 
@@ -441,14 +431,14 @@ wgpu::BindGroup WebUIMaterialCache::RootGroup(Prepared &prepared, const wgpu::Bu
 
 bool WebUIMaterialCache::Bind(wgpu::RenderPassEncoder pass, const UIShaderMaterialBinding &binding, bool world,
                               bool alwaysOnTop, const wgpu::Buffer &constants, uint32_t rootOwner,
-                              uint32_t dynamicOffset)
+                              uint32_t dynamicOffset, const MaterialPassPipelineDescriptor &target)
 {
     auto &prepared = Resolve(binding, world);
     if (!RefreshTextures(prepared))
         return false;
-    auto &pipeline = prepared.pipelines[alwaysOnTop ? 1 : 0];
+    auto &pipeline = prepared.pipelines[target][alwaysOnTop ? 1 : 0];
     if (!pipeline)
-        pipeline = CreatePipeline(prepared, world, alwaysOnTop);
+        pipeline = CreatePipeline(prepared, world, alwaysOnTop, target);
     pass.SetPipeline(pipeline);
     pass.SetBindGroup(0, RootGroup(prepared, constants, rootOwner), 1, &dynamicOffset);
     pass.SetBindGroup(1, m_cameraGroup);

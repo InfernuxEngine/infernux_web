@@ -1,6 +1,9 @@
 #pragma once
 
 #include <function/renderer/EngineGlobals.h>
+#include <function/renderer/ScriptableRenderContext.h>
+#include <function/renderer/MaterialPassPipeline.h>
+#include <function/renderer/FullscreenRenderer.h>
 #include <function/renderer/rhi/RhiDescriptors.h>
 #include <function/resources/InxMaterial/MaterialProperty.h>
 #include <memory>
@@ -14,6 +17,7 @@ class Camera;
 namespace infernux::web
 {
 class WebGpuRhiDevice;
+class WebRenderGraph;
 
 /// Browser attachments around the shared scene publication, material programs,
 /// lighting policy and RHI draw commands.
@@ -22,12 +26,7 @@ class WebSceneRenderer final
   public:
     WebSceneRenderer();
     ~WebSceneRenderer();
-    bool Initialize(WebGpuRhiDevice &device, rhi::PixelFormat colorFormat, uint32_t samples);
-    void Resize(uint32_t width, uint32_t height);
-    bool ConfigureSampleCount(uint32_t samples);
-    bool HasDepthTarget() const noexcept;
-    wgpu::TextureView GetDepthView() const noexcept;
-    wgpu::Color GetClearColor() const noexcept;
+    bool Initialize(WebGpuRhiDevice &device);
     struct SampledTexture
     {
         wgpu::TextureView view;
@@ -35,8 +34,16 @@ class WebSceneRenderer final
     };
     SampledTexture ResolveSampledTexture(const std::string &guid, const MaterialTextureSampler *sampler = nullptr);
     void StageFrame(const EngineGlobalsUBO &frame);
-    bool Prepare(wgpu::CommandEncoder encoder, uint32_t width, uint32_t height, Camera *camera);
-    bool RenderPrepared(wgpu::RenderPassEncoder pass);
+    std::shared_ptr<const RenderViewPlan> Capture(uint32_t width, uint32_t height, Camera &camera,
+                                                   RenderPipelineCallback &pipeline);
+    void Prepare(const RenderViewPlan &plan, const WebRenderGraph &graph);
+    void RecordPreparation(wgpu::CommandEncoder encoder);
+    void Record(wgpu::RenderPassEncoder pass, const GraphCommandDesc &command,
+                   const MaterialPassPipelineDescriptor &pipeline);
+    [[nodiscard]] const RenderViewData &View() const noexcept;
+    [[nodiscard]] rhi::BindingLayoutHandle ViewLayout() const noexcept;
+    [[nodiscard]] FullscreenViewResources FullscreenView() const noexcept;
+    [[nodiscard]] wgpu::TextureView GetDepthView() const noexcept;
     void SetSkyEnabledForDiagnostics(bool enabled) noexcept;
     void SetShadowsEnabledForDiagnostics(bool enabled) noexcept;
 

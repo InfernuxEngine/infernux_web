@@ -40,9 +40,7 @@ class WebScreenUIRenderer final
     WebScreenUIRenderer();
     ~WebScreenUIRenderer();
 
-    bool Initialize(WebGpuRhiDevice &device, wgpu::TextureFormat colorFormat, wgpu::TextureFormat worldColorFormat,
-                    uint32_t worldSampleCount, WebSceneRenderer &scene);
-    bool ConfigureSampleCount(uint32_t sampleCount);
+    bool Initialize(WebGpuRhiDevice &device, WebSceneRenderer &scene);
     void StageFrame(const EngineGlobalsUBO &frame, uint32_t width, uint32_t height);
     void BeginFrame(uint32_t width, uint32_t height);
     bool BeginFrameCached(uint32_t width, uint32_t height, uint64_t contentRevision);
@@ -76,8 +74,10 @@ class WebScreenUIRenderer final
                                          const std::string &wrapMode = "clamp", int anisoLevel = 1);
     void ReleaseTexture(uint64_t textureId);
 
-    bool Render(wgpu::RenderPassEncoder pass, int list, uint32_t width, uint32_t height);
-    bool RenderWorld(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height);
+    bool Render(wgpu::RenderPassEncoder pass, int list, uint32_t width, uint32_t height,
+                    const MaterialPassPipelineDescriptor &target);
+    bool RenderWorld(wgpu::RenderPassEncoder pass, Camera &camera, uint32_t width, uint32_t height,
+                         const MaterialPassPipelineDescriptor &target, uint32_t layerMask = 0xffffffffu);
 
   private:
     using MaterialBinding = UIShaderMaterialBinding;
@@ -155,7 +155,6 @@ class WebScreenUIRenderer final
     WebGpuRhiDevice *m_rhi = nullptr;
     wgpu::Device m_device;
     wgpu::Queue m_queue;
-    wgpu::TextureFormat m_colorFormat = wgpu::TextureFormat::Undefined;
     std::unique_ptr<WebUIMaterialCache> m_materials;
     wgpu::BindGroupLayout m_textureLayout;
     wgpu::Buffer m_worldConstantsBuffer;
@@ -164,8 +163,6 @@ class WebScreenUIRenderer final
     uint64_t m_worldConstantsCapacity = 0;
     uint64_t m_worldVertexCapacity = 0;
     uint64_t m_worldIndexCapacity = 0;
-    wgpu::TextureFormat m_worldColorFormat = wgpu::TextureFormat::Undefined;
-    uint32_t m_worldSampleCount = 1;
     wgpu::BindGroup m_fontGroup;
     std::shared_ptr<const rhi::TextureGpuView> m_fontTexture;
     wgpu::TextureView m_fontView;

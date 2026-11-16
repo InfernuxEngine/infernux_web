@@ -54,6 +54,8 @@ wgpu::TextureFormat ToWebFormat(rhi::PixelFormat format)
         return wgpu::TextureFormat::R32Float;
     case rhi::PixelFormat::RG32UInt:
         return wgpu::TextureFormat::RG32Uint;
+    case rhi::PixelFormat::RGBA32UInt:
+        return wgpu::TextureFormat::RGBA32Uint;
     case rhi::PixelFormat::RGBA32SFloat:
         return wgpu::TextureFormat::RGBA32Float;
     case rhi::PixelFormat::RGB10A2UNorm:
@@ -412,7 +414,10 @@ WebGpuRhiDevice::WebGpuRhiDevice(wgpu::Device device, wgpu::Queue queue, uint32_
             break;
         }
         caps.sampleCounts = rhi::SampleCountBit(rhi::SampleCount::One);
-        if (format == rhi::PixelFormat::RGBA16SFloat)
+        // Core WebGPU multisampling covers normalized/half-float colors,
+        // r32float and depth-stencil, but not the 32-bit vector formats.
+        if (format != rhi::PixelFormat::RG32UInt && format != rhi::PixelFormat::RGBA32UInt &&
+            format != rhi::PixelFormat::RGBA32SFloat)
             caps.sampleCounts |= rhi::SampleCountBit(rhi::SampleCount::Four);
     }
 }
@@ -1523,6 +1528,11 @@ void WebGpuRhiDevice::ResolveTexture(void *raw, rhi::TextureHandle, rhi::Texture
 const std::string &WebGpuRhiDevice::LastError() const noexcept
 {
     return m_lastError;
+}
+
+wgpu::TextureFormat WebGpuRhiDevice::NativeFormat(rhi::PixelFormat format) noexcept
+{
+    return ToWebFormat(format);
 }
 
 void WebGpuRhiDevice::ClearError() noexcept

@@ -129,6 +129,7 @@ class WebGpuRhiDevice final : public rhi::Device
     }
 
     [[nodiscard]] const std::string &LastError() const noexcept;
+    [[nodiscard]] static wgpu::TextureFormat NativeFormat(rhi::PixelFormat format) noexcept;
     void ClearError() noexcept;
 
   private:

@@ -19,7 +19,7 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "required_for_040": True,
         "parity_gate": "closed",
         "owner": "WebSceneRenderer",
-        "difference": "The Web host consumes the shared scene publication through a fixed WGSL PBR pipeline; the native 1280x720 fixed-frame full-scene and character-region comparisons pass.",
+        "difference": "SceneMaterialPass selects the same authored material variants, reflected resources and render state as Vulkan. Browser graph probes cover Forward, Forward+ and Deferred pixel output.",
         "validation": [
             "web.contract.scene-publication",
             "web.smoke.scene-frame",
@@ -32,7 +32,7 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "required_for_040": True,
         "parity_gate": "closed",
         "owner": "WebSceneRenderer",
-        "difference": "WebGPU consumes published skinned vertices; the native-resolution deterministic character-region comparison passes.",
+        "difference": "WebGPU binds published bones and skin state to the shared authored vertex program. End-to-end animated Player comparison remains a release gate.",
         "validation": [
             "web.contract.skinned-scene",
             "web.smoke.animation-clock",
@@ -45,7 +45,7 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "required_for_040": True,
         "parity_gate": "closed",
         "owner": "WebSceneRenderer",
-        "difference": "The WebGPU sky shader is backend-native but uses the same camera and scene publication semantics.",
+        "difference": "Sky draws select the shared scene sky material through the authored graph's sky pass and camera publication.",
         "validation": ["web.smoke.sky-pixel-difference"],
     },
     {
@@ -54,7 +54,7 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "required_for_040": True,
         "parity_gate": "closed",
         "owner": "WebSceneRenderer",
-        "difference": "The WebGPU host implements the directional shadow pass independently; the native-resolution fixed-frame cross-backend tolerance passes.",
+        "difference": "SceneLightCollector and ShadowViewBuilder prepare the shared shadow atlas and views; the Web adapter records the material Shadow variants. Browser probes cover four directional views.",
         "validation": [
             "web.smoke.shadow-pixel-difference",
             "web.smoke.vulkan-webgpu-fixed-frame",
@@ -113,8 +113,8 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "status": "different-but-validated",
         "required_for_040": True,
         "parity_gate": "closed",
-        "owner": "WebPostProcessRenderer",
-        "difference": "The WebGPU post chain owns HDR intermediates and bloom kernels; native-resolution fixed-exposure particle and emissive-region comparisons pass.",
+        "owner": "FullscreenRenderer",
+        "difference": "The authored RenderGraph owns HDR targets and Bloom passes. The common fullscreen renderer executes the same Python shader assets on both backends; browser HDR pixel checks pass.",
         "validation": [
             "web.contract.hdr-format",
             "web.smoke.post-process",
@@ -126,8 +126,8 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "status": "different-but-validated",
         "required_for_040": True,
         "parity_gate": "closed",
-        "owner": "WebPostProcessRenderer",
-        "difference": "ACES is implemented in backend-native WGSL; fixed-exposure native-resolution cross-backend color tolerance passes.",
+        "owner": "FullscreenRenderer",
+        "difference": "The common tonemapping shader and parameter schema implement ACES. Browser graph pixel checks compare the authored result with its numerical reference.",
         "validation": [
             "web.contract.aces-pass",
             "web.smoke.post-process",
@@ -139,8 +139,8 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "status": "different-but-validated",
         "required_for_040": True,
         "parity_gate": "closed",
-        "owner": "WebPostProcessRenderer",
-        "difference": "The Web host applies the explicit Vulkan-to-Web clip-space transform and browser-surface display encoding.",
+        "owner": "WebRenderGraph",
+        "difference": "The shared display-encoding asset runs at the graph's declared color-domain boundary. Browser Forward, Forward+ and Deferred outputs match the linear-to-sRGB reference.",
         "validation": ["web.smoke.frame-orientation", "web.smoke.non-black-present"],
     },
     {
@@ -149,7 +149,7 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "required_for_040": False,
         "parity_gate": "not-required",
         "owner": "WebSceneRenderer",
-        "reason": "The Web scene renderer does not yet consume cooked custom surface shader variants.",
+        "reason": "Authored surface variants run in the common material path and browser probes pass. Cooked custom-surface export and full Player startup still require a product gate.",
         "validation": ["web.contract.capability-inventory"],
     },
     {
@@ -158,7 +158,7 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "required_for_040": False,
         "parity_gate": "not-required",
         "owner": "WebSceneRenderer",
-        "reason": "The Web scene renderer currently exposes only its PBR material pipeline.",
+        "reason": "The common shader registry contains Toon; a dedicated browser pixel comparison is still required.",
         "validation": ["web.contract.capability-inventory"],
     },
     {
@@ -167,7 +167,7 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "required_for_040": False,
         "parity_gate": "not-required",
         "owner": "WebSceneRenderer",
-        "reason": "The current WebGPU material ABI has no authored alpha-clip contract.",
+        "reason": "The common material ABI carries alpha clipping; dedicated browser coverage and shadow pixel checks remain open.",
         "validation": ["web.contract.capability-inventory"],
     },
     {
@@ -176,7 +176,7 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "required_for_040": True,
         "parity_gate": "closed",
         "owner": "WebSceneRenderer",
-        "difference": "Point-light evaluation is implemented in the backend-native WGSL scene path; both authored 040 point lights are active in the passing native-resolution fixed-frame comparison.",
+        "difference": "Point lights use the shared canonical light list and Slang lighting module. Forward+ uses the common C++ tiled light grid.",
         "validation": [
             "web.contract.point-light-publication",
             "web.smoke.vulkan-webgpu-fixed-frame",
@@ -197,7 +197,7 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "required_for_040": False,
         "parity_gate": "not-required",
         "owner": "WebSceneRenderer",
-        "reason": "Point and spot shadow passes are not implemented by the WebGPU host.",
+        "reason": "The shared atlas and shadow variants are wired, but point and spot visibility have not passed a dedicated browser product gate.",
         "validation": ["web.contract.capability-inventory"],
     },
     {
@@ -205,8 +205,8 @@ _FEATURES: tuple[dict[str, object], ...] = (
         "status": "unsupported",
         "required_for_040": False,
         "parity_gate": "not-required",
-        "owner": "WebPostProcessRenderer",
-        "reason": "Only the 040 Bloom and ACES chain is implemented in the WebGPU host.",
+        "owner": "WebRenderGraph",
+        "reason": "The authored effect graph replaces the private Web effect list. Temporal histories and complete effect-catalog acceptance remain open.",
         "validation": ["web.contract.capability-inventory"],
     },
 )
