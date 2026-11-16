@@ -28,7 +28,7 @@ struct WebRenderGraph::Impl
         FullscreenPipelineEntry pipeline;
         FullscreenParameters parameters;
         std::vector<FullscreenResourceInput> inputs;
-        std::vector<uint32_t> viewLightInputs;
+        std::vector<std::pair<uint32_t, GraphFrameBuffer>> frameBufferInputs;
         struct HistoryInput
         {
             uint32_t index;
@@ -209,7 +209,7 @@ struct WebRenderGraph::Impl
     void PrepareBuffers()
     {
         if (std::all_of(graph->buffers.begin(), graph->buffers.end(),
-                        [](const auto &buffer) { return buffer.viewLightList; })) {
+                        [](const auto &buffer) { return buffer.HasFrameBuffer(); })) {
             workStorage.reset();
             transientBuffers.clear();
             bufferWrites.clear();
@@ -226,7 +226,7 @@ struct WebRenderGraph::Impl
         bufferWrites = FindGraphBufferWrites(*graph);
         transientBuffers.clear();
         for (const auto &buffer : graph->buffers) {
-            if (buffer.viewLightList || workStorage->buffers.count(buffer.name))
+            if (buffer.HasFrameBuffer() || workStorage->buffers.count(buffer.name))
                 continue;
             rhi::BufferDesc desc;
             desc.byteSize = buffer.byteSize;
@@ -272,7 +272,7 @@ struct WebRenderGraph::Impl
                 exports.insert(id);
         }
         for (const auto &buffer : graph->buffers) {
-            const auto id = buffer.viewLightList ? newResource() : resourceId(bufferIds, GetBuffer(buffer.name));
+            const auto id = buffer.HasFrameBuffer() ? newResource() : resourceId(bufferIds, GetBuffer(buffer.name));
             resources.emplace(buffer.name, id);
             if (buffer.exportLayout)
                 exports.insert(id);
@@ -442,8 +442,8 @@ struct WebRenderGraph::Impl
                     [&](const auto &item) { return item.name == binding->second; });
                 if (buffer != graph->buffers.end()) {
                     FullscreenResourceInput input;
-                    if (buffer->viewLightList)
-                        prepared.viewLightInputs.push_back(uint32_t(prepared.inputs.size()));
+                    if (buffer->HasFrameBuffer())
+                        prepared.frameBufferInputs.emplace_back(uint32_t(prepared.inputs.size()), buffer->frameBuffer);
                     else {
                         input.buffer = GetBuffer(buffer->name);
                         input.byteOffset = buffer->byteOffset;
@@ -845,11 +845,13 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
                     WebGpuGraphicsCommandContext context;
                     auto commands = s.device.MakeGraphicsCommandEncoder(context, pass);
                     auto &program = prepared.fullscreen[commandIndex];
-                    for (const auto inputIndex : program.viewLightInputs) {
+                    for (const auto &[inputIndex, source] : program.frameBufferInputs) {
                         auto &input = program.inputs[inputIndex];
-                        input.buffer = view.canonicalLights.buffer;
-                        input.byteOffset = view.canonicalLights.offset;
-                        input.byteSize = view.canonicalLights.byteSize;
+                        const auto &binding =
+                            source == GraphFrameBuffer::ViewLights ? view.canonicalLights : view.worldSurfaces;
+                        input.buffer = binding.buffer;
+                        input.byteOffset = binding.offset;
+                        input.byteSize = binding.byteSize;
                     }
                     for (const auto &binding : program.historyInputs) {
                         auto &input = program.inputs[binding.index];

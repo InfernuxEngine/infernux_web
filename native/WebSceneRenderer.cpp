@@ -12,22 +12,23 @@
 #include <core/types/ColorSpace.h>
 #include <function/renderer/MaterialSamplerState.h>
 #include <function/renderer/RenderInstanceHistory.h>
+#include <function/renderer/RenderSurfaceRecords.h>
 #include <function/renderer/RenderViewHistory.h>
 #include <function/renderer/RenderWorld.h>
 #include <function/renderer/SceneMaterialPass.h>
 #include <function/renderer/TextureUploadBuilder.h>
 #include <function/renderer/lighting/CanonicalLightGpuBuffer.h>
+#include <function/renderer/rhi/RenderTextureRegistry.h>
 #include <function/renderer/rhi/RhiBuffer.h>
 #include <function/renderer/rhi/RhiComputeHost.h>
 #include <function/renderer/rhi/RhiRenderTexture.h>
-#include <function/renderer/rhi/RenderTextureRegistry.h>
 #include <function/resources/AssetRegistry/AssetRegistry.h>
-#include <function/scene/SceneManager.h>
 #include <function/resources/InxTexture/InxTexture.h>
 #include <function/resources/ShaderAsset/ShaderLoader.h>
 #include <function/scene/Camera.h>
 #include <function/scene/LightingData.h>
 #include <function/scene/PrimitiveMeshes.h>
+#include <function/scene/SceneManager.h>
 #include <function/scene/SceneRenderExtractor.h>
 
 #include <algorithm>
@@ -154,6 +155,7 @@ struct WebSceneRenderer::Impl
     {
         uint64_t lastFrame = 0;
         Buffer camera, globals, lighting, canonicalLights, models, skins, bones, instances;
+        std::shared_ptr<const rhi::BufferResource> surfaceRecords;
         std::vector<Buffer> shadowCameras, shadowParameters;
         Texture shadow;
         rhi::BindGroupHandle fullscreenGroup;
@@ -876,6 +878,16 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     const auto canonical = lighting::BuildCanonicalLightUpload(s.lights.GetCanonicalLightSnapshot());
     s.Upload(s.current->canonicalLights, canonical.bytes.data(), canonical.bytes.size(),
              rhi::BufferUsageFlags::Storage);
+    const auto &buffers = graph.Description().buffers;
+    if (std::any_of(buffers.begin(), buffers.end(),
+                    [](const auto &buffer) { return buffer.frameBuffer == GraphFrameBuffer::WorldSurfaces; })) {
+        const auto &records = plan.world->SurfaceRecords();
+        if (!records)
+            throw std::runtime_error("Surface records require an acquired RenderWorld");
+        resources.surfaceRecords = records->Acquire(*s.device);
+    } else {
+        resources.surfaceRecords.reset();
+    }
     s.current->usesGrid = GraphUsesForwardPlus(*plan.graph);
     if (s.current->usesGrid) {
         if (!s.gridProgram) {
@@ -1012,10 +1024,14 @@ rhi::BindingLayoutHandle WebSceneRenderer::ViewLayout() const noexcept
 FullscreenViewResources WebSceneRenderer::FullscreenView() const noexcept
 {
     const auto &view = *m_impl->current;
-    return {{0, rhi::BindingType::UniformBuffer, view.globals->GetBuffer(), 0, sizeof(EngineGlobalsUBO)},
-            view.fullscreenGroup,
-            {1, rhi::BindingType::StorageBuffer, view.canonicalLights->GetBuffer(), 0,
-             view.canonicalLights->GetByteSize()}};
+    const auto &surfaces = view.surfaceRecords;
+    return {
+        {0, rhi::BindingType::UniformBuffer, view.globals->GetBuffer(), 0, sizeof(EngineGlobalsUBO)},
+        view.fullscreenGroup,
+        {1, rhi::BindingType::StorageBuffer, view.canonicalLights->GetBuffer(), 0, view.canonicalLights->GetByteSize()},
+        surfaces
+            ? rhi::BufferBinding{0, rhi::BindingType::StorageBuffer, surfaces->GetBuffer(), 0, surfaces->GetByteSize()}
+            : rhi::BufferBinding{}};
 }
 
 wgpu::TextureView WebSceneRenderer::GetDepthView() const noexcept
