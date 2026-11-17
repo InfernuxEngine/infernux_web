@@ -928,8 +928,7 @@ bool WebParticleRuntime::Render(wgpu::RenderPassEncoder pass, const RenderViewDa
                                 int32_t queueMin, int32_t queueMax, rhi::TextureViewHandle sceneDepth,
                                 bool sceneDepthIsDepth)
 {
-    const bool color =
-        target.target == ShaderCompileTarget::Forward || target.target == ShaderCompileTarget::ForwardPlus;
+    const bool color = target.target == ShaderCompileTarget::Forward || IsForwardPlusMaterialPass(target.target);
     const bool motion = target.target == ShaderCompileTarget::Motion;
     if (!m_state->rhi || !pass || target.colorFormats.size() != 1 || (!color && !motion))
         return false;

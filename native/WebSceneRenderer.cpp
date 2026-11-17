@@ -1,12 +1,12 @@
 #include "WebSceneRenderer.h"
 #include "WebGpuRhiDevice.h"
-#include <function/renderer/lighting/ForwardPlusLightGrid.h>
-#include <function/resources/ShaderAsset/SlangCompiler.h>
-#include "WebRenderGraph.h"
-#include <function/renderer/RendererSelection.h>
 #include "WebIndexPacking.h"
+#include "WebRenderGraph.h"
 #include "WebTextureAssetLoad.h"
 #include "WebTextureUpload.h"
+#include <function/renderer/RendererSelection.h>
+#include <function/renderer/lighting/ForwardPlusLightGrid.h>
+#include <function/resources/ShaderAsset/SlangCompiler.h>
 
 #include <core/math/DepthConvention.h>
 #include <core/types/ColorSpace.h>
@@ -70,14 +70,18 @@ bool PassIncludesDraw(const GraphCommandDesc &command, const DrawCall &draw, boo
         ((command.overrideMaterialValue && tag != command.passTag) ||
          (!command.overrideMaterialValue && !tag.empty() && tag != command.passTag)))
         return false;
-    const auto &material = command.rendererSelection ? command.rendererSelection->Material()
-                           : command.overrideMaterialValue ? command.overrideMaterialValue : source;
+    const auto &material = command.rendererSelection       ? command.rendererSelection->Material()
+                           : command.overrideMaterialValue ? command.overrideMaterialValue
+                                                           : source;
     const auto &artifact = material->GetSelectedShaderArtifact();
     if (!artifact || (shadow && !artifact->FindVariant(ShaderCompileTarget::Shadow)))
         return false;
     const bool deferred = artifact->FindVariant(ShaderCompileTarget::GBuffer) != nullptr;
+    const bool thinSheet = artifact->FindVariant(ShaderCompileTarget::ThinSurface) != nullptr;
     return (command.materialFilter != GraphMaterialFilter::DeferredCompatible || deferred) &&
-           (command.materialFilter != GraphMaterialFilter::DeferredUnsupported || !deferred);
+           (command.materialFilter != GraphMaterialFilter::DeferredUnsupported || !deferred) &&
+           (command.materialFilter != GraphMaterialFilter::ThinSheet || thinSheet) &&
+           (command.materialFilter != GraphMaterialFilter::OrdinaryTransparent || !thinSheet);
 }
 
 UniformBufferObject CameraUniform(const RenderViewData &view, const glm::mat4 &projection,
@@ -99,6 +103,8 @@ struct WebSceneRenderer::Impl
 {
     WebGpuRhiDevice *device = nullptr;
     rhi::BindingLayoutHandle viewLayout;
+    rhi::BindingLayoutHandle partitionViewLayout;
+    rhi::BindingLayoutDesc viewLayoutDescription;
     uint32_t width = 0, height = 0;
     uint32_t shadowResolution = 0;
     Texture depth;
@@ -144,7 +150,8 @@ struct WebSceneRenderer::Impl
         RenderState state;
         bool invertCulling = false;
         uint64_t lastFrame = 0;
-        struct Program {
+        struct Program
+        {
             std::shared_ptr<const ShaderProgramArtifact> artifact;
             RenderState state;
             MaterialPassPipelineDescriptor pass;
@@ -158,7 +165,10 @@ struct WebSceneRenderer::Impl
         std::shared_ptr<const rhi::BufferResource> surfaceRecords;
         std::vector<Buffer> shadowCameras, shadowParameters;
         Texture shadow;
+        Texture transparentLayer;
         rhi::BindGroupHandle fullscreenGroup;
+        rhi::BindGroupHandle partitionGroup;
+        rhi::TextureViewHandle partitionLayer;
         std::array<rhi::BufferHandle, 6> fullscreenBuffers{};
         std::unique_ptr<lighting::ForwardPlusLightGrid> grid;
         bool usesGrid = false;
@@ -197,15 +207,18 @@ struct WebSceneRenderer::Impl
     {
         if (!device)
             return;
-        for (auto &[id, view] : views)
+        for (auto &[id, view] : views) {
             device->Release(view.fullscreenGroup);
+            device->Release(view.partitionGroup);
+        }
         device->Release(viewLayout);
+        device->Release(partitionViewLayout);
     }
 
     void PrepareFullscreenView()
     {
-        const std::array<Buffer, 6> buffers{current->canonicalLights, dummy, dummy,
-                                           current->lighting, current->camera, current->camera};
+        const std::array<Buffer, 6> buffers{current->canonicalLights, dummy,           dummy,
+                                            current->lighting,        current->camera, current->camera};
         std::array<rhi::BufferHandle, 6> handles;
         for (size_t index = 0; index < buffers.size(); ++index)
             handles[index] = buffers[index]->GetBuffer();
@@ -213,27 +226,53 @@ struct WebSceneRenderer::Impl
             handles[1] = current->grid->Frame(0).headers;
             handles[2] = current->grid->Frame(0).lightMasks;
         }
-        if (handles == current->fullscreenBuffers && current->fullscreenShadow == current->shadow->GetView())
+        const auto shadow = current->shadow->GetView();
+        const auto layer = current->transparentLayer ? current->transparentLayer->GetView() : rhi::TextureViewHandle{};
+        const bool baseChanged = handles != current->fullscreenBuffers || current->fullscreenShadow != shadow;
+        const bool layerChanged = current->partitionLayer != layer;
+        if (!baseChanged && !layerChanged)
             return;
-        device->Release(current->fullscreenGroup);
         rhi::BindGroupDesc group;
         group.layout = viewLayout;
         group.textureCount = 2;
-        group.textures[0] = {0, rhi::BindingType::SampledTexture, current->shadow->GetView(), {}, true};
+        group.textures[0] = {0, rhi::BindingType::SampledTexture, shadow, {}, true};
         group.textures[1] = {6, rhi::BindingType::Sampler, {}, current->shadow->GetSampler(), false};
         const std::array<uint32_t, 6> bindings{1, 2, 3, 4, 5, 7};
         for (size_t index = 0; index < buffers.size(); ++index) {
             const auto &buffer = buffers[index];
-            group.buffers[group.bufferCount++] = {bindings[index], index < 3 ? rhi::BindingType::StorageBuffer
-                                                                           : rhi::BindingType::UniformBuffer,
-                                                  handles[index], 0, buffer->GetByteSize()};
+            group.buffers[group.bufferCount++] = {
+                bindings[index], index < 3 ? rhi::BindingType::StorageBuffer : rhi::BindingType::UniformBuffer,
+                handles[index], 0, buffer->GetByteSize()};
             if (current->usesGrid && (index == 1 || index == 2))
-                group.buffers[group.bufferCount - 1].byteSize = index == 1
-                    ? current->grid->Frame(0).headerCapacityBytes : current->grid->Frame(0).maskCapacityBytes;
+                group.buffers[group.bufferCount - 1].byteSize = index == 1 ? current->grid->Frame(0).headerCapacityBytes
+                                                                           : current->grid->Frame(0).maskCapacityBytes;
         }
-        current->fullscreenGroup = device->CreateBindGroup(group);
-        current->fullscreenBuffers = handles;
-        current->fullscreenShadow = current->shadow->GetView();
+        if (baseChanged) {
+            device->Release(current->fullscreenGroup);
+            current->fullscreenGroup = device->CreateBindGroup(group);
+            current->fullscreenBuffers = handles;
+            current->fullscreenShadow = shadow;
+        }
+        if (layer.IsValid()) {
+            if (!partitionViewLayout.IsValid()) {
+                auto descriptor = viewLayoutDescription;
+                auto &entry = descriptor.entries[descriptor.entryCount++];
+                entry.binding = kTransparentLayerViewBinding;
+                entry.visibility = rhi::ShaderStage::Fragment;
+                entry.type = rhi::BindingType::SampledTexture;
+                entry.sampleType = rhi::TextureSampleType::Uint;
+                partitionViewLayout = device->CreateBindingLayout(descriptor);
+            }
+            group.layout = partitionViewLayout;
+            group.textures[group.textureCount++] = {kTransparentLayerViewBinding, rhi::BindingType::SampledTexture,
+                                                    layer};
+            device->Release(current->partitionGroup);
+            current->partitionGroup = device->CreateBindGroup(group);
+        } else if (layerChanged) {
+            device->Release(current->partitionGroup);
+            current->partitionGroup = {};
+        }
+        current->partitionLayer = layer;
     }
 
     void Upload(Buffer &buffer, const void *data, uint64_t bytes, rhi::BufferUsageFlags usage)
@@ -372,7 +411,6 @@ struct WebSceneRenderer::Impl
             result.artifact = material.GetSelectedShaderArtifact();
             result.state = material.GetRenderState();
             result.invertCulling = invertCulling;
-
         }
         result.lastFrame = frameIndex;
         return result;
@@ -411,7 +449,8 @@ struct WebSceneRenderer::Impl
             };
             skin.boneOffset = appendPalette(*source.skinBoneMatrices);
             skin.previousBoneOffset = previous && previous->skin && previous->skin != source.skinBoneMatrices
-                                          ? appendPalette(*previous->skin) : skin.boneOffset;
+                                          ? appendPalette(*previous->skin)
+                                          : skin.boneOffset;
             skin.boneCount = static_cast<uint32_t>(source.skinBoneMatrices->size());
             skin.flags = kGPUSkinFlagEnabled;
         }
@@ -500,11 +539,15 @@ struct WebSceneRenderer::Impl
             case 7:
                 addOwned(current->shadowParameters[shadowView]);
                 return true;
+            case kTransparentLayerViewBinding:
+                group.textures[group.textureCount++] = {binding.binding, binding.type,
+                                                        current->transparentLayer->GetView()};
+                return true;
             }
         }
         if (resource.set == 2) {
-            const auto &pose = binding.binding == 5 && draw.previousPose ? draw.previousPose
-                                                                               : draw.source.devicePose.value;
+            const auto &pose =
+                binding.binding == 5 && draw.previousPose ? draw.previousPose : draw.source.devicePose.value;
             switch (binding.binding) {
             case 0:
                 addOwned(current->globals);
@@ -535,12 +578,12 @@ struct WebSceneRenderer::Impl
         }
         throw std::invalid_argument("Unsupported scene resource: " + resource.name);
     }
-    void RecordDraw(const rhi::GraphicsCommandEncoder &commands, const Draw &draw,
-                    const GraphCommandDesc &command, MaterialPassPipelineDescriptor descriptor,
-                    uint32_t shadowView = UINT32_MAX)
+    void RecordDraw(const rhi::GraphicsCommandEncoder &commands, const Draw &draw, const GraphCommandDesc &command,
+                    MaterialPassPipelineDescriptor descriptor, uint32_t shadowView = UINT32_MAX)
     {
-        const auto material = command.rendererSelection ? command.rendererSelection->Material()
-                              : command.overrideMaterialValue ? command.overrideMaterialValue : draw.source.material;
+        const auto material = command.rendererSelection       ? command.rendererSelection->Material()
+                              : command.overrideMaterialValue ? command.overrideMaterialValue
+                                                              : draw.source.material;
         auto parameters = command.overrideMaterialValue ? nullptr : draw.source.parameterBlock;
         if (command.rendererSelection)
             parameters = *command.rendererSelection->Find(draw.source.identity);
@@ -555,14 +598,17 @@ struct WebSceneRenderer::Impl
             program.artifact = material->GetSelectedShaderArtifact();
             program.state = material->GetRenderState();
             program.pass = descriptor;
-            program.pipeline = std::make_unique<SceneMaterialPass>(*device, program.artifact, program.state, descriptor);
+            program.pipeline =
+                std::make_unique<SceneMaterialPass>(*device, program.artifact, program.state, descriptor);
         }
         const uint32_t slot = shadowView == UINT32_MAX ? 0 : shadowView;
         Draw bound = draw;
         bound.source.material = material;
         bound.source.parameterBlock = parameters;
-        if (!program.pipeline->Prepare(material, parameters,
-                [&](const auto &resource, auto &group) { return BindResources(bound, shadowView, resource, group); }, slot))
+        if (!program.pipeline->Prepare(
+                material, parameters,
+                [&](const auto &resource, auto &group) { return BindResources(bound, shadowView, resource, group); },
+                slot))
             return;
         program.pipeline->Bind(commands, slot);
         commands.BindVertexBuffer(0, draw.vertexBuffer, 0, draw.vertexBytes);
@@ -591,15 +637,17 @@ bool WebSceneRenderer::Initialize(WebGpuRhiDevice &device)
         auto &entry = viewLayout.entries[binding];
         entry.binding = binding;
         entry.visibility = rhi::ShaderStage::Fragment;
-        entry.type = binding == 0 ? rhi::BindingType::SampledTexture
-                                 : binding <= 3 ? rhi::BindingType::StorageBuffer
-                                 : binding == 6 ? rhi::BindingType::Sampler : rhi::BindingType::UniformBuffer;
+        entry.type = binding == 0   ? rhi::BindingType::SampledTexture
+                     : binding <= 3 ? rhi::BindingType::StorageBuffer
+                     : binding == 6 ? rhi::BindingType::Sampler
+                                    : rhi::BindingType::UniformBuffer;
         entry.depthRead = binding == 0;
         entry.readOnlyStorage = binding >= 1 && binding <= 3;
     }
     viewLayout.entries[5].visibility = rhi::ShaderStage::Vertex | rhi::ShaderStage::Fragment;
     viewLayout.entries[6].samplerType = rhi::SamplerBindingType::NonFiltering;
     viewLayout.entries[7].visibility = rhi::ShaderStage::Vertex;
+    s.viewLayoutDescription = viewLayout;
     s.viewLayout = device.CreateBindingLayout(viewLayout);
     s.extractor.SetMaterialPreparation(
         [](const std::shared_ptr<InxMaterial> &material) { ShaderLoader::PrepareMaterial(*material); });
@@ -632,8 +680,8 @@ void WebSceneRenderer::SetOutputSize(uint32_t width, uint32_t height)
 std::shared_ptr<rhi::RenderTexture> WebSceneRenderer::CreateRenderTexture(const rhi::RenderTextureDesc &description)
 {
     auto &s = *m_impl;
-    return s.renderTextures.Create(*s.device, description, SceneManager::Instance().CurrentWorld().id,
-                                   s.outputWidth, s.outputHeight);
+    return s.renderTextures.Create(*s.device, description, SceneManager::Instance().CurrentWorld().id, s.outputWidth,
+                                   s.outputHeight);
 }
 
 std::shared_ptr<rhi::RenderTexture> WebSceneRenderer::LoadRenderTexture(const std::string &guid)
@@ -681,8 +729,9 @@ std::shared_ptr<const rhi::TextureResource> WebSceneRenderer::ResolveGraphTextur
     return m_impl->ResolveTexture(guid, {}, true);
 }
 
-std::optional<raytracing::RayLitTexture> WebSceneRenderer::ResolveRayLitTexture(const InxMaterial &material,
-    const RendererParameterBlock *parameters, std::string_view name)
+std::optional<raytracing::RayLitTexture>
+WebSceneRenderer::ResolveRayLitTexture(const InxMaterial &material, const RendererParameterBlock *parameters,
+                                       std::string_view name)
 {
     using namespace raytracing;
     const auto reference = ResolveRayLitTextureReference(material, parameters, name);
@@ -706,14 +755,14 @@ std::optional<raytracing::RayLitTexture> WebSceneRenderer::ResolveRayLitTexture(
             guid, registry.GetAssetVersion(guid), image.GetTexture(), image.GetView(), image.GetSampler(),
             image.GetResidentBytes(), entry.image, image.GetFormat(), image.GetViewDesc(), image.GetUploadSubmission());
     }
-    const auto pageClass = rhi::IsSrgbFormat(entry.rayView->GetFormat()) ? RayTexturePageClass::Color
-                                                                      : RayTexturePageClass::Data;
+    const auto pageClass =
+        rhi::IsSrgbFormat(entry.rayView->GetFormat()) ? RayTexturePageClass::Color : RayTexturePageClass::Data;
     return CaptureRayTexturePageSource(*s.device, entry.rayView, registry.GetAssetContentGeneration(guid), pageClass);
 }
 
-std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, uint32_t height,
-                                                              Camera &camera, RenderPipelineCallback &pipeline,
-                                                              const FullscreenPipelineCache &programs)
+std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, uint32_t height, Camera &camera,
+                                                                RenderPipelineCallback &pipeline,
+                                                                const FullscreenPipelineCache &programs)
 {
     auto &s = *m_impl;
     camera.SetScreenDimensions(width, height);
@@ -735,7 +784,7 @@ std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, 
 }
 
 std::vector<MaterialTextureRead> WebSceneRenderer::CollectMaterialTextureReads(const RenderViewPlan &plan,
-                                                                           const WebRenderGraph &graph) const
+                                                                               const WebRenderGraph &graph) const
 {
     std::vector<MaterialTextureRead> reads;
     for (const auto index : graph.ExecutionOrder()) {
@@ -755,10 +804,11 @@ std::vector<MaterialTextureRead> WebSceneRenderer::CollectMaterialTextureReads(c
             }
         };
         const auto visit = [&](const DrawCall &draw) {
-            const auto &override = command->rendererSelection ? command->rendererSelection->Material()
-                                                               : command->overrideMaterialValue;
+            const auto &override =
+                command->rendererSelection ? command->rendererSelection->Material() : command->overrideMaterialValue;
             const auto &material = override ? override : draw.material;
-            if (material && !material->GetRenderTextures().empty() && draw.material && draw.material->GetRenderState().cullMode != MaterialCullMode::FrontAndBack &&
+            if (material && !material->GetRenderTextures().empty() && draw.material &&
+                draw.material->GetRenderState().cullMode != MaterialCullMode::FrontAndBack &&
                 PassIncludesDraw(*command, draw, false)) {
                 visitMaterial(material);
             }
@@ -797,6 +847,7 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     s.height = view.pixelHeight;
     const uint32_t width = s.width, height = s.height;
     auto &resources = *s.current;
+    resources.transparentLayer = graph.TransparentLayer();
     const bool newGraph = resources.graph != plan.graph;
     if (newGraph) {
         const bool topologyChanged = !resources.graph || !RenderGraphTopologyEquals(*resources.graph, *plan.graph);
@@ -804,11 +855,11 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
         resources.graph = plan.graph;
         if (topologyChanged)
             resources.acceptedView.reset();
-        resources.useMotion = std::any_of(graph.ExecutionOrder().begin(), graph.ExecutionOrder().end(),
-                                          [&](uint32_t pass) {
-                                              const auto *command = graph.Description().passes[pass].PrimaryCommand();
-                                              return command && UsesInstanceMotion(command->shaderTarget);
-                                          });
+        resources.useMotion =
+            std::any_of(graph.ExecutionOrder().begin(), graph.ExecutionOrder().end(), [&](uint32_t pass) {
+                const auto *command = graph.Description().passes[pass].PrimaryCommand();
+                return command && UsesInstanceMotion(command->shaderTarget);
+            });
     }
     if (!resources.acceptedView || resources.acceptedView->pixelWidth != width ||
         resources.acceptedView->pixelHeight != height || IsRenderViewCut(*resources.acceptedView, view)) {
@@ -880,11 +931,12 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     s.Storage(s.current->skins, s.skinValues);
     s.Storage(s.current->bones, s.boneValues);
     s.Storage(s.current->instances, s.instanceValues);
-    s.preparedJitter = plan.graph->temporalJitter ? RenderViewJitterNdc(resources.temporalSample, width, height)
-                                                : glm::vec2(0.0f);
+    s.preparedJitter =
+        plan.graph->temporalJitter ? RenderViewJitterNdc(resources.temporalSample, width, height) : glm::vec2(0.0f);
     s.preparedProjection = JitterRenderViewProjection(view.projection, s.preparedJitter);
     s.preparedViewProjection = s.preparedProjection * view.view;
-    const auto &previousProjection = resources.acceptedView ? resources.previousViewProjection : s.preparedViewProjection;
+    const auto &previousProjection =
+        resources.acceptedView ? resources.previousViewProjection : s.preparedViewProjection;
     const auto viewport = CameraUniform(view, s.preparedProjection, previousProjection);
     s.Uniform(resources.camera, viewport);
     auto globals = s.frameGlobals;
@@ -893,8 +945,8 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     globals.projectionParams = viewport.projectionParams;
     globals.zBufferParams = viewport.zBufferParams;
     globals.frameParams.w = resources.acceptedView ? resources.previousTime : globals.time.x;
-    globals.viewOptions = MakeViewOptions(view.dithering, view.stopNaNs, true, graph.AcceptedRayGeometry(),
-                                         graph.AcceptedSampleIndex());
+    globals.viewOptions =
+        MakeViewOptions(view.dithering, view.stopNaNs, true, graph.AcceptedRayGeometry(), graph.AcceptedSampleIndex());
     s.Uniform(s.current->globals, globals);
     s.lights.CollectLights(*s.frame->Lighting(), view.position);
     s.lights.ComputeShadowVP(*s.frame->Lighting(), view, s.shadowsEnabled ? s.shadowResolution : 0);
@@ -916,9 +968,10 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     s.current->usesGrid = GraphUsesForwardPlus(*plan.graph);
     if (s.current->usesGrid) {
         if (!s.gridProgram) {
-            const auto code = SlangCompiler::Get().Compile(
-                {"inx_forward_plus_grid", "Infernux/ForwardPlus.compute.py",
-                 std::string(lighting::ForwardPlusLightGrid::ShaderSource())}, {}, {ShaderCodeTarget::Wgsl});
+            const auto code =
+                SlangCompiler::Get().Compile({"inx_forward_plus_grid", "Infernux/ForwardPlus.compute.py",
+                                              std::string(lighting::ForwardPlusLightGrid::ShaderSource())},
+                                             {}, {ShaderCodeTarget::Wgsl});
             s.gridProgram = lighting::ForwardPlusLightGrid::CreateProgram(*s.device, code.targets[0]);
         }
         if (!s.current->grid) {
@@ -973,6 +1026,7 @@ void WebSceneRenderer::ReleaseView(uint64_t cameraId)
     auto &s = *m_impl;
     if (const auto entry = s.views.find(cameraId); entry != s.views.end()) {
         s.device->Release(entry->second.fullscreenGroup);
+        s.device->Release(entry->second.partitionGroup);
         s.views.erase(entry);
     }
 }
@@ -1007,7 +1061,7 @@ void WebSceneRenderer::RecordPreparation(wgpu::CommandEncoder encoder)
 }
 
 void WebSceneRenderer::Record(wgpu::RenderPassEncoder pass, const GraphCommandDesc &command,
-                               const MaterialPassPipelineDescriptor &pipeline)
+                              const MaterialPassPipelineDescriptor &pipeline)
 {
     auto &s = *m_impl;
     const bool shadow = command.type == GraphCommandType::DrawShadowCasters;
@@ -1053,6 +1107,15 @@ const RenderViewData &WebSceneRenderer::View() const noexcept
 rhi::BindingLayoutHandle WebSceneRenderer::ViewLayout() const noexcept
 {
     return m_impl->viewLayout;
+}
+
+ShaderViewBindings WebSceneRenderer::ParticleView(ShaderCompileTarget target) const noexcept
+{
+    const auto &s = *m_impl;
+    const auto &view = *s.current;
+    const bool partitioned = IsTransparentPartition(target);
+    return {partitioned ? s.partitionViewLayout : s.viewLayout,
+            partitioned ? view.partitionGroup : view.fullscreenGroup, view.globals->GetBuffer()};
 }
 
 FullscreenViewResources WebSceneRenderer::FullscreenView() const noexcept

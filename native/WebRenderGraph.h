@@ -4,8 +4,8 @@
 #include <function/renderer/MaterialPassPipeline.h>
 #include <function/renderer/RenderGraphDescription.h>
 #include <function/renderer/RenderViewSchedule.h>
-#include <function/renderer/rhi/RhiRasterPass.h>
 #include <function/renderer/rhi/RenderViewContext.h>
+#include <function/renderer/rhi/RhiRasterPass.h>
 #include <functional>
 #include <memory>
 #include <webgpu/webgpu_cpp.h>
@@ -14,7 +14,7 @@ namespace infernux::rhi
 {
 class BufferResource;
 class ComputeHost;
-}
+} // namespace infernux::rhi
 
 namespace infernux
 {
@@ -24,8 +24,8 @@ namespace raytracing
 {
 struct RayWorldGeometryBinding;
 struct RayWorldMaterialPublication;
-}
-}
+} // namespace raytracing
+} // namespace infernux
 
 namespace infernux::web
 {
@@ -38,9 +38,9 @@ class WebRenderGraph final
   public:
     using Texture = std::shared_ptr<const rhi::TextureResource>;
     using ImportTexture = std::function<Texture(const GraphTextureDesc &)>;
-    using RecordRaster = std::function<void(wgpu::RenderPassEncoder, const GraphCommandDesc &,
-                                             const rhi::RasterPassDescription &, const MaterialPassPipelineDescriptor &,
-                                             const rhi::TextureResource *)>;
+    using RecordRaster =
+        std::function<void(wgpu::RenderPassEncoder, const GraphCommandDesc &, const rhi::RasterPassDescription &,
+                           const MaterialPassPipelineDescriptor &, const rhi::TextureResource *)>;
     explicit WebRenderGraph(WebGpuRhiDevice &device, std::shared_ptr<FullscreenRendererHost> fullscreenHost,
                             rhi::ComputeHost *computeHost = nullptr,
                             std::shared_ptr<FullscreenPipelineCache> pipelines = {});
@@ -48,9 +48,9 @@ class WebRenderGraph final
     /// Compile only when topology or view extent changes. External texture
     /// generations are part of that publication, never looked up while drawing.
     bool Apply(std::shared_ptr<const RenderGraphDescription> graph, const rhi::RenderViewContext &view,
-                 const ImportTexture &imports = {}, const std::optional<GraphPassDesc> &cameraClear = {},
-                 std::shared_ptr<const rhi::RenderTextureGeneration> output = {},
-                 const glm::vec4 &rect = {0, 0, 1, 1}, bool sampleParticleDepth = false);
+               const ImportTexture &imports = {}, const std::optional<GraphPassDesc> &cameraClear = {},
+               std::shared_ptr<const rhi::RenderTextureGeneration> output = {}, const glm::vec4 &rect = {0, 0, 1, 1},
+               bool sampleParticleDepth = false);
     void UpdateParameters(const std::vector<GraphParameterBlockUpdate> &updates);
     void Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
                 const raytracing::RayWorldGeometryBinding &rays,
@@ -68,6 +68,7 @@ class WebRenderGraph final
     [[nodiscard]] uint32_t AcceptedRayGeometry() const noexcept;
     [[nodiscard]] const RenderGraphDescription &Description() const noexcept;
     [[nodiscard]] Texture GetTexture(const std::string &name) const;
+    [[nodiscard]] Texture TransparentLayer() const noexcept;
     [[nodiscard]] Texture Output() const;
     [[nodiscard]] const std::vector<uint32_t> &ExecutionOrder() const noexcept;
     [[nodiscard]] RenderViewAccess GetResourceAccess(const std::vector<MaterialTextureRead> &materialReads = {}) const;

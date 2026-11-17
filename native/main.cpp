@@ -1190,8 +1190,6 @@ void Frame()
             g_sceneRenderer.RecordPreparation(encoder);
             const auto resources = g_sceneRenderer.FullscreenView();
             state.viewGlobals = resources.globals.buffer;
-            const infernux::ShaderViewBindings particleView{g_sceneRenderer.ViewLayout(), resources.perView,
-                                                           resources.globals.buffer};
             std::optional<PresentedCamera> presented;
             const auto record = [&] {
                 state.graph->Record(encoder, resources, capture.worldRayGeometry, capture.worldRayMaterials.get(),
@@ -1203,7 +1201,8 @@ void Frame()
                             if (g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics &&
                                 !command.rendererSelection && !command.overrideMaterialValue)
                                 (void)g_particleRuntime.Render(
-                                    pass, cameraView, particleView, target, command.queueMin, command.queueMax,
+                                    pass, cameraView, g_sceneRenderer.ParticleView(target.target), target,
+                                    command.queueMin, command.queueMax,
                                     particleDepth ? particleDepth->GetView() : infernux::rhi::TextureViewHandle{},
                                     particleDepth && infernux::rhi::IsDepthFormat(particleDepth->GetFormat()));
                             break;
