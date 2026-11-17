@@ -143,6 +143,15 @@ struct ScreenCopy
     infernux::FullscreenParameters parameters;
 };
 std::array<std::optional<ScreenCopy>, 2> g_screenCopies;
+struct PresentedCamera
+{
+    infernux::web::WebRenderGraph::Texture color;
+    infernux::FullscreenViewResources resources;
+    glm::uvec4 rect;
+    uint64_t world, epoch;
+    uint32_t width, height;
+    bool displayEncoded;
+};
 struct CameraGraph
 {
     std::unique_ptr<infernux::web::WebRenderGraph> graph;
@@ -153,6 +162,7 @@ struct CameraGraph
     std::shared_ptr<const infernux::ShaderTargetCode> rayMaterialCode;
     std::shared_ptr<const infernux::raytracing::RayLitMaterialLayout> rayMaterialLayout;
     std::shared_ptr<const infernux::raytracing::RayWorldMaterialRequest> rayMaterialRequest;
+    std::optional<PresentedCamera> presented;
     uint64_t outputRevision = 0;
     infernux::rhi::BufferHandle viewGlobals;
     uint64_t lastFrame = 0;
@@ -1128,38 +1138,38 @@ void Frame()
         auto encoder = g_device.CreateCommandEncoder();
         if (!g_splashActive && g_particleRuntimeReady && !g_particleRuntime.RecordCompute(encoder))
             throw std::runtime_error(g_particleRuntime.LastError());
-        const auto present = [&](const infernux::web::WebRenderGraph &graph, bool displayEncoded,
-                                 const infernux::FullscreenViewResources &resources, wgpu::TextureView destination,
-                                 infernux::rhi::PixelFormat format, const glm::uvec4 &rect, bool clear) {
-            auto &copy = g_screenCopies[displayEncoded];
+        const auto present = [&](const PresentedCamera &sample, bool clear) {
+            auto &copy = g_screenCopies[sample.displayEncoded];
             if (!copy) {
                 infernux::FullscreenPipelineKey key;
-                key.shaderName = displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
+                key.shaderName = sample.displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
                 key.program = g_fullscreenPipelines->AcquireProgram(key.shaderName);
-                key.colorFormat = format;
+                key.colorFormat = ToRhiFormat(g_surfaceFormat);
                 key.useDynamicRendering = true;
                 std::vector<std::pair<std::string, infernux::ShaderParameterValue>> parameters;
-                if (!displayEncoded)
-                    parameters.emplace_back("target_is_srgb", infernux::rhi::IsSrgbFormat(format));
+                if (!sample.displayEncoded)
+                    parameters.emplace_back("target_is_srgb", infernux::rhi::IsSrgbFormat(key.colorFormat));
                 copy.emplace(ScreenCopy{g_fullscreenPipelines->EnsurePipeline(key),
                                         infernux::FullscreenRenderer::PrepareParameters(*key.program, parameters)});
             }
             wgpu::RenderPassColorAttachment attachment{};
-            attachment.view = destination;
+            attachment.view = view;
             attachment.loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
             attachment.storeOp = wgpu::StoreOp::Store;
             wgpu::RenderPassDescriptor description{};
             description.colorAttachmentCount = 1;
             description.colorAttachments = &attachment;
             auto pass = encoder.BeginRenderPass(&description);
+            const auto &rect = sample.rect;
             pass.SetViewport(rect.x, rect.y, rect.z, rect.w, 0, 1);
             pass.SetScissorRect(rect.x, rect.y, rect.z, rect.w);
-            const auto output = graph.Output();
             infernux::FullscreenResourceInput input;
-            input.view = output->GetView(); input.format = output->GetFormat(); input.sampler = output->GetSampler();
+            input.view = sample.color->GetView();
+            input.format = sample.color->GetFormat();
+            input.sampler = sample.color->GetSampler();
             infernux::web::WebGpuGraphicsCommandContext context;
             auto commands = g_rhi->MakeGraphicsCommandEncoder(context, pass);
-            g_presentRenderer.DrawProgram(commands, copy->pipeline, &input, copy->parameters, nullptr, resources);
+            g_presentRenderer.DrawProgram(commands, copy->pipeline, &input, copy->parameters, nullptr, sample.resources);
             pass.End();
         };
         bool rendered = false;
@@ -1182,6 +1192,7 @@ void Frame()
             state.viewGlobals = resources.globals.buffer;
             const infernux::ShaderViewBindings particleView{g_sceneRenderer.ViewLayout(), resources.perView,
                                                            resources.globals.buffer};
+            std::optional<PresentedCamera> presented;
             const auto record = [&] {
                 state.graph->Record(encoder, resources, capture.worldRayGeometry, capture.worldRayMaterials.get(),
                     [&](auto pass, const auto &command, const auto &raster, const auto &target, const auto *particleDepth) {
@@ -1211,8 +1222,11 @@ void Frame()
                         }
                     });
                 if (!output) {
-                    present(*state.graph, state.description->outputDisplayEncoded, resources, view, ToRhiFormat(g_surfaceFormat),
-                            infernux::RasterViewportRect(cameraView.rect, g_width, g_height), !rendered);
+                    presented = PresentedCamera{state.graph->Output(), resources,
+                                                infernux::RasterViewportRect(cameraView.rect, g_width, g_height),
+                                                plan->world->WorldId(), plan->world->SimulationEpoch(), g_width,
+                                                g_height, state.description->outputDisplayEncoded};
+                    present(*presented, !rendered);
                     rendered = true;
                 }
                 // Per-camera UI uploads precede this submit. The next view can
@@ -1236,8 +1250,25 @@ void Frame()
             }
             state.graph->AcceptHistory();
             g_sceneRenderer.AcceptView();
+            state.presented = std::move(presented);
             state.pendingRayPlan.reset();
             encoder = g_device.CreateCommandEncoder();
+        }
+        const bool pendingScreen = !rendered && std::any_of(captured.begin(), captured.end(), [](const auto &capture) {
+            return !capture.plan->view->outputGeneration && capture.state->pendingRayPlan;
+        });
+        if (pendingScreen) {
+            // Present the last accepted picture during ray preparation. This
+            // copy does not accept a render sample or advance its histories.
+            for (const auto &capture : captured) {
+                const auto &sample = capture.state->presented;
+                if (capture.plan->view->outputGeneration || !sample || sample->width != g_width ||
+                    sample->height != g_height || sample->world != capture.plan->world->WorldId() ||
+                    sample->epoch != capture.plan->world->SimulationEpoch())
+                    continue;
+                present(*sample, !rendered);
+                rendered = true;
+            }
         }
         if (!rendered) {
             wgpu::RenderPassColorAttachment attachment{};
@@ -1261,6 +1292,7 @@ void Frame()
             if (entry->second.lastFrame + 1 < g_shaderFrameIndex) {
                 if (entry->second.viewGlobals.IsValid())
                     g_particleRuntime.ReleaseView(entry->second.viewGlobals);
+                g_sceneRenderer.ReleaseView(entry->first);
                 entry = g_cameraGraphs.erase(entry);
             } else
                 ++entry;

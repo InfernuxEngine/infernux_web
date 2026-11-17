@@ -162,8 +162,7 @@ void WebUIMaterialCache::StageCamera(Camera &camera)
     globals.worldSpaceCameraPos = glm::vec4(glm::vec3(glm::inverse(view.view)[3]), 1);
     globals.projectionParams = view.projectionParams;
     globals.zBufferParams = view.zBufferParams;
-    globals.viewOptions.x = static_cast<uint32_t>(camera.GetDithering());
-    globals.viewOptions.y = static_cast<uint32_t>(camera.GetStopNaNs());
+    globals.viewOptions = MakeViewOptions(camera.GetDithering(), camera.GetStopNaNs(), false);
     m_queue.WriteBuffer(m_cameraBuffer, 0, &view, sizeof(view));
     m_queue.WriteBuffer(m_globalsBuffer, 0, &globals, sizeof(globals));
 }

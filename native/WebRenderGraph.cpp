@@ -995,6 +995,7 @@ WebRenderGraph::PreparePublication(const GraphEventInterests &interests,
 void WebRenderGraph::AcceptHistory()
 {
     ++m_impl->acceptedSampleIndex;
+    m_impl->rayHistoryWorld.AcceptGeometry();
     m_impl->historyReset = false;
     for (auto &[key, history] : m_impl->histories)
         history.Accept();
@@ -1004,13 +1005,18 @@ void WebRenderGraph::UpdateRayHistory(
     const RenderWorldFrame &world, const raytracing::RayWorldGeometryBinding &rays,
     const std::shared_ptr<const raytracing::RayWorldMaterialPublication> &materials)
 {
-    if (m_impl->rayHistoryWorld.Update(world, rays.meshes, materials))
+    if (m_impl->rayHistoryWorld.Update(world, rays, materials))
         raytracing::InvalidateRayHistories(m_impl->histories);
 }
 
 uint32_t WebRenderGraph::AcceptedSampleIndex() const noexcept
 {
     return m_impl->acceptedSampleIndex;
+}
+
+uint32_t WebRenderGraph::AcceptedRayGeometry() const noexcept
+{
+    return m_impl->rayHistoryWorld.AcceptedGeometry();
 }
 
 void WebRenderGraph::InvalidateHistory() noexcept

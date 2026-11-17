@@ -45,6 +45,7 @@ class WebSceneRenderer final
                                                                               const WebRenderGraph &graph) const;
     void Prepare(const RenderViewPlan &plan, WebRenderGraph &graph);
     void AcceptView();
+    void ReleaseView(uint64_t cameraId);
     [[nodiscard]] bool HasPreviousViewSample() const noexcept;
     [[nodiscard]] std::shared_ptr<GraphEventViewSample> CaptureViewSample() const;
     void RecordPreparation(wgpu::CommandEncoder encoder);

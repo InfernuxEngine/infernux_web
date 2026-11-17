@@ -154,7 +154,6 @@ struct WebSceneRenderer::Impl
     };
     struct ViewResources
     {
-        uint64_t lastFrame = 0;
         Buffer camera, globals, lighting, canonicalLights, models, skins, bones, instances;
         std::shared_ptr<const rhi::BufferResource> surfaceRecords;
         std::vector<Buffer> shadowCameras, shadowParameters;
@@ -659,13 +658,6 @@ void WebSceneRenderer::StageFrame(const EngineGlobalsUBO &frame)
             it = it->second.lastFrame + 1 < s.frameIndex ? values.erase(it) : std::next(it);
     };
     retireUnused(s.geometry);
-    for (auto it = s.views.begin(); it != s.views.end();) {
-        if (it->second.lastFrame + 1 < s.frameIndex) {
-            s.device->Release(it->second.fullscreenGroup);
-            it = s.views.erase(it);
-        } else
-            ++it;
-    }
     for (auto &[id, view] : s.views)
         retireUnused(view.materials);
     s.current = nullptr;
@@ -801,7 +793,6 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     s.view = plan.view;
     const auto &view = *s.view;
     s.current = &s.views[view.cameraId];
-    s.current->lastFrame = s.frameIndex;
     s.width = view.pixelWidth;
     s.height = view.pixelHeight;
     const uint32_t width = s.width, height = s.height;
@@ -902,7 +893,8 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     globals.projectionParams = viewport.projectionParams;
     globals.zBufferParams = viewport.zBufferParams;
     globals.frameParams.w = resources.acceptedView ? resources.previousTime : globals.time.x;
-    globals.viewOptions = {view.dithering ? 1u : 0u, view.stopNaNs ? 1u : 0u, 1, graph.AcceptedSampleIndex()};
+    globals.viewOptions = MakeViewOptions(view.dithering, view.stopNaNs, true, graph.AcceptedRayGeometry(),
+                                         graph.AcceptedSampleIndex());
     s.Uniform(s.current->globals, globals);
     s.lights.CollectLights(*s.frame->Lighting(), view.position);
     s.lights.ComputeShadowVP(*s.frame->Lighting(), view, s.shadowsEnabled ? s.shadowResolution : 0);
@@ -974,6 +966,15 @@ void WebSceneRenderer::AcceptView()
         resources.motion.CommitFrame();
     if (resources.graph->temporalJitter)
         resources.temporalSample = (resources.temporalSample + 1u) % kTemporalJitterSampleCount;
+}
+
+void WebSceneRenderer::ReleaseView(uint64_t cameraId)
+{
+    auto &s = *m_impl;
+    if (const auto entry = s.views.find(cameraId); entry != s.views.end()) {
+        s.device->Release(entry->second.fullscreenGroup);
+        s.views.erase(entry);
+    }
 }
 
 bool WebSceneRenderer::HasPreviousViewSample() const noexcept

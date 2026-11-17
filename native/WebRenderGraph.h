@@ -65,6 +65,7 @@ class WebRenderGraph final
     void UpdateRayHistory(const RenderWorldFrame &world, const raytracing::RayWorldGeometryBinding &rays,
                           const std::shared_ptr<const raytracing::RayWorldMaterialPublication> &materials);
     [[nodiscard]] uint32_t AcceptedSampleIndex() const noexcept;
+    [[nodiscard]] uint32_t AcceptedRayGeometry() const noexcept;
     [[nodiscard]] const RenderGraphDescription &Description() const noexcept;
     [[nodiscard]] Texture GetTexture(const std::string &name) const;
     [[nodiscard]] Texture Output() const;
