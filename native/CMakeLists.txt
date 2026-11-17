@@ -35,6 +35,7 @@ target_include_directories(InfernuxWebShaderCompiler
     PUBLIC "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux"
     PRIVATE "${INFERNUX_EXTERNAL_ROOT}")
 target_link_libraries(InfernuxWebShaderCompiler PRIVATE ${INFERNUX_SLANG_TARGET})
+infernux_add_rt_slang_module(InfernuxWebShaderCompiler)
 target_compile_features(InfernuxWebShaderCompiler PRIVATE cxx_std_17)
 target_compile_options(InfernuxWebShaderCompiler PRIVATE "-fwasm-exceptions")
 option(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE
