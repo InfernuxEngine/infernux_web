@@ -714,8 +714,8 @@ std::optional<raytracing::RayLitTexture> WebSceneRenderer::ResolveRayLitTexture(
             guid, registry.GetAssetVersion(guid), image.GetTexture(), image.GetView(), image.GetSampler(),
             image.GetResidentBytes(), entry.image, image.GetFormat(), image.GetViewDesc(), image.GetUploadSubmission());
     }
-    const auto pageClass = name == "albedo_map" || name == "emission_map" ? RayTexturePageClass::Color
-                                                                          : RayTexturePageClass::Data;
+    const auto pageClass = rhi::IsSrgbFormat(entry.rayView->GetFormat()) ? RayTexturePageClass::Color
+                                                                      : RayTexturePageClass::Data;
     return CaptureRayTexturePageSource(*s.device, entry.rayView, registry.GetAssetContentGeneration(guid), pageClass);
 }
 
