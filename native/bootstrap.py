@@ -10,7 +10,6 @@ import math
 import os
 import struct
 import sys
-import time
 from types import CodeType, ModuleType
 from typing import Any
 
@@ -30,7 +29,6 @@ _player_asset_database: Any = None
 _player_asset_count = 0
 _player_type_count = 0
 _player_initial_scene_name = ""
-_player_activated = False
 _pending_audio_activation = False
 _screen_width = 1
 _screen_height = 1
@@ -560,6 +558,7 @@ def _prepare_player_runtime() -> None:
     session.configure_runtime_contract(
         _player_runtime_manifest, _player_runtime_catalog
     )
+    session.configure_startup_warmup(_runtime_data_root)
     _player_plugin_manager = PluginManager.startup(
         _runtime_data_root,
         runtime=True,
@@ -579,22 +578,6 @@ def _prepare_player_runtime() -> None:
     active_scene = scene_manager.get_active_scene()
     if active_scene is None:
         raise RuntimeError("Web Player scene transaction published no active scene")
-    # Web Player is source-less at runtime, but its cooked content still owns
-    # the exact Library/RuntimeTypeRegistry closure.  Run the same persistent
-    # project declaration warmup used by desktop and Android before the first
-    # visible frame so CPU JIT and GPU declaration caches are established on
-    # every target, including Web.
-    from infernux.engine.startup_warmup import run_project_script_warmups
-
-    warmup_started = time.perf_counter()
-    warmup_hooks = run_project_script_warmups(
-        project_path=_runtime_data_root,
-        scope="player-startup",
-    )
-    print(
-        "INFERNUX_WEB_STARTUP_WARMUP_READY "
-        f"hooks={warmup_hooks} elapsed_ms={(time.perf_counter() - warmup_started) * 1000.0:.1f}"
-    )
     _player_session = session
     _player_scene_manager = scene_manager
     print(
@@ -812,14 +795,8 @@ class _WebSplashPlayer:
 
 
 def _activate_web_player_session() -> None:
-    global _player_activated
-
-    if _player_activated:
-        return
-    if _player_session is None or not _player_session.activate():
+    if not _player_session.activate():
         raise RuntimeError("Web Player runtime session could not be activated")
-    _player_activated = True
-    print("INFERNUX_WEB_RUNTIME_ACTIVE")
 
 
 def _create_web_splash() -> _WebSplashPlayer | None:
@@ -880,7 +857,7 @@ def infernux_web_activate(audio_ready: bool) -> bool:
     global _pending_audio_activation
     if not audio_ready:
         raise RuntimeError("Web Player audio did not unlock from the user gesture")
-    if _player_session is None:
+    if _player_session is None or not _player_session.is_playing:
         _pending_audio_activation = True
         print("INFERNUX_WEB_AUDIO_USER_ACTIVATION_QUEUED")
         return True
@@ -1289,14 +1266,8 @@ def _complete_pending_audio_activation() -> None:
     """Finish a browser gesture that arrived before scene/session readiness."""
 
     global _pending_audio_activation
-    if not _pending_audio_activation or _player_session is None:
+    if not _pending_audio_activation or _player_session is None or not _player_session.is_playing:
         return
-    # A splash keeps the player session intentionally inactive. The normal
-    # splash-completion path activates it before retrying this handoff.
-    if _web_splash is not None:
-        return
-    if not _player_activated:
-        _activate_web_player_session()
     _pending_audio_activation = False
     print("INFERNUX_WEB_AUDIO_USER_ACTIVATED_DEFERRED")
 
@@ -1308,21 +1279,16 @@ def infernux_web_tick(delta_time: float) -> bool:
     if _player_session is None:
         return False
     if _web_splash is not None:
-        splash_active = _web_splash.update(
-            max(0.0, min(float(delta_time), 0.25)), _screen_width, _screen_height
-        )
-        if splash_active:
+        if _web_splash.update(max(0.0, min(float(delta_time), 0.25)), _screen_width, _screen_height):
             return True
         _web_splash.close()
         _web_splash = None
         print("INFERNUX_WEB_SPLASH_COMPLETE")
         _activate_web_player_session()
-        _complete_pending_audio_activation()
-        return False
-    _complete_pending_audio_activation()
-    if not _player_activated:
-        return False
     _player_host.prepare_frame(float(delta_time))
+    if not _player_session.is_playing:
+        return True
+    _complete_pending_audio_activation()
     # UI listeners may replace scenes. Dispatch after hit-test traversal and
     # before collecting the next render submission, matching desktop ownership.
     from infernux.engine.runtime_event_queue import drain
@@ -1331,6 +1297,8 @@ def infernux_web_tick(delta_time: float) -> bool:
     _submit_screen_ui()
     _frame_count += 1
     if _frame_count == 1:
+        print("INFERNUX_WEB_STARTUP_WARMUP_READY")
+        print("INFERNUX_WEB_RUNTIME_ACTIVE")
         print("INFERNUX_WEB_FIRST_FRAME_READY")
     return False
 
