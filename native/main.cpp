@@ -938,52 +938,9 @@ void Frame()
         }
     }
 #endif
-    wgpu::SurfaceTexture surfaceTexture;
-    g_surface.GetCurrentTexture(&surfaceTexture);
-    bool foregroundSubmitted = false;
-    if (surfaceTexture.texture) {
-        wgpu::TextureView view = surfaceTexture.texture.CreateView();
-        auto encoder = g_device.CreateCommandEncoder();
-        if (!g_splashActive && g_particleRuntimeReady && !g_particleRuntime.RecordCompute(encoder))
-            throw std::runtime_error(g_particleRuntime.LastError());
-        const auto present = [&](const infernux::web::WebRenderGraph &graph, bool displayEncoded,
-                                 const infernux::FullscreenViewResources &resources, wgpu::TextureView destination,
-                                 infernux::rhi::PixelFormat format, const glm::uvec4 &rect, bool clear) {
-            auto &copy = g_screenCopies[displayEncoded];
-            if (!copy) {
-                infernux::FullscreenPipelineKey key;
-                key.shaderName = displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
-                key.program = g_fullscreenPipelines->AcquireProgram(key.shaderName);
-                key.colorFormat = format;
-                key.useDynamicRendering = true;
-                std::vector<std::pair<std::string, infernux::ShaderParameterValue>> parameters;
-                if (!displayEncoded)
-                    parameters.emplace_back("target_is_srgb", infernux::rhi::IsSrgbFormat(format));
-                copy.emplace(ScreenCopy{g_fullscreenPipelines->EnsurePipeline(key),
-                                        infernux::FullscreenRenderer::PrepareParameters(*key.program, parameters)});
-            }
-            wgpu::RenderPassColorAttachment attachment{};
-            attachment.view = destination;
-            attachment.loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
-            attachment.storeOp = wgpu::StoreOp::Store;
-            wgpu::RenderPassDescriptor description{};
-            description.colorAttachmentCount = 1;
-            description.colorAttachments = &attachment;
-            auto pass = encoder.BeginRenderPass(&description);
-            pass.SetViewport(rect.x, rect.y, rect.z, rect.w, 0, 1);
-            pass.SetScissorRect(rect.x, rect.y, rect.z, rect.w);
-            const auto output = graph.Output();
-            infernux::FullscreenResourceInput input;
-            input.view = output->GetView(); input.format = output->GetFormat(); input.sampler = output->GetSampler();
-            infernux::web::WebGpuGraphicsCommandContext context;
-            auto commands = g_rhi->MakeGraphicsCommandEncoder(context, pass);
-            g_presentRenderer.DrawProgram(commands, copy->pipeline, &input, copy->parameters, nullptr, resources);
-            pass.End();
-        };
+    const bool foregroundSubmitted = [] {
         auto *scene = infernux::SceneManager::Instance().GetActiveScene();
         const auto cameras = scene ? scene->GetActiveGameCameras(nullptr) : std::vector<infernux::Camera *>{};
-        bool rendered = false;
-        g_presentRenderer.ResetPool();
         struct CapturedCamera
         {
             infernux::Camera *camera;
@@ -1159,6 +1116,54 @@ void Frame()
             captured.push_back({camera, plan, &state, std::move(rays), std::move(materials.value)});
         }
         const auto schedule = infernux::RenderViewSchedule::Build(accesses);
+
+        // Author callbacks can suspend while preparing the graph. Acquire the canvas texture
+        // only for the native recording and submission that follow them.
+        wgpu::SurfaceTexture surfaceTexture;
+        g_surface.GetCurrentTexture(&surfaceTexture);
+        if (!surfaceTexture.texture)
+            return false;
+
+        wgpu::TextureView view = surfaceTexture.texture.CreateView();
+        auto encoder = g_device.CreateCommandEncoder();
+        if (!g_splashActive && g_particleRuntimeReady && !g_particleRuntime.RecordCompute(encoder))
+            throw std::runtime_error(g_particleRuntime.LastError());
+        const auto present = [&](const infernux::web::WebRenderGraph &graph, bool displayEncoded,
+                                 const infernux::FullscreenViewResources &resources, wgpu::TextureView destination,
+                                 infernux::rhi::PixelFormat format, const glm::uvec4 &rect, bool clear) {
+            auto &copy = g_screenCopies[displayEncoded];
+            if (!copy) {
+                infernux::FullscreenPipelineKey key;
+                key.shaderName = displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
+                key.program = g_fullscreenPipelines->AcquireProgram(key.shaderName);
+                key.colorFormat = format;
+                key.useDynamicRendering = true;
+                std::vector<std::pair<std::string, infernux::ShaderParameterValue>> parameters;
+                if (!displayEncoded)
+                    parameters.emplace_back("target_is_srgb", infernux::rhi::IsSrgbFormat(format));
+                copy.emplace(ScreenCopy{g_fullscreenPipelines->EnsurePipeline(key),
+                                        infernux::FullscreenRenderer::PrepareParameters(*key.program, parameters)});
+            }
+            wgpu::RenderPassColorAttachment attachment{};
+            attachment.view = destination;
+            attachment.loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
+            attachment.storeOp = wgpu::StoreOp::Store;
+            wgpu::RenderPassDescriptor description{};
+            description.colorAttachmentCount = 1;
+            description.colorAttachments = &attachment;
+            auto pass = encoder.BeginRenderPass(&description);
+            pass.SetViewport(rect.x, rect.y, rect.z, rect.w, 0, 1);
+            pass.SetScissorRect(rect.x, rect.y, rect.z, rect.w);
+            const auto output = graph.Output();
+            infernux::FullscreenResourceInput input;
+            input.view = output->GetView(); input.format = output->GetFormat(); input.sampler = output->GetSampler();
+            infernux::web::WebGpuGraphicsCommandContext context;
+            auto commands = g_rhi->MakeGraphicsCommandEncoder(context, pass);
+            g_presentRenderer.DrawProgram(commands, copy->pipeline, &input, copy->parameters, nullptr, resources);
+            pass.End();
+        };
+        bool rendered = false;
+        g_presentRenderer.ResetPool();
         for (auto *input : schedule.cyclicInputs)
             input->MarkResultCycle();
         for (const auto index : schedule.order) {
@@ -1261,10 +1266,10 @@ void Frame()
         g_screenUIRenderer.PruneUnusedMaterials();
         wgpu::CommandBuffer commands = encoder.Finish();
         g_queue.Submit(1, &commands);
-        foregroundSubmitted = true;
         if (g_particleRuntimeReady)
             g_particleRuntime.NotifySubmission();
-    }
+        return true;
+    }();
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
     if (foregroundSubmitted)
         infernux::SceneManager::Instance().EmitRuntimeFrameBarrier(
