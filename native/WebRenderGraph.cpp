@@ -686,6 +686,10 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
                              std::shared_ptr<const rhi::RenderTextureGeneration> output, const glm::vec4 &rect, bool sampleParticleDepth)
 {
     auto &s = *m_impl;
+    if (s.graph != graph && std::any_of(graph->buffers.begin(), graph->buffers.end(), [](const auto &buffer) {
+            return buffer.frameBuffer == GraphFrameBuffer::WorldRayGeometry;
+        }))
+        throw std::invalid_argument("World ray geometry is unavailable on this Web render host");
     const bool sameAssets = !imports || std::all_of(graph->textures.begin(), graph->textures.end(), [&](const auto &texture) {
         if (texture.role != GraphTextureRole::Asset)
             return true;
