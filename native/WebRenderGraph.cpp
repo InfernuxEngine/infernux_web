@@ -436,7 +436,9 @@ struct WebRenderGraph::Impl
             key.program = program;
             key.shaderName = command.shaderName;
             key.samples = materialPass.samples;
-            key.colorFormat = pass.raster.colorCount ? pass.raster.colors[0].format : rhi::PixelFormat::Undefined;
+            key.colorCount = pass.raster.colorCount;
+            for (uint32_t index = 0; index < key.colorCount; ++index)
+                key.colorFormats[index] = pass.raster.colors[index].format;
             key.depthFormat = pass.raster.depth.format;
             key.depth.testEnabled = command.depthTest;
             key.depth.writeEnabled = command.depthWrite;

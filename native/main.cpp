@@ -1144,11 +1144,11 @@ void Frame()
                 infernux::FullscreenPipelineKey key;
                 key.shaderName = sample.displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
                 key.program = g_fullscreenPipelines->AcquireProgram(key.shaderName);
-                key.colorFormat = ToRhiFormat(g_surfaceFormat);
+                key.colorFormats[0] = ToRhiFormat(g_surfaceFormat);
                 key.useDynamicRendering = true;
                 std::vector<std::pair<std::string, infernux::ShaderParameterValue>> parameters;
                 if (!sample.displayEncoded)
-                    parameters.emplace_back("target_is_srgb", infernux::rhi::IsSrgbFormat(key.colorFormat));
+                    parameters.emplace_back("target_is_srgb", infernux::rhi::IsSrgbFormat(key.colorFormats[0]));
                 copy.emplace(ScreenCopy{g_fullscreenPipelines->EnsurePipeline(key),
                                         infernux::FullscreenRenderer::PrepareParameters(*key.program, parameters)});
             }
