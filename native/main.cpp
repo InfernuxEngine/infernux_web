@@ -27,6 +27,7 @@
 #include "WebParticleRuntime.h"
 #include "WebRenderGraph.h"
 #include <function/renderer/RenderGraphWork.h>
+#include <function/renderer/raytracing/RayTexturePageRenderer.h>
 #include <function/renderer/raytracing/RayWorldGeometry.h>
 #include <function/renderer/raytracing/RayWorldMaterials.h>
 #include <pybind11/pybind11.h>
@@ -833,27 +834,41 @@ bool InitializePython()
            PyCallable_Check(g_runtimeDiagnostic);
 }
 
-void SubmitRayTextureCopies()
+void SubmitRayTexturePages()
 {
     if (!g_worldRayMaterials)
         return;
-    const auto batch = g_worldRayMaterials->PrepareCopyBatch();
+    const auto batch = g_worldRayMaterials->PreparePageBatch();
     if (!batch)
         return;
     try {
         const auto ticket = g_computeQueue->SubmitGraphics([&] {
             auto encoder = g_device.CreateCommandEncoder();
-            infernux::web::WebGpuTransferCommandContext context;
-            if (!batch->Record(g_rhi->MakeTransferCommandEncoder(context, encoder)))
-                throw std::runtime_error("Could not record the Web ray material texture copies");
+            for (const auto &slice : batch->Slices()) {
+                auto raster = slice.draw->Raster();
+                raster.colors[0].load = slice.FirstStripe() ? infernux::rhi::AttachmentLoad::Clear
+                                                            : infernux::rhi::AttachmentLoad::Load;
+                infernux::web::WebGpuRasterPass native;
+                g_rhi->PrepareRasterPass(raster, native);
+                auto pass = encoder.BeginRenderPass(&native.descriptor);
+                pass.SetViewport(0.0f, 0.0f, static_cast<float>(raster.width), static_cast<float>(raster.height),
+                                 0.0f, 1.0f);
+                pass.SetScissorRect(0, slice.y, raster.width, slice.rowCount);
+                infernux::web::WebGpuGraphicsCommandContext context;
+                const bool recorded = slice.draw->Record(g_rhi->MakeGraphicsCommandEncoder(context, pass));
+                pass.End();
+                if (!recorded)
+                    throw std::runtime_error("Could not record a Web ray texture page stripe");
+            }
+            batch->MarkRecorded();
             return encoder.Finish();
         }, batch, batch->Receipt());
-        if (ticket.IsValid() && g_worldRayMaterials->AcceptCopyBatch(*batch))
+        if (ticket.IsValid() && g_worldRayMaterials->AcceptPageBatch(*batch))
             return;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "Web ray material texture submission failed: %s\n", error.what());
     }
-    g_worldRayMaterials->FailCopyBatch();
+    g_worldRayMaterials->FailPageBatch();
 }
 
 void Frame()
@@ -1261,7 +1276,7 @@ void Frame()
                                                            : infernux::FrameGpuAvailability::Ready;
     });
     if (foregroundSubmitted)
-        SubmitRayTextureCopies();
+        SubmitRayTexturePages();
     if (pauseAcceptanceAfterRender) {
         auto &sceneManager = infernux::SceneManager::Instance();
         sceneManager.Pause();
