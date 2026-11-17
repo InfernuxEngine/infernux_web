@@ -12,6 +12,7 @@
 
 namespace infernux::rhi
 {
+class BufferResource;
 class ComputeHost;
 }
 
@@ -45,7 +46,8 @@ class WebRenderGraph final
                  std::shared_ptr<const rhi::RenderTextureGeneration> output = {},
                  const glm::vec4 &rect = {0, 0, 1, 1}, bool sampleParticleDepth = false);
     void UpdateParameters(const std::vector<GraphParameterBlockUpdate> &updates);
-    void Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view, const RecordRaster &raster);
+    void Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
+                const rhi::BufferResource *worldRayGeometry, const RecordRaster &raster);
     [[nodiscard]] std::shared_ptr<void> RetainWorkStorage() const;
     [[nodiscard]] std::shared_ptr<GraphBufferCapture> CaptureBuffer(const std::string &name);
     [[nodiscard]] std::shared_ptr<GraphFramePublication>

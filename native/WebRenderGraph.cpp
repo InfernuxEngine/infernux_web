@@ -686,10 +686,6 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
                              std::shared_ptr<const rhi::RenderTextureGeneration> output, const glm::vec4 &rect, bool sampleParticleDepth)
 {
     auto &s = *m_impl;
-    if (s.graph != graph && std::any_of(graph->buffers.begin(), graph->buffers.end(), [](const auto &buffer) {
-            return buffer.frameBuffer == GraphFrameBuffer::WorldRayGeometry;
-        }))
-        throw std::invalid_argument("World ray geometry is unavailable on this Web render host");
     const bool sameAssets = !imports || std::all_of(graph->textures.begin(), graph->textures.end(), [&](const auto &texture) {
         if (texture.role != GraphTextureRole::Asset)
             return true;
@@ -831,7 +827,7 @@ void WebRenderGraph::UpdateParameters(const std::vector<GraphParameterBlockUpdat
 }
 
 void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
-                            const RecordRaster &raster)
+                            const rhi::BufferResource *worldRayGeometry, const RecordRaster &raster)
 {
     auto &s = *m_impl;
     s.fullscreen.ResetPool();
@@ -851,6 +847,14 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
                     auto &program = prepared.fullscreen[commandIndex];
                     for (const auto &[inputIndex, source] : program.frameBufferInputs) {
                         auto &input = program.inputs[inputIndex];
+                        if (source == GraphFrameBuffer::WorldRayGeometry) {
+                            if (!worldRayGeometry)
+                                throw std::logic_error("A world ray geometry view requires its acquired buffer");
+                            input.buffer = worldRayGeometry->GetBuffer();
+                            input.byteOffset = 0;
+                            input.byteSize = worldRayGeometry->GetByteSize();
+                            continue;
+                        }
                         const auto &binding =
                             source == GraphFrameBuffer::ViewLights ? view.canonicalLights : view.worldSurfaces;
                         input.buffer = binding.buffer;
