@@ -161,7 +161,7 @@ struct CameraGraph
 struct CameraSubmission
 {
     std::shared_ptr<void> workStorage;
-    std::shared_ptr<const infernux::rhi::BufferResource> worldRayGeometry;
+    infernux::raytracing::RayWorldGeometryBinding worldRayGeometry;
     std::shared_ptr<const infernux::raytracing::RayWorldMaterialPublication> worldRayMaterials;
 };
 std::unordered_map<uint64_t, CameraGraph> g_cameraGraphs;
@@ -989,7 +989,7 @@ void Frame()
             infernux::Camera *camera;
             std::shared_ptr<const infernux::RenderViewPlan> plan;
             CameraGraph *state;
-            std::shared_ptr<const infernux::rhi::BufferResource> worldRayGeometry;
+            infernux::raytracing::RayWorldGeometryBinding worldRayGeometry;
             std::shared_ptr<const infernux::raytracing::RayWorldMaterialPublication> worldRayMaterials;
         };
         std::vector<CapturedCamera> captured;
@@ -1029,7 +1029,8 @@ void Frame()
                     infernux::NormalizeRenderGraphForOutput(*plan->graph, true, output->description.samples)) : plan->graph;
                 const auto &buffers = state.description->buffers;
                 state.requiresWorldRayGeometry = std::any_of(buffers.begin(), buffers.end(), [](const auto &buffer) {
-                    return buffer.frameBuffer == infernux::GraphFrameBuffer::WorldRayGeometry;
+                    return buffer.frameBuffer == infernux::GraphFrameBuffer::WorldRayGeometry ||
+                           buffer.frameBuffer == infernux::GraphFrameBuffer::WorldRayMeshes;
                 });
                 if (!state.requiresWorldRayGeometry)
                     state.rayPublication.reset();
@@ -1155,7 +1156,7 @@ void Frame()
             auto access = state.graph->GetResourceAccess(
                 g_sceneRenderer.CollectMaterialTextureReads(*plan, *state.graph));
             accesses.push_back(std::move(access));
-            captured.push_back({camera, plan, &state, std::move(rays.buffer), std::move(materials.value)});
+            captured.push_back({camera, plan, &state, std::move(rays), std::move(materials.value)});
         }
         const auto schedule = infernux::RenderViewSchedule::Build(accesses);
         for (auto *input : schedule.cyclicInputs)
@@ -1175,7 +1176,7 @@ void Frame()
             const infernux::ShaderViewBindings particleView{g_sceneRenderer.ViewLayout(), resources.perView,
                                                            resources.globals.buffer};
             const auto record = [&] {
-                state.graph->Record(encoder, resources, capture.worldRayGeometry.get(), capture.worldRayMaterials.get(),
+                state.graph->Record(encoder, resources, capture.worldRayGeometry, capture.worldRayMaterials.get(),
                     [&](auto pass, const auto &command, const auto &raster, const auto &target, const auto *particleDepth) {
                         using Type = infernux::GraphCommandType;
                         switch (command.type) {
@@ -1215,7 +1216,7 @@ void Frame()
                 return g_sceneRenderer.CaptureViewSample();
             });
             auto storage = state.graph->RetainWorkStorage();
-            if (capture.worldRayGeometry || capture.worldRayMaterials)
+            if (capture.worldRayGeometry.buffer || capture.worldRayMaterials)
                 storage = std::make_shared<CameraSubmission>(CameraSubmission{
                     std::move(storage), capture.worldRayGeometry, capture.worldRayMaterials});
             if (storage || publication) {

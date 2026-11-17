@@ -5,6 +5,7 @@
 #include <function/renderer/RenderGraphTemporalHistory.h>
 #include <function/renderer/RenderGraphTransfer.h>
 #include <function/renderer/RenderGraphWork.h>
+#include <function/renderer/raytracing/RayWorldGeometry.h>
 #include <function/renderer/raytracing/RayWorldMaterials.h>
 #include <function/renderer/rhi/RhiBuffer.h>
 #include <function/renderer/rhi/RhiComputeKernel.h>
@@ -840,7 +841,7 @@ void WebRenderGraph::UpdateParameters(const std::vector<GraphParameterBlockUpdat
 }
 
 void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
-                            const rhi::BufferResource *worldRayGeometry,
+                            const raytracing::RayWorldGeometryBinding &rays,
                             const raytracing::RayWorldMaterialPublication *worldRayMaterials, const RecordRaster &raster)
 {
     auto &s = *m_impl;
@@ -851,8 +852,10 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
         frameBuffers[static_cast<size_t>(source)] =
             {0, rhi::BindingType::StorageBuffer, buffer.GetBuffer(), 0, buffer.GetByteSize()};
     };
-    if (worldRayGeometry)
-        bindBuffer(GraphFrameBuffer::WorldRayGeometry, *worldRayGeometry);
+    if (rays.buffer) {
+        bindBuffer(GraphFrameBuffer::WorldRayGeometry, *rays.buffer);
+        bindBuffer(GraphFrameBuffer::WorldRayMeshes, *rays.meshes);
+    }
     if (worldRayMaterials) {
         bindBuffer(GraphFrameBuffer::WorldRayLitMaterials, *worldRayMaterials->materials);
         bindBuffer(GraphFrameBuffer::WorldRayTextureDescriptors, *worldRayMaterials->descriptors);
