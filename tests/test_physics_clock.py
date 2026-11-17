@@ -83,12 +83,17 @@ def test_player_host_receives_unscaled_browser_elapsed_time(monkeypatch):
     events = types.ModuleType("infernux.engine.runtime_event_queue")
     events.drain = lambda: calls.append(("events",))
     monkeypatch.setitem(sys.modules, "infernux.engine.runtime_event_queue", events)
+    session = types.SimpleNamespace(is_playing=False)
     tick = _function("infernux_web_tick", {
-        "_player_session": object(),
+        "_player_session": session,
         "_player_host": types.SimpleNamespace(prepare_frame=lambda delta: calls.append(("frame", delta))),
-        "_web_splash": None, "_player_activated": True, "_frame_count": 0,
+        "_web_splash": None, "_frame_count": 0,
         "_complete_pending_audio_activation": lambda: None,
         "_submit_screen_ui": lambda: calls.append(("ui",)),
     })
+    assert tick(0.2) is True
+    assert calls == [("frame", 0.2)]
+    calls.clear()
+    session.is_playing = True
     assert tick(0.4) is False
     assert calls == [("frame", 0.4), ("events",), ("ui",)]

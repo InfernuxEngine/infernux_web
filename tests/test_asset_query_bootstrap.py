@@ -2,6 +2,7 @@
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -62,26 +63,12 @@ def test_web_catalog_schema_is_rejected_before_package_extraction() -> None:
 
 def test_web_bootstrap_binds_guid_asset_api_to_player_memfs() -> None:
     source = (ROOT / "native/bootstrap.py").read_text(encoding="utf-8")
-    extraction = source[
-        source.index("def _prepare_cooked_player_content()") : source.index(
-            "def _install_runtime_lifecycle_bridge("
-        )
-    ]
-    public_api = source[
-        source.index("def _install_platform_runtime_api(") : source.index(
-            "def _install_runtime_lifecycle_bridge("
-        )
-    ]
-    asset_contract = source[
-        source.index("def _prepare_player_asset_contract()") : source.index(
-            "def _prepare_player_runtime()"
-        )
-    ]
-    runtime = source[
-        source.index("def _prepare_player_runtime()") : source.index(
-            "class _WebSplashPlayer"
-        )
-    ]
+    bodies = {node.name: ast.get_source_segment(source, node)
+              for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)}
+    extraction = bodies["_prepare_cooked_player_content"]
+    public_api = bodies["_install_platform_runtime_api"]
+    asset_contract = bodies["_prepare_player_asset_contract"]
+    runtime = bodies["_prepare_player_runtime"]
 
     assert '"AssetFile": assets_module.AssetFile' in public_api
     assert '"AssetManager": assets_module.AssetManager' in public_api
@@ -100,12 +87,10 @@ def test_web_bootstrap_binds_guid_asset_api_to_player_memfs() -> None:
     assert 'set(records_document) != {"$schema", "entries"}' in asset_contract
     assert "runtime_catalog.resolve_scene(scene_guids[0])" in asset_contract
     assert "BuildSettings.json" not in asset_contract
-    assert 'Application._bind_engine(session, "player")' in runtime
-    assert "AssetManager.initialize(session)" in runtime
-    assert runtime.index('Application._bind_engine(session, "player")') < runtime.index(
-        "AssetManager.initialize(session)"
+    assert runtime.index('Application._bind_engine(_player_host, "player")') < runtime.index(
+        "AssetManager.initialize(_player_host)"
     )
-    assert runtime.index("AssetManager.initialize(session)") < runtime.index(
+    assert runtime.index("AssetManager.initialize(_player_host)") < runtime.index(
         "session.configure_runtime_contract("
     )
     assert runtime.index("session.configure_runtime_contract(") < runtime.index(
@@ -118,12 +103,11 @@ def test_web_bootstrap_binds_guid_asset_api_to_player_memfs() -> None:
     )
 
 
-def test_web_audio_gesture_is_queued_until_player_scene_is_ready() -> None:
+def test_web_audio_gesture_is_queued_until_player_session_is_active() -> None:
     source = (ROOT / "native/bootstrap.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     names = {
         "_pending_audio_activation",
-        "_player_activated",
         "infernux_web_activate",
         "_complete_pending_audio_activation",
     }
@@ -139,7 +123,7 @@ def test_web_audio_gesture_is_queued_until_player_scene_is_ready() -> None:
         )
         or (isinstance(node, ast.FunctionDef) and node.name in names)
     ]
-    namespace: dict[str, Any] = {"_player_session": None, "_web_splash": None}
+    namespace: dict[str, Any] = {"_player_session": None}
     exec(compile(ast.Module(nodes, type_ignores=[]), "bootstrap.py", "exec"), namespace)
     activated: list[str] = []
     namespace["_activate_web_player_session"] = lambda: activated.append("session")
@@ -148,10 +132,16 @@ def test_web_audio_gesture_is_queued_until_player_scene_is_ready() -> None:
     assert namespace["_pending_audio_activation"] is True
     assert activated == []
 
-    namespace["_player_session"] = object()
+    session = SimpleNamespace(is_playing=False)
+    namespace["_player_session"] = session
+    namespace["_complete_pending_audio_activation"]()
+    assert namespace["_pending_audio_activation"] is True
+    assert activated == []
+
+    session.is_playing = True
     namespace["_complete_pending_audio_activation"]()
     assert namespace["_pending_audio_activation"] is False
-    assert activated == ["session"]
+    assert activated == []
 
 
 def test_web_audio_gesture_rejects_unsuccessful_browser_unlock() -> None:
