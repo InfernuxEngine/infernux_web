@@ -4,6 +4,7 @@
 #include <function/renderer/ScriptableRenderContext.h>
 #include <function/renderer/MaterialPassPipeline.h>
 #include <function/renderer/FullscreenRenderer.h>
+#include <function/renderer/raytracing/RayLitMaterials.h>
 #include <function/renderer/rhi/RhiDescriptors.h>
 #include <function/renderer/rhi/RhiRenderTexture.h>
 #include <function/resources/InxMaterial/MaterialProperty.h>
@@ -34,6 +35,8 @@ class WebSceneRenderer final
     std::shared_ptr<const rhi::TextureResource>
     ResolveSampledTexture(const std::string &guid, const MaterialTextureSampler *sampler = nullptr);
     std::shared_ptr<const rhi::TextureResource> ResolveGraphTextureAsset(const std::string &guid);
+    std::optional<raytracing::RayLitTexture> ResolveRayLitTexture(const InxMaterial &material,
+        const RendererParameterBlock *parameters, std::string_view name);
     void StageFrame(const EngineGlobalsUBO &frame);
     std::shared_ptr<const RenderViewPlan> Capture(uint32_t width, uint32_t height, Camera &camera,
                                                   RenderPipelineCallback &pipeline,

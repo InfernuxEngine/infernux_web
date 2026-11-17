@@ -5,6 +5,7 @@
 #include <function/renderer/RenderGraphTemporalHistory.h>
 #include <function/renderer/RenderGraphTransfer.h>
 #include <function/renderer/RenderGraphWork.h>
+#include <function/renderer/raytracing/RayWorldMaterials.h>
 #include <function/renderer/rhi/RhiBuffer.h>
 #include <function/renderer/rhi/RhiComputeKernel.h>
 #include <function/renderer/MaterialPassPipeline.h>
@@ -29,6 +30,7 @@ struct WebRenderGraph::Impl
         FullscreenParameters parameters;
         std::vector<FullscreenResourceInput> inputs;
         std::vector<std::pair<uint32_t, GraphFrameBuffer>> frameBufferInputs;
+        std::vector<std::pair<uint32_t, raytracing::RayTexturePageClass>> worldRayPageInputs;
         struct HistoryInput
         {
             uint32_t index;
@@ -265,7 +267,8 @@ struct WebRenderGraph::Impl
             return ids.emplace(handle, newResource()).first->second;
         };
         for (const auto &texture : graph->textures) {
-            const auto id = resourceId(imageIds, textures.at(texture.name)->GetTexture());
+            const auto id = texture.IsWorldRayPage() ? newResource()
+                                                    : resourceId(imageIds, textures.at(texture.name)->GetTexture());
             resources.emplace(texture.name, id);
             if (texture.role == GraphTextureRole::Persistent || texture.role == GraphTextureRole::TemporalWrite ||
                 texture.IsViewAttachment())
@@ -452,10 +455,18 @@ struct WebRenderGraph::Impl
                     prepared.inputs.push_back(input);
                     continue;
                 }
+                const auto &textureDesc = TextureDescription(binding->second);
+                if (textureDesc.IsWorldRayPage()) {
+                    const auto pageClass = textureDesc.role == GraphTextureRole::WorldRayColorPages
+                                               ? raytracing::RayTexturePageClass::Color
+                                               : raytracing::RayTexturePageClass::Data;
+                    prepared.worldRayPageInputs.emplace_back(uint32_t(prepared.inputs.size()), pageClass);
+                    prepared.inputs.emplace_back();
+                    continue;
+                }
                 const bool rawSamples = std::any_of(program->code->resources.begin(), program->code->resources.end(),
                     [&](const auto &resource) { return resource.name == name && resource.binding.multisampled; });
                 const auto texture = SampledTexture(binding->second, rawSamples, view);
-                const auto &textureDesc = TextureDescription(binding->second);
                 if (IsHistory(textureDesc))
                     prepared.historyInputs.push_back({static_cast<uint32_t>(prepared.inputs.size()), &textureDesc});
                 if (!rawSamples && resolved.count(binding->second))
@@ -759,6 +770,8 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
     if (resetHistory)
         InvalidateHistory();
     for (const auto &description : s.graph->textures) {
+        if (description.IsWorldRayPage())
+            continue;
         Texture texture = s.CameraAttachment(description);
         if (Impl::IsHistory(description)) {
             const auto &history = s.histories.at(description.temporalKey);
@@ -827,9 +840,23 @@ void WebRenderGraph::UpdateParameters(const std::vector<GraphParameterBlockUpdat
 }
 
 void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
-                            const rhi::BufferResource *worldRayGeometry, const RecordRaster &raster)
+                            const rhi::BufferResource *worldRayGeometry,
+                            const raytracing::RayWorldMaterialPublication *worldRayMaterials, const RecordRaster &raster)
 {
     auto &s = *m_impl;
+    std::array<rhi::BufferBinding, static_cast<size_t>(GraphFrameBuffer::Count)> frameBuffers{};
+    frameBuffers[static_cast<size_t>(GraphFrameBuffer::ViewLights)] = view.canonicalLights;
+    frameBuffers[static_cast<size_t>(GraphFrameBuffer::WorldSurfaces)] = view.worldSurfaces;
+    const auto bindBuffer = [&](GraphFrameBuffer source, const rhi::BufferResource &buffer) {
+        frameBuffers[static_cast<size_t>(source)] =
+            {0, rhi::BindingType::StorageBuffer, buffer.GetBuffer(), 0, buffer.GetByteSize()};
+    };
+    if (worldRayGeometry)
+        bindBuffer(GraphFrameBuffer::WorldRayGeometry, *worldRayGeometry);
+    if (worldRayMaterials) {
+        bindBuffer(GraphFrameBuffer::WorldRayLitMaterials, *worldRayMaterials->materials);
+        bindBuffer(GraphFrameBuffer::WorldRayTextureDescriptors, *worldRayMaterials->descriptors);
+    }
     s.fullscreen.ResetPool();
     s.RestoreViewport(encoder);
     s.RecordHistoryBindings(encoder);
@@ -847,19 +874,21 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
                     auto &program = prepared.fullscreen[commandIndex];
                     for (const auto &[inputIndex, source] : program.frameBufferInputs) {
                         auto &input = program.inputs[inputIndex];
-                        if (source == GraphFrameBuffer::WorldRayGeometry) {
-                            if (!worldRayGeometry)
-                                throw std::logic_error("A world ray geometry view requires its acquired buffer");
-                            input.buffer = worldRayGeometry->GetBuffer();
-                            input.byteOffset = 0;
-                            input.byteSize = worldRayGeometry->GetByteSize();
-                            continue;
-                        }
-                        const auto &binding =
-                            source == GraphFrameBuffer::ViewLights ? view.canonicalLights : view.worldSurfaces;
+                        const auto &binding = frameBuffers[static_cast<size_t>(source)];
+                        if (!binding.buffer.IsValid())
+                            throw std::logic_error("A fullscreen view frame buffer is unavailable");
                         input.buffer = binding.buffer;
                         input.byteOffset = binding.offset;
                         input.byteSize = binding.byteSize;
+                    }
+                    for (const auto &[inputIndex, pageClass] : program.worldRayPageInputs) {
+                        if (!worldRayMaterials)
+                            throw std::logic_error("A world ray Lit view requires its acquired texture pages");
+                        const auto &texture = worldRayMaterials->pages[static_cast<size_t>(pageClass)];
+                        auto &input = program.inputs[inputIndex];
+                        input.view = texture->GetView();
+                        input.format = texture->GetFormat();
+                        input.sampler = texture->GetSampler();
                     }
                     for (const auto &binding : program.historyInputs) {
                         auto &input = program.inputs[binding.index];

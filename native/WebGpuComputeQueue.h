@@ -21,8 +21,10 @@ class WebGpuComputeQueue final : public rhi::ComputeQueue
     [[nodiscard]] std::optional<rhi::SubmissionTicket> TrySubmit(const Recorder &record,
                                                                  const rhi::ComputeSubmissionResources &resources = {},
                                                                  const Admission &admit = {}) override;
+    /// Optional owner-thread receipt for graphics work whose publication can fail independently.
     [[nodiscard]] rhi::SubmissionTicket SubmitGraphics(const std::function<wgpu::CommandBuffer()> &record,
-                                                       std::shared_ptr<void> retained);
+                                                       std::shared_ptr<void> retained,
+                                                       std::shared_ptr<rhi::WorkCompletionReceipt> receipt = {});
     void Wait(rhi::SubmissionTicket ticket) override;
     [[nodiscard]] bool WaitFor(rhi::SubmissionTicket ticket, uint64_t timeoutNanoseconds) override;
     [[nodiscard]] bool IsComplete(rhi::SubmissionTicket ticket) override;

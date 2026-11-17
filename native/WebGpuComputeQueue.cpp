@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <emscripten.h>
 #include <limits>
 #include <stdexcept>
@@ -110,6 +111,7 @@ struct WebGpuComputeQueue::Completion
 {
     rhi::SubmissionTicket ticket;
     rhi::ComputeSubmissionResources resources;
+    std::shared_ptr<rhi::WorkCompletionReceipt> graphicsReceipt;
     wgpu::QueueWorkDoneStatus status = wgpu::QueueWorkDoneStatus::Error;
     bool commandsDone = false;
     bool validationDone = false;
@@ -206,13 +208,18 @@ rhi::SubmissionTicket WebGpuComputeQueue::Record(const Recorder &record, rhi::Co
 }
 
 rhi::SubmissionTicket WebGpuComputeQueue::SubmitGraphics(const std::function<wgpu::CommandBuffer()> &record,
-                                                        std::shared_ptr<void> retained)
+                                                        std::shared_ptr<void> retained,
+                                                        std::shared_ptr<rhi::WorkCompletionReceipt> receipt)
 {
     auto completion = std::make_shared<Completion>();
     completion->ticket = {m_device.GetDeviceId(), rhi::QueueRole::Graphics, m_submitted + 1};
     completion->resources.retained = std::move(retained);
+    completion->graphicsReceipt = std::move(receipt);
     Completion::ValidationScope validation(m_device.NativeDevice(), completion);
-    return Enqueue(completion, record());
+    const auto ticket = Enqueue(completion, record());
+    if (completion->graphicsReceipt)
+        completion->graphicsReceipt->submission = ticket;
+    return ticket;
 }
 
 rhi::SubmissionTicket WebGpuComputeQueue::Enqueue(const std::shared_ptr<Completion> &completion,
@@ -276,10 +283,15 @@ void WebGpuComputeQueue::Collect()
 {
     while (!m_pending.empty() && m_pending.front()->Ready()) {
         const auto &completion = m_pending.front();
-        if (!completion->error.empty())
-            throw std::runtime_error(completion->error);
-        if (completion->status != wgpu::QueueWorkDoneStatus::Success)
-            throw std::runtime_error("WebGPU submission failed");
+        if (!completion->error.empty() || completion->status != wgpu::QueueWorkDoneStatus::Success) {
+            const auto *message = completion->error.empty() ? "WebGPU submission failed" : completion->error.c_str();
+            if (!completion->graphicsReceipt)
+                throw std::runtime_error(message);
+            std::fprintf(stderr, "WebGPU graphics work failed: %s\n", message);
+            completion->graphicsReceipt->failed = true;
+        } else if (completion->graphicsReceipt) {
+            completion->graphicsReceipt->complete = true;
+        }
         if (completion->ticket.queue == rhi::QueueRole::Compute)
             --m_pendingCompute;
         m_completed = completion->ticket.serial;

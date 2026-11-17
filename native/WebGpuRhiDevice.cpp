@@ -563,6 +563,15 @@ rhi::TextureHandle WebGpuRhiDevice::CreateTexture(const rhi::TextureDesc &desc)
     return Register<rhi::TextureHandle>(m_textures, m_freeTexture, {std::move(texture), desc});
 }
 
+bool WebGpuRhiDevice::GetTextureDesc(rhi::TextureHandle handle, rhi::TextureDesc &desc) const noexcept
+{
+    const auto *texture = Resolve(m_textures, handle);
+    if (!texture)
+        return false;
+    desc = texture->desc;
+    return true;
+}
+
 rhi::TextureViewHandle WebGpuRhiDevice::CreateTextureView(const rhi::TextureViewDesc &desc)
 {
     const auto *texture = Resolve(m_textures, desc.texture);

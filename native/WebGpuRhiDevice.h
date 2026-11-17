@@ -82,6 +82,7 @@ class WebGpuRhiDevice final : public rhi::Device
 
     [[nodiscard]] rhi::BufferHandle CreateBuffer(const rhi::BufferDesc &desc) override;
     [[nodiscard]] rhi::TextureHandle CreateTexture(const rhi::TextureDesc &desc) override;
+    [[nodiscard]] bool GetTextureDesc(rhi::TextureHandle handle, rhi::TextureDesc &desc) const noexcept;
     [[nodiscard]] rhi::TextureViewHandle CreateTextureView(const rhi::TextureViewDesc &desc) override;
     [[nodiscard]] rhi::SamplerHandle CreateSampler(const rhi::SamplerDesc &desc) override;
     [[nodiscard]] rhi::ShaderModuleHandle CreateShaderModule(const rhi::ShaderModuleDesc &desc) override;

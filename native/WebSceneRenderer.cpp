@@ -124,6 +124,7 @@ struct WebSceneRenderer::Impl
     {
         WebTextureAssetLoad load;
         Texture image;
+        std::shared_ptr<const rhi::TextureGpuView> rayView;
     };
     std::unordered_map<std::string, TextureEntry> textures;
     struct Geometry
@@ -296,6 +297,20 @@ struct WebSceneRenderer::Impl
         TextureUploadBatch upload(*source, sampler);
         return device->UploadTexture(upload.GetRequest());
     }
+    WebTextureAssetLoad::Result PollTexture(TextureEntry &entry, const std::string &guid,
+                                            const MaterialTextureSampler &sampler)
+    {
+        const auto status = entry.load.Poll(guid);
+        if (status == WebTextureAssetLoad::Result::Ready) {
+            auto data = entry.load.TakeData();
+            entry.image = UploadTexture(data.texture, data.filterMode, data.wrapMode, data.anisoLevel, sampler);
+            entry.rayView.reset();
+        } else if (status == WebTextureAssetLoad::Result::Missing) {
+            entry.image.reset();
+            entry.rayView.reset();
+        }
+        return status;
+    }
     Texture ResolveTexture(const std::string &guid, const MaterialTextureSampler &sampler, bool requiredAsset = false)
     {
         if (guid.empty() || guid == "white" || guid == "White")
@@ -305,20 +320,8 @@ struct WebSceneRenderer::Impl
         if (guid == "normal" || guid == "Normal")
             return normal;
         auto &entry = textures[guid + '\x1e' + SamplerIdentity(sampler)];
-        switch (entry.load.Poll(guid)) {
-        case WebTextureAssetLoad::Result::Ready: {
-            auto data = entry.load.TakeData();
-            entry.image = UploadTexture(data.texture, data.filterMode, data.wrapMode, data.anisoLevel, sampler);
-            break;
-        }
-        case WebTextureAssetLoad::Result::Missing:
-            entry.image.reset();
-            if (requiredAsset)
-                throw std::invalid_argument("Render graph texture asset is unavailable: " + guid);
-            break;
-        default:
-            break;
-        }
+        if (PollTexture(entry, guid, sampler) == WebTextureAssetLoad::Result::Missing && requiredAsset)
+            throw std::invalid_argument("Render graph texture asset is unavailable: " + guid);
         return entry.image;
     }
     rhi::BufferHandle AcceptedBuffer(const std::shared_ptr<rhi::ComputeBuffer> &value) const
@@ -684,6 +687,36 @@ WebSceneRenderer::ResolveSampledTexture(const std::string &guid, const MaterialT
 std::shared_ptr<const rhi::TextureResource> WebSceneRenderer::ResolveGraphTextureAsset(const std::string &guid)
 {
     return m_impl->ResolveTexture(guid, {}, true);
+}
+
+std::optional<raytracing::RayLitTexture> WebSceneRenderer::ResolveRayLitTexture(const InxMaterial &material,
+    const RendererParameterBlock *parameters, std::string_view name)
+{
+    using namespace raytracing;
+    const auto reference = ResolveRayLitTextureReference(material, parameters, name);
+    if (const auto *solid = std::get_if<RayLitSolidTexture>(&reference))
+        return *solid;
+    const auto &guid = std::get<std::string>(reference);
+    const auto *authoredSampler = material.GetTextureSampler(std::string(name));
+    const auto sampler = authoredSampler ? *authoredSampler : MaterialTextureSampler{};
+    auto &s = *m_impl;
+    auto &entry = s.textures[guid + '\x1e' + SamplerIdentity(sampler)];
+    // Raster can keep the previous image during an asset reload. Publish ray
+    // pages only from the current asset version.
+    if (s.PollTexture(entry, guid, sampler) == WebTextureAssetLoad::Result::Pending)
+        return std::nullopt;
+    if (!entry.image)
+        throw std::invalid_argument("Ray Lit texture asset is unavailable: " + guid);
+    const auto &registry = AssetRegistry::Instance();
+    if (!entry.rayView) {
+        const auto &image = *entry.image;
+        entry.rayView = std::make_shared<const rhi::TextureGpuView>(
+            guid, registry.GetAssetVersion(guid), image.GetTexture(), image.GetView(), image.GetSampler(),
+            image.GetResidentBytes(), entry.image, image.GetFormat(), image.GetViewDesc(), image.GetUploadSubmission());
+    }
+    const auto pageClass = name == "albedo_map" || name == "emission_map" ? RayTexturePageClass::Color
+                                                                          : RayTexturePageClass::Data;
+    return CaptureRayTexturePageSource(*s.device, entry.rayView, registry.GetAssetContentGeneration(guid), pageClass);
 }
 
 std::shared_ptr<const RenderViewPlan> WebSceneRenderer::Capture(uint32_t width, uint32_t height,

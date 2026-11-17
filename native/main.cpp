@@ -28,6 +28,7 @@
 #include "WebRenderGraph.h"
 #include <function/renderer/RenderGraphWork.h>
 #include <function/renderer/raytracing/RayWorldGeometry.h>
+#include <function/renderer/raytracing/RayWorldMaterials.h>
 #include <pybind11/pybind11.h>
 #include <function/resources/ShaderAsset/FullscreenProgramAsset.h>
 #include <function/renderer/rhi/RhiBuffer.h>
@@ -119,6 +120,7 @@ std::unique_ptr<infernux::web::WebGpuComputeQueue> g_computeQueue;
 std::unique_ptr<infernux::rhi::ComputeHost> g_computeHost;
 infernux::FrameWorkOwner g_frameWork;
 std::unique_ptr<infernux::raytracing::RayWorldGeometry> g_worldRayGeometry;
+std::unique_ptr<infernux::raytracing::RayWorldMaterials> g_worldRayMaterials;
 infernux::web::WebSceneRenderer g_sceneRenderer;
 infernux::web::WebParticleRuntime g_particleRuntime;
 class FullscreenHost final : public infernux::FullscreenRendererHost
@@ -147,6 +149,9 @@ struct CameraGraph
     std::shared_ptr<const infernux::RenderGraphDescription> description;
     std::shared_ptr<const infernux::RenderViewPlan> pendingRayPlan;
     std::shared_ptr<const infernux::raytracing::RayWorldGeometryPublication> rayPublication;
+    std::shared_ptr<const infernux::ShaderTargetCode> rayMaterialCode;
+    std::shared_ptr<const infernux::raytracing::RayLitMaterialLayout> rayMaterialLayout;
+    std::shared_ptr<const infernux::raytracing::RayWorldMaterialRequest> rayMaterialRequest;
     uint64_t outputRevision = 0;
     infernux::rhi::BufferHandle viewGlobals;
     uint64_t lastFrame = 0;
@@ -156,6 +161,7 @@ struct CameraSubmission
 {
     std::shared_ptr<void> workStorage;
     std::shared_ptr<const infernux::rhi::BufferResource> worldRayGeometry;
+    std::shared_ptr<const infernux::raytracing::RayWorldMaterialPublication> worldRayMaterials;
 };
 std::unordered_map<uint64_t, CameraGraph> g_cameraGraphs;
 std::unordered_map<uint64_t, uint64_t> g_mainCameraViews;
@@ -827,6 +833,29 @@ bool InitializePython()
            PyCallable_Check(g_runtimeDiagnostic);
 }
 
+void SubmitRayTextureCopies()
+{
+    if (!g_worldRayMaterials)
+        return;
+    const auto batch = g_worldRayMaterials->PrepareCopyBatch();
+    if (!batch)
+        return;
+    try {
+        const auto ticket = g_computeQueue->SubmitGraphics([&] {
+            auto encoder = g_device.CreateCommandEncoder();
+            infernux::web::WebGpuTransferCommandContext context;
+            if (!batch->Record(g_rhi->MakeTransferCommandEncoder(context, encoder)))
+                throw std::runtime_error("Could not record the Web ray material texture copies");
+            return encoder.Finish();
+        }, batch, batch->Receipt());
+        if (ticket.IsValid() && g_worldRayMaterials->AcceptCopyBatch(*batch))
+            return;
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "Web ray material texture submission failed: %s\n", error.what());
+    }
+    g_worldRayMaterials->FailCopyBatch();
+}
+
 void Frame()
 {
     g_frameWork.BeginOpportunity();
@@ -946,6 +975,7 @@ void Frame()
             std::shared_ptr<const infernux::RenderViewPlan> plan;
             CameraGraph *state;
             std::shared_ptr<const infernux::rhi::BufferResource> worldRayGeometry;
+            std::shared_ptr<const infernux::raytracing::RayWorldMaterialPublication> worldRayMaterials;
         };
         std::vector<CapturedCamera> captured;
         std::vector<infernux::RenderViewAccess> accesses;
@@ -988,6 +1018,21 @@ void Frame()
                 });
                 if (!state.requiresWorldRayGeometry)
                     state.rayPublication.reset();
+                auto rayMaterialCode = infernux::ResolveGraphRayLitProgram(*state.description);
+                if (state.rayMaterialCode != rayMaterialCode) {
+                    state.rayMaterialCode = std::move(rayMaterialCode);
+                    state.rayMaterialLayout.reset();
+                    state.rayMaterialRequest.reset();
+                    if (state.rayMaterialCode) {
+                        const auto existing = std::find_if(g_cameraGraphs.begin(), g_cameraGraphs.end(),
+                            [&](const auto &entry) {
+                                return entry.second.rayMaterialLayout && entry.second.rayMaterialCode == state.rayMaterialCode;
+                            });
+                        state.rayMaterialLayout = existing == g_cameraGraphs.end()
+                            ? std::make_shared<const infernux::raytracing::RayLitMaterialLayout>(state.rayMaterialCode->resources)
+                            : existing->second.rayMaterialLayout;
+                    }
+                }
             }
             g_lastSampleCount = state.description->msaaSamples > 0 ? uint32_t(state.description->msaaSamples) : 1;
             infernux::rhi::RenderViewContext graphView;
@@ -1032,11 +1077,32 @@ void Frame()
                 if (!g_worldRayGeometry)
                     g_worldRayGeometry = std::make_unique<infernux::raytracing::RayWorldGeometry>(g_frameWork, *g_rhi);
                 rays = g_worldRayGeometry->Acquire(plan->world, state.rayPublication);
-                // Keep this view's world selected until its page can be submitted.
-                if (rays.pending)
-                    state.pendingRayPlan = plan;
             }
-            if (!texturesReady || rays.pending) {
+            infernux::raytracing::RayWorldMaterialBinding materials;
+            if (texturesReady && state.rayMaterialLayout) {
+                using namespace infernux::raytracing;
+                if (!g_worldRayMaterials) {
+                    constexpr uint64_t atlasByteBudget = 64ULL * 1024 * 1024;
+                    g_worldRayMaterials = std::make_unique<RayWorldMaterials>(g_frameWork, *g_rhi,
+                        [](const auto &material, const auto *parameters, auto name) {
+                            return g_sceneRenderer.ResolveRayLitTexture(material, parameters, name);
+                        },
+                        [](RayTexturePageClass pageClass) {
+                            auto image = g_rhi->UploadTexture(RayPlaceholderTextureUpload(pageClass));
+                            if (!image)
+                                throw std::runtime_error("Could not upload a Web ray material placeholder page");
+                            const auto *id = pageClass == RayTexturePageClass::Color ? "ray/empty-color" : "ray/empty-data";
+                            return std::make_shared<const infernux::rhi::TextureGpuView>(id, 1, std::move(image));
+                        }, atlasByteBudget);
+                }
+                const auto *database = infernux::AssetRegistry::Instance().GetAssetDatabase();
+                materials = g_worldRayMaterials->Acquire(plan->world, state.rayMaterialLayout,
+                    database ? database->GetQueryGeneration() : 0, state.rayMaterialRequest);
+            }
+            if (!texturesReady || rays.pending || (state.rayMaterialLayout && !materials.value)) {
+                // Keep geometry and materials on the same captured World until
+                // its outstanding preparation can be submitted.
+                state.pendingRayPlan = rays.pending || materials.pending ? plan : nullptr;
                 infernux::RenderViewAccess access;
                 access.viewId = graphView.id;
                 access.admitted = false;
@@ -1053,7 +1119,7 @@ void Frame()
                                                                                    texture.attachment));
                 }
                 accesses.push_back(std::move(access));
-                captured.push_back({camera, plan, &state, {}});
+                captured.push_back({camera, plan, &state, {}, {}});
                 continue;
             }
             const bool sampleParticleDepth = g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics &&
@@ -1074,7 +1140,7 @@ void Frame()
             auto access = state.graph->GetResourceAccess(
                 g_sceneRenderer.CollectMaterialTextureReads(*plan, *state.graph));
             accesses.push_back(std::move(access));
-            captured.push_back({camera, plan, &state, std::move(rays.buffer)});
+            captured.push_back({camera, plan, &state, std::move(rays.buffer), std::move(materials.value)});
         }
         const auto schedule = infernux::RenderViewSchedule::Build(accesses);
         for (auto *input : schedule.cyclicInputs)
@@ -1094,7 +1160,7 @@ void Frame()
             const infernux::ShaderViewBindings particleView{g_sceneRenderer.ViewLayout(), resources.perView,
                                                            resources.globals.buffer};
             const auto record = [&] {
-                state.graph->Record(encoder, resources, capture.worldRayGeometry.get(),
+                state.graph->Record(encoder, resources, capture.worldRayGeometry.get(), capture.worldRayMaterials.get(),
                     [&](auto pass, const auto &command, const auto &raster, const auto &target, const auto *particleDepth) {
                         using Type = infernux::GraphCommandType;
                         switch (command.type) {
@@ -1134,8 +1200,9 @@ void Frame()
                 return g_sceneRenderer.CaptureViewSample();
             });
             auto storage = state.graph->RetainWorkStorage();
-            if (capture.worldRayGeometry)
-                storage = std::make_shared<CameraSubmission>(CameraSubmission{std::move(storage), capture.worldRayGeometry});
+            if (capture.worldRayGeometry || capture.worldRayMaterials)
+                storage = std::make_shared<CameraSubmission>(CameraSubmission{
+                    std::move(storage), capture.worldRayGeometry, capture.worldRayMaterials});
             if (storage || publication) {
                 const auto ticket = g_computeQueue->SubmitGraphics(record, std::move(storage));
                 if (publication)
@@ -1193,6 +1260,8 @@ void Frame()
         return g_computeQueue->GetPendingSubmissionCount() ? infernux::FrameGpuAvailability::BackgroundPending
                                                            : infernux::FrameGpuAvailability::Ready;
     });
+    if (foregroundSubmitted)
+        SubmitRayTextureCopies();
     if (pauseAcceptanceAfterRender) {
         auto &sceneManager = infernux::SceneManager::Instance();
         sceneManager.Pause();
