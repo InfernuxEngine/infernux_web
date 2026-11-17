@@ -5,6 +5,7 @@
 #include <function/renderer/RenderGraphTemporalHistory.h>
 #include <function/renderer/RenderGraphTransfer.h>
 #include <function/renderer/RenderGraphWork.h>
+#include <function/renderer/raytracing/RayHistoryWorldState.h>
 #include <function/renderer/raytracing/RayWorldGeometry.h>
 #include <function/renderer/raytracing/RayWorldMaterials.h>
 #include <function/renderer/rhi/RhiBuffer.h>
@@ -63,9 +64,11 @@ struct WebRenderGraph::Impl
     std::unordered_map<std::string, Texture> textures;
     std::unordered_map<std::string, Texture> resolved;
     std::unordered_map<std::string, GraphTemporalHistory> histories;
+    raytracing::RayHistoryWorldState rayHistoryWorld;
     std::shared_ptr<RenderGraphWorkStorage> workStorage;
     RenderGraphResults results;
     uint64_t historyEpoch = 0;
+    uint32_t acceptedSampleIndex = 0;
     bool historyReset = true;
     std::vector<uint32_t> eventPasses;
     std::vector<const GraphBufferDesc *> liveBufferInputs;
@@ -991,9 +994,23 @@ WebRenderGraph::PreparePublication(const GraphEventInterests &interests,
 
 void WebRenderGraph::AcceptHistory()
 {
+    ++m_impl->acceptedSampleIndex;
     m_impl->historyReset = false;
     for (auto &[key, history] : m_impl->histories)
         history.Accept();
+}
+
+void WebRenderGraph::UpdateRayHistory(
+    const RenderWorldFrame &world, const raytracing::RayWorldGeometryBinding &rays,
+    const std::shared_ptr<const raytracing::RayWorldMaterialPublication> &materials)
+{
+    if (m_impl->rayHistoryWorld.Update(world, rays.meshes, materials))
+        raytracing::InvalidateRayHistories(m_impl->histories);
+}
+
+uint32_t WebRenderGraph::AcceptedSampleIndex() const noexcept
+{
+    return m_impl->acceptedSampleIndex;
 }
 
 void WebRenderGraph::InvalidateHistory() noexcept

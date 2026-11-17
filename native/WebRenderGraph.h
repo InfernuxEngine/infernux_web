@@ -19,6 +19,7 @@ class ComputeHost;
 namespace infernux
 {
 class GraphFramePublication;
+class RenderWorldFrame;
 namespace raytracing
 {
 struct RayWorldGeometryBinding;
@@ -61,6 +62,9 @@ class WebRenderGraph final
                        const std::function<std::shared_ptr<GraphEventViewSample>()> &sample);
     void AcceptHistory();
     void InvalidateHistory() noexcept;
+    void UpdateRayHistory(const RenderWorldFrame &world, const raytracing::RayWorldGeometryBinding &rays,
+                          const std::shared_ptr<const raytracing::RayWorldMaterialPublication> &materials);
+    [[nodiscard]] uint32_t AcceptedSampleIndex() const noexcept;
     [[nodiscard]] const RenderGraphDescription &Description() const noexcept;
     [[nodiscard]] Texture GetTexture(const std::string &name) const;
     [[nodiscard]] Texture Output() const;

@@ -571,7 +571,7 @@ struct WebSceneRenderer::Impl
                                                                 ? rhi::IndexFormat::Uint16
                                                                 : rhi::IndexFormat::Uint32);
         commands.DrawIndexed(draw.source.indexCount, 1, draw.source.indexStart, draw.source.vertexStart, draw.instance);
-        if (descriptor.target == ShaderCompileTarget::Motion)
+        if (UsesInstanceMotion(descriptor.target))
             current->motion.Record(draw.source.identity, draw.source.worldMatrix, draw.source.skinBoneMatrices,
                                    draw.source.skinContinuity, draw.source.devicePose);
     }
@@ -816,7 +816,7 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
         resources.useMotion = std::any_of(graph.ExecutionOrder().begin(), graph.ExecutionOrder().end(),
                                           [&](uint32_t pass) {
                                               const auto *command = graph.Description().passes[pass].PrimaryCommand();
-                                              return command && command->shaderTarget == ShaderCompileTarget::Motion;
+                                              return command && UsesInstanceMotion(command->shaderTarget);
                                           });
     }
     if (!resources.acceptedView || resources.acceptedView->pixelWidth != width ||
@@ -902,7 +902,7 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     globals.projectionParams = viewport.projectionParams;
     globals.zBufferParams = viewport.zBufferParams;
     globals.frameParams.w = resources.acceptedView ? resources.previousTime : globals.time.x;
-    globals.viewOptions = {view.dithering ? 1u : 0u, view.stopNaNs ? 1u : 0u, 1, 0};
+    globals.viewOptions = {view.dithering ? 1u : 0u, view.stopNaNs ? 1u : 0u, 1, graph.AcceptedSampleIndex()};
     s.Uniform(s.current->globals, globals);
     s.lights.CollectLights(*s.frame->Lighting(), view.position);
     s.lights.ComputeShadowVP(*s.frame->Lighting(), view, s.shadowsEnabled ? s.shadowResolution : 0);

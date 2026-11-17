@@ -1174,6 +1174,8 @@ void Frame()
             const auto &cameraView = *plan->view;
             const auto output = cameraView.outputGeneration;
             g_lastSampleCount = state.description->msaaSamples > 0 ? uint32_t(state.description->msaaSamples) : 1;
+            if (capture.worldRayMaterials)
+                state.graph->UpdateRayHistory(*plan->world, capture.worldRayGeometry, capture.worldRayMaterials);
             g_sceneRenderer.Prepare(*plan, *state.graph);
             g_sceneRenderer.RecordPreparation(encoder);
             const auto resources = g_sceneRenderer.FullscreenView();
