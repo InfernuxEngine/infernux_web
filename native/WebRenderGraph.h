@@ -24,6 +24,7 @@ namespace raytracing
 {
 struct RayWorldGeometryBinding;
 struct RayWorldMaterialPublication;
+struct RayTailCacheBinding;
 } // namespace raytracing
 } // namespace infernux
 
@@ -54,7 +55,8 @@ class WebRenderGraph final
     void UpdateParameters(const std::vector<GraphParameterBlockUpdate> &updates);
     void Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
                 const raytracing::RayWorldGeometryBinding &rays,
-                const raytracing::RayWorldMaterialPublication *worldRayMaterials, const RecordRaster &raster);
+                const raytracing::RayWorldMaterialPublication *worldRayMaterials,
+                const raytracing::RayTailCacheBinding &tail, const RecordRaster &raster);
     [[nodiscard]] std::shared_ptr<void> RetainWorkStorage() const;
     [[nodiscard]] std::shared_ptr<GraphBufferCapture> CaptureBuffer(const std::string &name);
     [[nodiscard]] std::shared_ptr<GraphFramePublication>

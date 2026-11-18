@@ -12,6 +12,7 @@
 #include <function/renderer/raytracing/RayHistoryWorldState.h>
 #include <function/renderer/raytracing/RayWorldGeometry.h>
 #include <function/renderer/raytracing/RayWorldMaterials.h>
+#include <function/renderer/raytracing/RayWorldTailCache.h>
 #include <function/renderer/rhi/CameraViewportTarget.h>
 #include <function/renderer/rhi/RenderViewContext.h>
 #include <function/renderer/rhi/RhiBuffer.h>
@@ -880,7 +881,7 @@ void WebRenderGraph::UpdateParameters(const std::vector<GraphParameterBlockUpdat
 void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
                             const raytracing::RayWorldGeometryBinding &rays,
                             const raytracing::RayWorldMaterialPublication *worldRayMaterials,
-                            const RecordRaster &raster)
+                            const raytracing::RayTailCacheBinding &tail, const RecordRaster &raster)
 {
     auto &s = *m_impl;
     std::array<rhi::BufferBinding, static_cast<size_t>(GraphFrameBuffer::Count)> frameBuffers{};
@@ -898,11 +899,19 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
         bindBuffer(GraphFrameBuffer::WorldRayLitMaterials, *worldRayMaterials->materials);
         bindBuffer(GraphFrameBuffer::WorldRayTextureDescriptors, *worldRayMaterials->descriptors);
     }
+    for (size_t i = 0; i < tail.buffers.size(); ++i)
+        if (tail.buffers[i]) {
+            const auto source = static_cast<size_t>(GraphFrameBuffer::WorldRayTailRead) + i;
+            frameBuffers[source] = {0, rhi::BindingType::StorageBuffer, tail.buffers[i]->GetBuffer(), 0,
+                                    tail.byteSizes[i]};
+        }
     s.fullscreen.ResetPool();
     s.RestoreViewport(encoder);
     s.RecordHistoryBindings(encoder);
     for (const auto index : s.order) {
         const auto &source = s.graph->passes[index];
+        if (source.rayTailBatch && (!tail.batch || !tail.batch->Allows(source.rayTailBatch)))
+            continue;
         auto &prepared = s.passes[index];
         s.RecordResolves(encoder, prepared.resolves);
         if (source.type == GraphPassType::Raster) {
@@ -946,7 +955,20 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
             }
             pass.End();
         } else if (const auto *command = source.PrimaryCommand()) {
-            if (command->type == GraphCommandType::ComputeWork) {
+            if (command->type == GraphCommandType::RayTailPrepare || command->type == GraphCommandType::RayTailMerge) {
+                auto pass = encoder.BeginComputePass();
+                WebGpuComputeCommandContext context;
+                auto commands = s.device.MakeComputeCommandEncoder(context, pass);
+                const bool prepare = command->type == GraphCommandType::RayTailPrepare;
+                std::array<rhi::TextureViewHandle, 2> images{};
+                for (const auto &[port, name] : command->inputBindings)
+                    images.at(prepare ? static_cast<size_t>(port.back() - '0') : 0) = s.textures.at(name)->GetView();
+                if (prepare)
+                    tail.batch->RecordPrepare(commands, images);
+                else
+                    tail.batch->RecordMerge(commands, images[0]);
+                pass.End();
+            } else if (command->type == GraphCommandType::ComputeWork) {
                 auto pass = encoder.BeginComputePass();
                 WebGpuComputeCommandContext context;
                 auto commands = s.device.MakeComputeCommandEncoder(context, pass);

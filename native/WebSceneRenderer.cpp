@@ -167,6 +167,7 @@ struct WebSceneRenderer::Impl
         Texture shadow;
         Texture transparentLayer;
         rhi::BindGroupHandle fullscreenGroup;
+        FullscreenViewBindings fullscreenBindings;
         rhi::BindGroupHandle partitionGroup;
         rhi::TextureViewHandle partitionLayer;
         std::array<rhi::BufferHandle, 6> fullscreenBuffers{};
@@ -248,6 +249,14 @@ struct WebSceneRenderer::Impl
                                                                            : current->grid->Frame(0).maskCapacityBytes;
         }
         if (baseChanged) {
+            for (uint32_t index = 0; index < group.bufferCount; ++index) {
+                const auto &binding = group.buffers[index];
+                current->fullscreenBindings.buffers[binding.binding] = binding;
+            }
+            for (uint32_t index = 0; index < group.textureCount; ++index) {
+                const auto &binding = group.textures[index];
+                current->fullscreenBindings.textures[binding.binding] = binding;
+            }
             device->Release(current->fullscreenGroup);
             current->fullscreenGroup = device->CreateBindGroup(group);
             current->fullscreenBuffers = handles;
@@ -1124,7 +1133,7 @@ FullscreenViewResources WebSceneRenderer::FullscreenView() const noexcept
     const auto &surfaces = view.surfaceRecords;
     return {
         {0, rhi::BindingType::UniformBuffer, view.globals->GetBuffer(), 0, sizeof(EngineGlobalsUBO)},
-        view.fullscreenGroup,
+        &view.fullscreenBindings,
         {1, rhi::BindingType::StorageBuffer, view.canonicalLights->GetBuffer(), 0, view.canonicalLights->GetByteSize()},
         surfaces
             ? rhi::BufferBinding{0, rhi::BindingType::StorageBuffer, surfaces->GetBuffer(), 0, surfaces->GetByteSize()}

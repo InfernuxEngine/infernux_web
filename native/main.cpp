@@ -5,10 +5,10 @@
 
 #include <function/renderer/rhi/RhiDescriptors.h>
 
+#include <core/math/ViewportRect.h>
 #include <core/threading/FrameWorkOwner.h>
 #include <core/threading/JobSystem.h>
 #include <core/types/ColorSpace.h>
-#include <core/math/ViewportRect.h>
 #include <function/audio/AudioEngine.h>
 #include <platform/filesystem/InxPack.h>
 #include <platform/input/InputManager.h>
@@ -26,18 +26,19 @@
 #include "WebKeyboard.h"
 #include "WebParticleRuntime.h"
 #include "WebRenderGraph.h"
+#include "WebSceneRenderer.h"
+#include "WebScreenUIRenderer.h"
 #include <function/renderer/RenderGraphWork.h>
 #include <function/renderer/raytracing/RayTexturePageRenderer.h>
 #include <function/renderer/raytracing/RayWorldGeometry.h>
 #include <function/renderer/raytracing/RayWorldMaterials.h>
-#include <pybind11/pybind11.h>
-#include <function/resources/ShaderAsset/FullscreenProgramAsset.h>
+#include <function/renderer/raytracing/RayWorldTailCache.h>
 #include <function/renderer/rhi/RhiBuffer.h>
-#include <function/renderer/rhi/RhiRenderTexture.h>
-#include "WebSceneRenderer.h"
-#include <function/renderer/shader/ShaderViewBindings.h>
-#include "WebScreenUIRenderer.h"
 #include <function/renderer/rhi/RhiComputeHost.h>
+#include <function/renderer/rhi/RhiRenderTexture.h>
+#include <function/renderer/shader/ShaderViewBindings.h>
+#include <function/resources/ShaderAsset/FullscreenProgramAsset.h>
+#include <pybind11/pybind11.h>
 
 #include <algorithm>
 #include <array>
@@ -122,17 +123,28 @@ std::unique_ptr<infernux::rhi::ComputeHost> g_computeHost;
 infernux::FrameWorkOwner g_frameWork;
 std::unique_ptr<infernux::raytracing::RayWorldGeometry> g_worldRayGeometry;
 std::unique_ptr<infernux::raytracing::RayWorldMaterials> g_worldRayMaterials;
+std::unique_ptr<infernux::raytracing::RayWorldTailCache> g_worldRayTailCache;
 infernux::web::WebSceneRenderer g_sceneRenderer;
 infernux::web::WebParticleRuntime g_particleRuntime;
 class FullscreenHost final : public infernux::FullscreenRendererHost
 {
   public:
-    infernux::rhi::Device &GetRhiDevice() noexcept override { return *g_rhi; }
-    uint32_t GetFrameCount() const noexcept override { return 1; }
-    uint32_t GetCurrentFrame() const noexcept override { return 0; }
-    infernux::rhi::BindingLayoutHandle GetPerViewLayout() const noexcept override { return g_sceneRenderer.ViewLayout(); }
+    infernux::rhi::Device &GetRhiDevice() noexcept override
+    {
+        return *g_rhi;
+    }
+    uint32_t GetFrameCount() const noexcept override
+    {
+        return 1;
+    }
+    uint32_t GetCurrentFrame() const noexcept override
+    {
+        return 0;
+    }
     std::shared_ptr<const infernux::FullscreenProgram> AcquireProgram(const std::string &name) override
-    { return infernux::LoadFullscreenProgram(name, infernux::ShaderCodeTarget::Wgsl); }
+    {
+        return infernux::LoadFullscreenProgram(name, infernux::ShaderCodeTarget::Wgsl);
+    }
 };
 std::shared_ptr<FullscreenHost> g_fullscreenHost;
 std::shared_ptr<infernux::FullscreenPipelineCache> g_fullscreenPipelines;
@@ -160,8 +172,8 @@ struct CameraGraph
     std::shared_ptr<const infernux::RenderViewPlan> pendingRayPlan;
     std::shared_ptr<const infernux::raytracing::RayWorldGeometryPublication> rayPublication;
     std::shared_ptr<const infernux::ShaderTargetCode> rayMaterialCode;
-    std::shared_ptr<const infernux::raytracing::RayLitMaterialLayout> rayMaterialLayout;
     std::shared_ptr<const infernux::raytracing::RayWorldMaterialRequest> rayMaterialRequest;
+    std::shared_ptr<infernux::raytracing::RayTailCacheRequest> rayTailRequest;
     std::optional<PresentedCamera> presented;
     uint64_t outputRevision = 0;
     infernux::rhi::BufferHandle viewGlobals;
@@ -173,6 +185,7 @@ struct CameraSubmission
     std::shared_ptr<void> workStorage;
     infernux::raytracing::RayWorldGeometryBinding worldRayGeometry;
     std::shared_ptr<const infernux::raytracing::RayWorldMaterialPublication> worldRayMaterials;
+    infernux::raytracing::RayTailCacheBinding tail;
 };
 std::unordered_map<uint64_t, CameraGraph> g_cameraGraphs;
 std::unordered_map<uint64_t, uint64_t> g_mainCameraViews;
@@ -852,27 +865,29 @@ void SubmitRayTexturePages()
     if (!batch)
         return;
     try {
-        const auto ticket = g_computeQueue->SubmitGraphics([&] {
-            auto encoder = g_device.CreateCommandEncoder();
-            for (const auto &slice : batch->Slices()) {
-                auto raster = slice.draw->Raster();
-                raster.colors[0].load = slice.FirstStripe() ? infernux::rhi::AttachmentLoad::Clear
-                                                            : infernux::rhi::AttachmentLoad::Load;
-                infernux::web::WebGpuRasterPass native;
-                g_rhi->PrepareRasterPass(raster, native);
-                auto pass = encoder.BeginRenderPass(&native.descriptor);
-                pass.SetViewport(0.0f, 0.0f, static_cast<float>(raster.width), static_cast<float>(raster.height),
-                                 0.0f, 1.0f);
-                pass.SetScissorRect(0, slice.y, raster.width, slice.rowCount);
-                infernux::web::WebGpuGraphicsCommandContext context;
-                const bool recorded = slice.draw->Record(g_rhi->MakeGraphicsCommandEncoder(context, pass));
-                pass.End();
-                if (!recorded)
-                    throw std::runtime_error("Could not record a Web ray texture page stripe");
-            }
-            batch->MarkRecorded();
-            return encoder.Finish();
-        }, batch, batch->Receipt());
+        const auto ticket = g_computeQueue->SubmitGraphics(
+            [&] {
+                auto encoder = g_device.CreateCommandEncoder();
+                for (const auto &slice : batch->Slices()) {
+                    auto raster = slice.draw->Raster();
+                    raster.colors[0].load = slice.FirstStripe() ? infernux::rhi::AttachmentLoad::Clear
+                                                                : infernux::rhi::AttachmentLoad::Load;
+                    infernux::web::WebGpuRasterPass native;
+                    g_rhi->PrepareRasterPass(raster, native);
+                    auto pass = encoder.BeginRenderPass(&native.descriptor);
+                    pass.SetViewport(0.0f, 0.0f, static_cast<float>(raster.width), static_cast<float>(raster.height),
+                                     0.0f, 1.0f);
+                    pass.SetScissorRect(0, slice.y, raster.width, slice.rowCount);
+                    infernux::web::WebGpuGraphicsCommandContext context;
+                    const bool recorded = slice.draw->Record(g_rhi->MakeGraphicsCommandEncoder(context, pass));
+                    pass.End();
+                    if (!recorded)
+                        throw std::runtime_error("Could not record a Web ray texture page stripe");
+                }
+                batch->MarkRecorded();
+                return encoder.Finish();
+            },
+            batch, batch->Receipt());
         if (ticket.IsValid() && g_worldRayMaterials->AcceptPageBatch(*batch))
             return;
     } catch (const std::exception &error) {
@@ -958,6 +973,7 @@ void Frame()
             CameraGraph *state;
             infernux::raytracing::RayWorldGeometryBinding worldRayGeometry;
             std::shared_ptr<const infernux::raytracing::RayWorldMaterialPublication> worldRayMaterials;
+            infernux::raytracing::RayTailCacheBinding tail;
         };
         std::vector<CapturedCamera> captured;
         std::vector<infernux::RenderViewAccess> accesses;
@@ -992,8 +1008,10 @@ void Frame()
             if (state.source != plan->graph || state.outputRevision != outputRevision) {
                 state.source = plan->graph;
                 state.outputRevision = outputRevision;
-                state.description = output ? std::make_shared<infernux::RenderGraphDescription>(
-                    infernux::NormalizeRenderGraphForOutput(*plan->graph, true, output->description.samples)) : plan->graph;
+                state.description =
+                    output ? std::make_shared<infernux::RenderGraphDescription>(infernux::NormalizeRenderGraphForOutput(
+                                 *plan->graph, true, output->description.samples))
+                           : plan->graph;
                 const auto &buffers = state.description->buffers;
                 state.requiresWorldRayGeometry = std::any_of(buffers.begin(), buffers.end(), [](const auto &buffer) {
                     return buffer.frameBuffer == infernux::GraphFrameBuffer::WorldRayGeometry ||
@@ -1004,17 +1022,7 @@ void Frame()
                 auto rayMaterialCode = infernux::ResolveGraphRayLitProgram(*state.description);
                 if (state.rayMaterialCode != rayMaterialCode) {
                     state.rayMaterialCode = std::move(rayMaterialCode);
-                    state.rayMaterialLayout.reset();
                     state.rayMaterialRequest.reset();
-                    if (state.rayMaterialCode) {
-                        const auto existing = std::find_if(g_cameraGraphs.begin(), g_cameraGraphs.end(),
-                            [&](const auto &entry) {
-                                return entry.second.rayMaterialLayout && entry.second.rayMaterialCode == state.rayMaterialCode;
-                            });
-                        state.rayMaterialLayout = existing == g_cameraGraphs.end()
-                            ? std::make_shared<const infernux::raytracing::RayLitMaterialLayout>(state.rayMaterialCode->resources)
-                            : existing->second.rayMaterialLayout;
-                    }
                 }
             }
             g_lastSampleCount = state.description->msaaSamples > 0 ? uint32_t(state.description->msaaSamples) : 1;
@@ -1035,13 +1043,15 @@ void Frame()
                     throw std::invalid_argument("Cameras sharing one screen must use the same sample count");
                 auto &target = g_screenTargets[world];
                 infernux::rhi::RenderTextureDesc description;
-                description.width = g_width; description.height = g_height;
+                description.width = g_width;
+                description.height = g_height;
                 description.colorFormat = graphView.colorFormat;
                 description.depthFormat = graphView.depthFormat;
                 description.samples = graphView.samples;
                 description.sampledDepth = true;
                 if (!target)
-                    target = std::make_shared<infernux::rhi::RenderTexture>(*g_rhi, "screen/" + std::to_string(world), description);
+                    target = std::make_shared<infernux::rhi::RenderTexture>(*g_rhi, "screen/" + std::to_string(world),
+                                                                            description);
                 else
                     target->Reconfigure(description);
                 destination = target->Acquire();
@@ -1062,11 +1072,12 @@ void Frame()
                 rays = g_worldRayGeometry->Acquire(plan->world, state.rayPublication);
             }
             infernux::raytracing::RayWorldMaterialBinding materials;
-            if (texturesReady && state.rayMaterialLayout) {
+            if (texturesReady && state.rayMaterialCode) {
                 using namespace infernux::raytracing;
                 if (!g_worldRayMaterials) {
                     constexpr uint64_t atlasByteBudget = 64ULL * 1024 * 1024;
-                    g_worldRayMaterials = std::make_unique<RayWorldMaterials>(g_frameWork, *g_rhi,
+                    g_worldRayMaterials = std::make_unique<RayWorldMaterials>(
+                        g_frameWork, *g_rhi,
                         [](const auto &material, const auto *parameters, auto name) {
                             return g_sceneRenderer.ResolveRayLitTexture(material, parameters, name);
                         },
@@ -1074,15 +1085,18 @@ void Frame()
                             auto image = g_rhi->UploadTexture(RayPlaceholderTextureUpload(pageClass));
                             if (!image)
                                 throw std::runtime_error("Could not upload a Web ray material placeholder page");
-                            const auto *id = pageClass == RayTexturePageClass::Color ? "ray/empty-color" : "ray/empty-data";
+                            const auto *id =
+                                pageClass == RayTexturePageClass::Color ? "ray/empty-color" : "ray/empty-data";
                             return std::make_shared<const infernux::rhi::TextureGpuView>(id, 1, std::move(image));
-                        }, atlasByteBudget);
+                        },
+                        atlasByteBudget);
                 }
                 const auto *database = infernux::AssetRegistry::Instance().GetAssetDatabase();
-                materials = g_worldRayMaterials->Acquire(plan->world, state.rayMaterialLayout,
-                    database ? database->GetQueryGeneration() : 0, state.rayMaterialRequest);
+                materials = g_worldRayMaterials->Acquire(plan->world, state.rayMaterialCode,
+                                                         database ? database->GetQueryGeneration() : 0,
+                                                         state.rayMaterialRequest);
             }
-            if (!texturesReady || rays.pending || (state.rayMaterialLayout && !materials.value)) {
+            if (!texturesReady || rays.pending || (state.rayMaterialCode && !materials.value)) {
                 // Keep geometry and materials on the same captured World until
                 // its outstanding preparation can be submitted.
                 state.pendingRayPlan = rays.pending || materials.pending ? plan : nullptr;
@@ -1095,35 +1109,53 @@ void Frame()
                 if (destination->depth)
                     access.writes.push_back(destination->depth.get());
                 for (const auto &texture : state.description->textures) {
-                    if (!texture.renderTextureGeneration || !std::any_of(state.description->passes.begin(),
-                            state.description->passes.end(), [&](const auto &pass) { return pass.WritesTexture(texture.name); }))
+                    if (!texture.renderTextureGeneration ||
+                        !std::any_of(state.description->passes.begin(), state.description->passes.end(),
+                                     [&](const auto &pass) { return pass.WritesTexture(texture.name); }))
                         continue;
-                    access.writes.push_back(infernux::ResolveGraphTextureAttachment(*texture.renderTextureGeneration,
-                                                                                   texture.attachment));
+                    access.writes.push_back(
+                        infernux::ResolveGraphTextureAttachment(*texture.renderTextureGeneration, texture.attachment));
                 }
                 accesses.push_back(std::move(access));
                 captured.push_back({camera, plan, &state, {}, {}});
                 continue;
             }
-            const bool sampleParticleDepth = g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics &&
+            const bool sampleParticleDepth =
+                g_particleRuntimeReady && g_particleRenderingEnabledForDiagnostics &&
                 std::any_of(state.description->passes.begin(), state.description->passes.end(), [&](const auto &pass) {
                     const auto *command = pass.PrimaryCommand();
                     return command && command->type == infernux::GraphCommandType::DrawRenderers &&
-                        g_particleRuntime.RequiresSceneDepth(cameraView.cullingMask, command->queueMin, command->queueMax);
+                           g_particleRuntime.RequiresSceneDepth(cameraView.cullingMask, command->queueMin,
+                                                                command->queueMax);
                 });
-            const bool rebuilt = state.graph->Apply(state.description, graphView, [&](const auto &texture) {
+            const bool rebuilt = state.graph->Apply(
+                state.description, graphView,
+                [&](const auto &texture) {
                     const auto found = textureAssets.find(texture.name);
                     return found == textureAssets.end() ? infernux::web::WebRenderGraph::Texture{} : found->second;
                 },
                 infernux::ResolveGraphCameraClear(*state.description, cameraView.clearFlags,
-                    inx::color::SrgbToLinear(cameraView.backgroundColor)), destination, cameraView.rect, sampleParticleDepth);
+                                                  inx::color::SrgbToLinear(cameraView.backgroundColor)),
+                destination, cameraView.rect, sampleParticleDepth);
             if (rebuilt && state.viewGlobals.IsValid())
                 g_particleRuntime.ReleaseView(state.viewGlobals);
             state.graph->UpdateParameters(plan->parameters);
-            auto access = state.graph->GetResourceAccess(
-                g_sceneRenderer.CollectMaterialTextureReads(*plan, *state.graph));
+            auto access =
+                state.graph->GetResourceAccess(g_sceneRenderer.CollectMaterialTextureReads(*plan, *state.graph));
             accesses.push_back(std::move(access));
-            captured.push_back({camera, plan, &state, std::move(rays), std::move(materials.value)});
+            infernux::raytracing::RayTailCacheBinding tail;
+            if (std::any_of(state.description->buffers.begin(), state.description->buffers.end(),
+                            [](const auto &buffer) {
+                                return buffer.frameBuffer == infernux::GraphFrameBuffer::WorldRayTailRead;
+                            })) {
+                if (!g_worldRayTailCache)
+                    g_worldRayTailCache =
+                        std::make_unique<infernux::raytracing::RayWorldTailCache>(g_frameWork, *g_rhi);
+                tail = g_worldRayTailCache->Acquire(plan->world, rays, materials.value, graphView.id,
+                                                    state.rayTailRequest);
+            } else
+                state.rayTailRequest.reset();
+            captured.push_back({camera, plan, &state, std::move(rays), std::move(materials.value), std::move(tail)});
         }
         const auto schedule = infernux::RenderViewSchedule::Build(accesses);
 
@@ -1142,7 +1174,8 @@ void Frame()
             auto &copy = g_screenCopies[sample.displayEncoded];
             if (!copy) {
                 infernux::FullscreenPipelineKey key;
-                key.shaderName = sample.displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
+                key.shaderName =
+                    sample.displayEncoded ? "infernux/internal/fullscreen_blit" : "infernux/internal/display_encode";
                 key.program = g_fullscreenPipelines->AcquireProgram(key.shaderName);
                 key.colorFormats[0] = ToRhiFormat(g_surfaceFormat);
                 key.useDynamicRendering = true;
@@ -1169,7 +1202,8 @@ void Frame()
             input.sampler = sample.color->GetSampler();
             infernux::web::WebGpuGraphicsCommandContext context;
             auto commands = g_rhi->MakeGraphicsCommandEncoder(context, pass);
-            g_presentRenderer.DrawProgram(commands, copy->pipeline, &input, copy->parameters, nullptr, sample.resources);
+            g_presentRenderer.DrawProgram(commands, copy->pipeline, &input, copy->parameters, nullptr,
+                                          sample.resources);
             pass.End();
         };
         bool rendered = false;
@@ -1192,8 +1226,10 @@ void Frame()
             state.viewGlobals = resources.globals.buffer;
             std::optional<PresentedCamera> presented;
             const auto record = [&] {
-                state.graph->Record(encoder, resources, capture.worldRayGeometry, capture.worldRayMaterials.get(),
-                    [&](auto pass, const auto &command, const auto &raster, const auto &target, const auto *particleDepth) {
+                state.graph->Record(
+                    encoder, resources, capture.worldRayGeometry, capture.worldRayMaterials.get(), capture.tail,
+                    [&](auto pass, const auto &command, const auto &raster, const auto &target,
+                        const auto *particleDepth) {
                         using Type = infernux::GraphCommandType;
                         switch (command.type) {
                         case Type::DrawRenderers:
@@ -1211,20 +1247,26 @@ void Frame()
                             g_sceneRenderer.Record(pass, command, target);
                             break;
                         case Type::DrawWorldUI:
-                            (void)g_screenUIRenderer.RenderWorld(pass, *camera, raster.width, raster.height, target, command.worldUILayerMask);
+                            (void)g_screenUIRenderer.RenderWorld(pass, *camera, raster.width, raster.height, target,
+                                                                 command.worldUILayerMask);
                             break;
                         case Type::DrawScreenUI:
-                            (void)g_screenUIRenderer.Render(pass, command.screenUIList, raster.width, raster.height, target);
+                            (void)g_screenUIRenderer.Render(pass, command.screenUIList, raster.width, raster.height,
+                                                            target);
                             break;
                         default:
                             throw std::invalid_argument("Unexpected non-raster command in a render pass");
                         }
                     });
                 if (!output) {
-                    presented = PresentedCamera{state.graph->Output(), resources,
+                    presented = PresentedCamera{state.graph->Output(),
+                                                resources,
                                                 infernux::RasterViewportRect(cameraView.rect, g_width, g_height),
-                                                plan->world->WorldId(), plan->world->SimulationEpoch(), g_width,
-                                                g_height, state.description->outputDisplayEncoded};
+                                                plan->world->WorldId(),
+                                                plan->world->SimulationEpoch(),
+                                                g_width,
+                                                g_height,
+                                                state.description->outputDisplayEncoded};
                     present(*presented, !rendered);
                     rendered = true;
                 }
@@ -1232,15 +1274,17 @@ void Frame()
                 // then reuse its UI buffers without changing this recorded draw.
                 return encoder.Finish();
             };
-            auto publication = state.graph->PreparePublication(g_graphServices.interests, [] {
-                return g_sceneRenderer.CaptureViewSample();
-            });
+            auto publication = state.graph->PreparePublication(g_graphServices.interests,
+                                                               [] { return g_sceneRenderer.CaptureViewSample(); });
             auto storage = state.graph->RetainWorkStorage();
             if (capture.worldRayGeometry.buffer || capture.worldRayMaterials)
                 storage = std::make_shared<CameraSubmission>(CameraSubmission{
-                    std::move(storage), capture.worldRayGeometry, capture.worldRayMaterials});
+                    std::move(storage), capture.worldRayGeometry, capture.worldRayMaterials, capture.tail});
             if (storage || publication) {
-                const auto ticket = g_computeQueue->SubmitGraphics(record, std::move(storage));
+                const auto ticket = g_computeQueue->SubmitGraphics(
+                    record, std::move(storage), capture.tail.batch ? capture.tail.batch->Receipt() : nullptr);
+                if (capture.tail.batch && !g_worldRayTailCache->AcceptBatch(capture.tail.batch))
+                    throw std::logic_error("Accepted Web directional ray cache batch was not fully recorded");
                 if (publication)
                     publication->Accept(ticket, g_graphServices.events);
             } else {
@@ -1356,7 +1400,8 @@ void StartSurface()
         return;
     }
     PyObject *mainModule = PyImport_AddModule("__main__");
-    auto createPipeline = pybind11::reinterpret_borrow<pybind11::object>(mainModule).attr("infernux_web_create_render_pipeline");
+    auto createPipeline =
+        pybind11::reinterpret_borrow<pybind11::object>(mainModule).attr("infernux_web_create_render_pipeline");
     auto pipeline = createPipeline();
     g_renderPipeline = pipeline.cast<infernux::RenderPipelineCallback *>();
     g_renderPipelineOwner = pipeline.release().ptr();
