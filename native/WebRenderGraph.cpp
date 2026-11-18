@@ -892,10 +892,8 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
         bindBuffer(GraphFrameBuffer::WorldRayGeometry, *rays.buffer);
         bindBuffer(GraphFrameBuffer::WorldRayMeshes, *rays.meshes);
     }
-    if (worldRayMaterials) {
+    if (worldRayMaterials)
         bindBuffer(GraphFrameBuffer::WorldRayLitMaterials, *worldRayMaterials->materials);
-        bindBuffer(GraphFrameBuffer::WorldRayTextureDescriptors, *worldRayMaterials->descriptors);
-    }
     for (size_t i = 0; i < tail.buffers.size(); ++i)
         if (tail.buffers[i]) {
             const auto source = static_cast<size_t>(GraphFrameBuffer::WorldRayTailRead) + i;
