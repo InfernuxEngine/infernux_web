@@ -16,6 +16,8 @@
 
 ## 维护
 
+WebGPU 的 Emdawn 源码固定在本仓库的 `external/emdawnwebgpu`，编译 Web Player 时在本地链接进 Wasm 和 JavaScript。项目导出复用这些文件。通过本机 HTTP 服务打开导出目录即可离线运行。
+
 在引擎仓库使用 `scripts/release/build_platform_plugins.py` 构建或打包此平台。引擎 CI 使用同一源码提交生成四个平台插件，统一核对版本与摘要，全部成功后才能发布引擎。平台仓库自身的 CI 负责源码与打包检查。`package.py`、`release.py` 保留为独立开发检查工具。
 
 安装包只包含 `package/` 和编译后的平台载荷。测试、CMake、CI、构建工具和缓存不会进入安装包。具体环境变量与批处理命令见引擎的[平台 Player 发布说明](https://github.com/ChenlizheMe/Infernux/blob/main/docs/learn/platform-player-releases.md)。

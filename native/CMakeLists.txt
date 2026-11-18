@@ -16,18 +16,32 @@ set(INFERNUX_WEB_NUMPY_PAYLOAD_ROOT "" CACHE PATH
     "Exact NumPy static archives, registration source, and preload tree")
 set(INFERNUX_WEB_HOST_PYTHON "" CACHE FILEPATH
     "Absolute host Python used by Web configure/build tools")
-set(INFERNUX_WEBGPU_PORT "" CACHE FILEPATH
-    "Pinned Emdawnwebgpu port prepared by native/build.py")
-if(NOT EXISTS "${INFERNUX_WEBGPU_PORT}")
-    message(FATAL_ERROR "Build through native/build.py or provide INFERNUX_WEBGPU_PORT")
-endif()
-set(_webgpu_port "--use-port=${INFERNUX_WEBGPU_PORT}")
+get_filename_component(_emdawnwebgpu "${CMAKE_CURRENT_SOURCE_DIR}/../external/emdawnwebgpu" ABSOLUTE)
+set(_webgpu_port "--use-port=${_emdawnwebgpu}/emdawnwebgpu.port.py")
+# CPython's system libraries are supplied by the prepared Emscripten sysroot.
+# Passing named Emscripten ports here would let emcc fetch sources during export.
+set(_python_system_libdir "${EMSCRIPTEN_SYSROOT}/lib/${CMAKE_LIBRARY_ARCHITECTURE}")
+foreach(_lib IN ITEMS bz2 sqlite3)
+    set(_archive "${_python_system_libdir}/lib${_lib}.a")
+    if(NOT EXISTS "${_archive}")
+        message(FATAL_ERROR "Missing local CPython system library: ${_archive}. Use the prepared Web toolchain.")
+    endif()
+    list(APPEND _python_system_libs "${_archive}")
+endforeach()
+set(_webgpu_notices "${CMAKE_CURRENT_BINARY_DIR}/emdawnwebgpu-notices.js")
+file(READ "${_emdawnwebgpu}/webgpu/src/LICENSE" _webgpu_license)
+file(READ "${_emdawnwebgpu}/webgpu_cpp/LICENSE" _webgpu_cpp_license)
+file(GENERATE OUTPUT "${_webgpu_notices}"
+    CONTENT "/*! Emdawnwebgpu\n${_webgpu_license}\n${_webgpu_cpp_license}\n*/\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_emdawnwebgpu}/webgpu/src/LICENSE" "${_emdawnwebgpu}/webgpu_cpp/LICENSE")
 set(INFERNUX_WEB_PLAYER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/publish/player" CACHE PATH
     "Build-tree destination for the precompiled Web Player payload")
 set(INFERNUX_ENGINE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." CACHE PATH
     "Infernux source directory providing the backend-neutral RHI contract")
 set(INFERNUX_EXTERNAL_ROOT "${INFERNUX_ENGINE_SOURCE_ROOT}/external")
 include("${INFERNUX_ENGINE_SOURCE_ROOT}/cmake/InfernuxSlang.cmake")
+include("${INFERNUX_ENGINE_SOURCE_ROOT}/cmake/InfernuxZlib.cmake")
 add_library(InfernuxWebShaderCompiler STATIC
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/resources/ShaderAsset/SlangCompiler.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/resources/ShaderAsset/SlangLayout.cpp")
@@ -301,6 +315,8 @@ target_link_libraries(InfernuxWebPlayerHost PRIVATE
     "${_python_expat}"
     "${_python_mpdecimal}"
     "${_python_hacl}"
+    ${_python_system_libs}
+    ZLIB::ZLIBSTATIC
     libzstd_static
     infernux_utf8proc
     InfernuxWebShaderCompiler
@@ -320,18 +336,8 @@ target_compile_definitions(InfernuxWebPlayerHost PRIVATE
 )
 if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
    INFERNUX_WEB_LINK_ENGINE_RUNTIME)
-    execute_process(
-        COMMAND "${INFERNUX_WEB_HOST_PYTHON}"
-            -c "import pybind11; print(pybind11.get_include())"
-        OUTPUT_VARIABLE _web_pybind11_include
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE _web_pybind11_result
-    )
-    if(NOT _web_pybind11_result EQUAL 0 OR
-       NOT EXISTS "${_web_pybind11_include}/pybind11/pybind11.h")
-        message(FATAL_ERROR
-            "The active Web build environment must provide pybind11 headers")
-    endif()
+    infernux_require_sources("${INFERNUX_EXTERNAL_ROOT}" pybind11/include/pybind11/pybind11.h)
+    set(_web_pybind11_include "${INFERNUX_EXTERNAL_ROOT}/pybind11/include")
     file(GLOB _web_binding_sources CONFIGURE_DEPENDS
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/bindings/python/*.cpp"
     )
@@ -533,12 +539,7 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
     endif()
 endif()
 
-target_compile_options(InfernuxWebPlayerHost PRIVATE
-    "${_webgpu_port}"
-    "-sUSE_ZLIB=1"
-    "-sUSE_BZIP2=1"
-    "-sUSE_SQLITE3=1"
-)
+target_compile_options(InfernuxWebPlayerHost PRIVATE "${_webgpu_port}")
 if(INFERNUX_WEB_LINK_ENGINE_RUNTIME)
     # Scene loading crosses the embedded Python C API and native scene
     # deserializers. Keep C++ exceptions enabled at this boundary so a
@@ -548,9 +549,7 @@ if(INFERNUX_WEB_LINK_ENGINE_RUNTIME)
 endif()
 target_link_options(InfernuxWebPlayerHost PRIVATE
     "${_webgpu_port}"
-    "-sUSE_ZLIB=1"
-    "-sUSE_BZIP2=1"
-    "-sUSE_SQLITE3=1"
+    "--extern-post-js=${_webgpu_notices}"
     "-sALLOW_MEMORY_GROWTH=1"
     "-sINITIAL_MEMORY=134217728"
     "-sMAXIMUM_MEMORY=2147483648"

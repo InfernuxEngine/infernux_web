@@ -16,6 +16,8 @@ A matching precompiled Player is used directly. If an installed Player is incomp
 
 ## Maintain
 
+The plugin owns the pinned Emdawnwebgpu source in `external/emdawnwebgpu`. Emscripten compiles and links this local port into the Player's Wasm and JavaScript. Project exports reuse that payload. Serve the exported directory on localhost to run without internet access.
+
 From the engine repository, use `scripts/release/build_platform_plugins.py` to build or package this target. The engine's `engine-platform-plugins.yml` workflow collects all four platforms from the same engine commit, checks their identities and digests, and gates publication of the engine release. `package.py` and `release.py` remain available for standalone development checks, not independent platform distribution.
 
 Only `package/` and the compiled target payload enter the installable archive. Tests, CMake, CI, source build tools and caches remain outside it. See the engine documentation [Platform Player releases](https://github.com/ChenlizheMe/Infernux/blob/main/docs/learn/platform-player-releases.md) for toolchain variables and batch commands.
