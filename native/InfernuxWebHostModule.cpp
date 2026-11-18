@@ -251,6 +251,7 @@ PyObject *InitializeRuntimeAssets(PyObject *, PyObject *arguments)
                                 infernux::ResourceType::DataAsset})
             registry.RegisterLoader(type, std::make_unique<infernux::InxDefaultLoader>(type));
         registry.PopulateAssetDatabaseLoaders();
+        registry.InitializeBuiltinMaterials();
         return PyLong_FromSize_t(assetCount);
     } catch (const std::exception &error) {
         PyErr_SetString(PyExc_RuntimeError, error.what());
