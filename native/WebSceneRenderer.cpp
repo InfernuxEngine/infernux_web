@@ -177,6 +177,7 @@ struct WebSceneRenderer::Impl
         std::shared_ptr<const RenderGraphDescription> graph;
         std::shared_ptr<const RenderViewData> acceptedView;
         glm::mat4 previousViewProjection{1.0f};
+        glm::vec2 previousJitter{0.0f};
         float previousTime = 0.f;
         uint32_t temporalSample = 0;
         bool useMotion = false;
@@ -955,7 +956,8 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     globals.zBufferParams = viewport.zBufferParams;
     globals.frameParams.w = resources.acceptedView ? resources.previousTime : globals.time.x;
     globals.viewOptions =
-        MakeViewOptions(view.dithering, view.stopNaNs, true, graph.AcceptedRayGeometry(), graph.AcceptedSampleIndex());
+        MakeViewOptions(view.dithering, view.stopNaNs, true, graph.AcceptedRayGeometry(), graph.AcceptedSampleIndex(),
+                        resources.acceptedView ? s.preparedJitter - resources.previousJitter : glm::vec2(0.0f));
     s.Uniform(s.current->globals, globals);
     s.lights.CollectLights(*s.frame->Lighting(), view.position);
     s.lights.ComputeShadowVP(*s.frame->Lighting(), view, s.shadowsEnabled ? s.shadowResolution : 0);
@@ -1023,6 +1025,7 @@ void WebSceneRenderer::AcceptView()
     auto &resources = *s.current;
     resources.acceptedView = s.view;
     resources.previousViewProjection = s.preparedViewProjection;
+    resources.previousJitter = s.preparedJitter;
     resources.previousTime = s.frameGlobals.time.x;
     if (resources.useMotion)
         resources.motion.CommitFrame();
