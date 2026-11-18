@@ -6,7 +6,7 @@
 #include "WebTextureUpload.h"
 #include <function/renderer/RendererSelection.h>
 #include <function/renderer/lighting/ForwardPlusLightGrid.h>
-#include <function/resources/ShaderAsset/SlangCompiler.h>
+#include <function/renderer/shader/BuiltinSceneProgram.h>
 
 #include <core/math/DepthConvention.h>
 #include <core/types/ColorSpace.h>
@@ -978,13 +978,9 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     }
     s.current->usesGrid = GraphUsesForwardPlus(*plan.graph);
     if (s.current->usesGrid) {
-        if (!s.gridProgram) {
-            const auto code =
-                SlangCompiler::Get().Compile({"inx_forward_plus_grid", "Infernux/ForwardPlus.compute.py",
-                                              std::string(lighting::ForwardPlusLightGrid::ShaderSource())},
-                                             {}, {ShaderCodeTarget::Wgsl});
-            s.gridProgram = lighting::ForwardPlusLightGrid::CreateProgram(*s.device, code.targets[0]);
-        }
+        if (!s.gridProgram)
+            s.gridProgram = lighting::ForwardPlusLightGrid::CreateProgram(
+                *s.device, LoadBuiltinSceneProgram(BuiltinSceneProgram::ForwardPlusGrid));
         if (!s.current->grid) {
             s.current->grid = std::make_unique<lighting::ForwardPlusLightGrid>();
             if (!s.current->grid->Initialize(s.gridProgram, 1))

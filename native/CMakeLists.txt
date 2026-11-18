@@ -264,6 +264,8 @@ add_executable(InfernuxWebPlayerHost
     "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/platform/input/InputManager.cpp"
     "${INFERNUX_ENGINE_SOURCE_ROOT}/external/stb/stb_vorbis.c"
 )
+include("${INFERNUX_ENGINE_SOURCE_ROOT}/cmake/InfernuxPhysicsCook.cmake")
+infernux_cook_scene_programs(InfernuxWebPlayerHost wgsl)
 set_target_properties(InfernuxWebPlayerHost PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
@@ -401,7 +403,6 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
     add_library(InfernuxWebSceneRuntimeProbe OBJECT EXCLUDE_FROM_ALL
         ${_web_scene_runtime_sources}
     )
-    include("${INFERNUX_ENGINE_SOURCE_ROOT}/cmake/InfernuxPhysicsCook.cmake")
     infernux_cook_jolt_gpu_programs(InfernuxWebSceneRuntimeProbe wgsl)
     file(GLOB_RECURSE _web_resource_runtime_sources CONFIGURE_DEPENDS
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/core/*.cpp"

@@ -19,6 +19,7 @@
 #include <function/renderer/rhi/RhiComputeBuffer.h>
 #include <function/renderer/rhi/RhiComputeKernel.h>
 #include <function/renderer/rhi/RhiRenderTexture.h>
+#include <function/renderer/shader/BuiltinSceneProgram.h>
 #include <function/resources/ShaderAsset/SlangCompiler.h>
 #include <stdexcept>
 #include <unordered_map>
@@ -150,13 +151,9 @@ struct WebRenderGraph::Impl
             if (source.IsDepth()) {
                 single.role = GraphTextureRole::Transient;
                 single.format = rhi::PixelFormat::R32SFloat;
-                if (!depthProgram) {
-                    const auto program = SlangCompiler::Get().Compile({"inx_scene_depth_resolve",
-                                                                       "Infernux/SceneDepthResolve.compute.py",
-                                                                       std::string(SceneDepthResolver::ShaderSource())},
-                                                                      {}, {ShaderCodeTarget::Wgsl});
-                    depthProgram = SceneDepthResolver::CreateProgram(device, program.targets[0]);
-                }
+                if (!depthProgram)
+                    depthProgram = SceneDepthResolver::CreateProgram(
+                        device, LoadBuiltinSceneProgram(BuiltinSceneProgram::DepthResolve));
                 if (!depthResolver.IsValid())
                     depthResolver.Initialize(depthProgram);
             }
