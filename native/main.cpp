@@ -179,6 +179,7 @@ struct CameraGraph
     infernux::rhi::BufferHandle viewGlobals;
     uint64_t lastFrame = 0;
     bool requiresWorldRayGeometry = false;
+    infernux::GraphRayTailUse rayTailUse = infernux::GraphRayTailUse::None;
 };
 struct CameraSubmission
 {
@@ -1019,6 +1020,7 @@ void Frame()
                 });
                 if (!state.requiresWorldRayGeometry)
                     state.rayPublication.reset();
+                state.rayTailUse = infernux::ResolveGraphRayTailUse(*state.description);
                 auto rayMaterialCode = infernux::ResolveGraphRayLitProgram(*state.description);
                 if (state.rayMaterialCode != rayMaterialCode) {
                     state.rayMaterialCode = std::move(rayMaterialCode);
@@ -1144,15 +1146,13 @@ void Frame()
                 state.graph->GetResourceAccess(g_sceneRenderer.CollectMaterialTextureReads(*plan, *state.graph));
             accesses.push_back(std::move(access));
             infernux::raytracing::RayTailCacheBinding tail;
-            if (std::any_of(state.description->buffers.begin(), state.description->buffers.end(),
-                            [](const auto &buffer) {
-                                return buffer.frameBuffer == infernux::GraphFrameBuffer::WorldRayTailRead;
-                            })) {
+            if (state.rayTailUse != infernux::GraphRayTailUse::None) {
                 if (!g_worldRayTailCache)
                     g_worldRayTailCache =
                         std::make_unique<infernux::raytracing::RayWorldTailCache>(g_frameWork, *g_rhi);
-                tail = g_worldRayTailCache->Acquire(plan->world, rays, materials.value, graphView.id,
-                                                    state.rayTailRequest);
+                const auto writer =
+                    state.rayTailUse == infernux::GraphRayTailUse::Update ? std::optional(graphView.id) : std::nullopt;
+                tail = g_worldRayTailCache->Acquire(plan->world, rays, materials.value, writer, state.rayTailRequest);
             } else
                 state.rayTailRequest.reset();
             captured.push_back({camera, plan, &state, std::move(rays), std::move(materials.value), std::move(tail)});
