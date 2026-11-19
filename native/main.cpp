@@ -229,6 +229,7 @@ std::unordered_map<uint64_t, std::shared_ptr<infernux::rhi::RenderTexture>> g_sc
 PyObject *g_renderPipelineOwner = nullptr;
 infernux::RenderPipelineCallback *g_renderPipeline = nullptr;
 uint32_t g_lastSampleCount = 1;
+uint64_t g_lastSubmittedScreenFrame = 0;
 infernux::web::WebScreenUIRenderer g_screenUIRenderer;
 bool g_particleRuntimeReady = false;
 bool g_particleRenderingEnabledForDiagnostics = true;
@@ -629,6 +630,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE double InfernuxWebGetRuntimeDiagnostic(int probe
 {
     if (probe == 15)
         return static_cast<double>(g_lastSampleCount);
+    if (probe == 16)
+        return static_cast<double>(g_lastSubmittedScreenFrame);
     if (g_runtimeDiagnostic == nullptr)
         return std::numeric_limits<double>::quiet_NaN();
     PyObject *result = PyObject_CallFunction(g_runtimeDiagnostic, "ii", probe, argument);
@@ -1342,6 +1345,8 @@ double Frame()
             state.pendingRayPlan.reset();
             encoder = g_device.CreateCommandEncoder();
         }
+        if (rendered)
+            g_lastSubmittedScreenFrame = g_shaderFrameIndex;
         const bool pendingScreen = !rendered && std::any_of(captured.begin(), captured.end(), [](const auto &capture) {
             return !capture.plan->view->outputGeneration && capture.state->pendingRayPlan;
         });
