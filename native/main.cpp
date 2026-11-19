@@ -44,7 +44,9 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -88,18 +90,50 @@ EM_JS(int, InfernuxWebFixedCanvasHeight, (), {
 EM_JS(void, InfernuxWebAbortStartup, (const char *reason), { abort(UTF8ToString(reason)); });
 
 EM_JS(void, InfernuxWebStartRuntime, (), {
-    // Only the suspended frame owns gameplay/rendering work. Schedule its
-    // successor after it returns, including an explicit GPU/IO wait.
     const fail = error => abort(error instanceof Error ? error.message : String(error));
-    const frame = async () => {
+    let busy = true;
+    let drawDue = false;
+    let timer;
+    const readers = [];
+    const diagnostic = (probe, argument = 0) =>
+        Module.ccall("InfernuxWebGetRuntimeDiagnostic", "number", ["number", "number"], [probe, argument]);
+    // Python Input and script diagnostics belong to the same turn as simulation.
+    // Read a whole snapshot between turns, even if the browser delivered it during a GPU wait.
+    Module["infernuxReadRuntime"] = read => new Promise((resolve, reject) => {
+        const snapshot = () => {
+            try { resolve(read(diagnostic)); } catch (error) { reject(error); }
+        };
+        if (busy) readers.push(snapshot);
+        else snapshot();
+    });
+    const release = () => {
+        busy = false;
+        for (const read of readers) read();
+        readers.length = 0;
+    };
+    const draw = () => {
+        clearTimeout(timer);
+        drawDue = true;
+        if (!busy) run();
+    };
+    // A due presentation wins over a continuation. A suspended native call
+    // still owns the World until it returns, including during GPU/IO waits.
+    const run = async () => {
+        const present = drawDue;
+        drawDue = false;
+        busy = true;
         try {
-            await Module.ccall("infernux_web_frame", null, [], [], {async: true});
-            requestAnimationFrame(frame);
+            const delay = await Module.ccall("infernux_web_frame", "number", ["number"], [+present], {async: true});
+            release();
+            if (present) requestAnimationFrame(draw);
+            if (drawDue) run();
+            else if (delay > 0 && !document.hidden)
+                timer = setTimeout(() => { if (!document.hidden) run(); }, delay);
         } catch (error) { fail(error); }
     };
     Promise.resolve()
         .then(() => Module.ccall("infernux_web_start", null, [], [], {async: true}))
-        .then(() => requestAnimationFrame(frame))
+        .then(() => { release(); requestAnimationFrame(draw); })
         .catch(fail);
 });
 // clang-format on
@@ -215,6 +249,7 @@ double g_lastFrameTimeMilliseconds = 0.0;
 float g_shaderTimeSeconds = 0.0f;
 uint64_t g_shaderFrameIndex = 0;
 bool g_runtimeFrameFailed = false;
+bool g_lastForegroundSubmitted = false;
 bool g_viewportDirty = false;
 bool g_splashActive = false;
 double g_safeAreaLeft = 0.0;
@@ -224,6 +259,7 @@ double g_safeAreaBottom = 0.0;
 double g_keyboardInset = 0.0;
 bool g_keyboardInsetKnown = false;
 bool g_runtimeActivated = false;
+std::deque<std::function<void()>> g_browserEvents;
 double g_acceptanceFixedDeltaSeconds = 0.0;
 uint64_t g_acceptancePauseAfterFrame = 0;
 bool g_acceptancePaused = false;
@@ -359,6 +395,18 @@ void DispatchInput(const char *kind, PyObject *payload)
         Py_DECREF(result);
 }
 
+// A DOM callback may interrupt a JSPI wait with CPython's thread state detached.
+// Capture browser data immediately and deliver it on the serialized host turn.
+template <class WritePayload> void QueueInput(const char *kind, WritePayload write)
+{
+    g_browserEvents.emplace_back([kind, write = std::move(write)] {
+        PyObject *payload = PyDict_New();
+        write(payload);
+        DispatchInput(kind, payload);
+        Py_DECREF(payload);
+    });
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebUserActivation()
 {
     if (g_runtimeActivated || g_activate == nullptr)
@@ -371,23 +419,14 @@ extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebUserActivation()
         return;
     }
 
-    PyObject *argument = PyBool_FromLong(1);
-    PyObject *result = argument != nullptr ? PyObject_CallOneArg(g_activate, argument) : nullptr;
-    Py_XDECREF(argument);
-    if (result == nullptr) {
-        PrintPythonError("activation");
-        return;
-    }
-    const int activated = PyObject_IsTrue(result);
-    Py_DECREF(result);
-    if (activated < 0) {
-        PrintPythonError("activation-result");
-        return;
-    }
-    if (activated == 0)
-        return;
-
     g_runtimeActivated = true;
+    g_browserEvents.emplace_back([] {
+        PyObject *result = PyObject_CallOneArg(g_activate, Py_True);
+        if (result == nullptr)
+            PrintPythonError("activation");
+        else
+            Py_DECREF(result);
+    });
     std::printf("INFERNUX_WEB_AUDIO_READY sample_rate=%d channels=%d\n",
                 infernux::AudioEngine::Instance().GetSampleRate(), infernux::AudioEngine::Instance().GetChannelCount());
     std::printf("INFERNUX_WEB_AUDIO_ACTIVE_VOICES count=%zu\n",
@@ -492,10 +531,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebPageLifecycle(int active)
     } else if (g_runtimeActivated) {
         infernux::AudioEngine::Instance().ResumeAll();
     }
-    PyObject *payload = PyDict_New();
-    SetDictBool(payload, "active", active != 0);
-    DispatchInput(active != 0 ? "page_show" : "page_hide", payload);
-    Py_DECREF(payload);
+    QueueInput(active != 0 ? "page_show" : "page_hide", [active](PyObject *payload) {
+        SetDictBool(payload, "active", active != 0);
+    });
 }
 
 EM_BOOL OnResize(int, const EmscriptenUiEvent *, void *)
@@ -511,10 +549,9 @@ EM_BOOL OnFocus(int eventType, const EmscriptenFocusEvent *, void *)
         g_pointerPositions.clear();
         InfernuxWebEndTextInput();
     }
-    PyObject *payload = PyDict_New();
-    SetDictBool(payload, "focused", eventType == EMSCRIPTEN_EVENT_FOCUS);
-    DispatchInput(eventType == EMSCRIPTEN_EVENT_FOCUS ? "focus" : "blur", payload);
-    Py_DECREF(payload);
+    QueueInput(eventType == EMSCRIPTEN_EVENT_FOCUS ? "focus" : "blur", [eventType](PyObject *payload) {
+        SetDictBool(payload, "focused", eventType == EMSCRIPTEN_EVENT_FOCUS);
+    });
     return EM_FALSE;
 }
 
@@ -528,11 +565,10 @@ EM_BOOL OnVisibility(int, const EmscriptenVisibilityChangeEvent *event, void *)
     } else if (g_runtimeActivated) {
         infernux::AudioEngine::Instance().ResumeAll();
     }
-    PyObject *payload = PyDict_New();
-    SetDictBool(payload, "hidden", event->hidden != 0);
-    SetDictInteger(payload, "state", event->visibilityState);
-    DispatchInput("visibility", payload);
-    Py_DECREF(payload);
+    QueueInput("visibility", [hidden = event->hidden, state = event->visibilityState](PyObject *payload) {
+        SetDictBool(payload, "hidden", hidden != 0);
+        SetDictInteger(payload, "state", state);
+    });
     return EM_FALSE;
 }
 
@@ -542,16 +578,15 @@ EM_BOOL OnKey(int eventType, const EmscriptenKeyboardEvent *event, void *)
         InfernuxWebUserActivation();
     infernux::InputManager::Instance().ProcessKeyEvent(infernux::web::BrowserCodeToScancode(event->code),
                                                        eventType == EMSCRIPTEN_EVENT_KEYDOWN);
-    PyObject *payload = PyDict_New();
-    SetDictString(payload, "key", event->key);
-    SetDictString(payload, "code", event->code);
-    SetDictBool(payload, "repeat", event->repeat != 0);
-    SetDictBool(payload, "ctrl", event->ctrlKey != 0);
-    SetDictBool(payload, "shift", event->shiftKey != 0);
-    SetDictBool(payload, "alt", event->altKey != 0);
-    SetDictBool(payload, "meta", event->metaKey != 0);
-    DispatchInput(eventType == EMSCRIPTEN_EVENT_KEYDOWN ? "key_down" : "key_up", payload);
-    Py_XDECREF(payload);
+    QueueInput(eventType == EMSCRIPTEN_EVENT_KEYDOWN ? "key_down" : "key_up", [key = *event](PyObject *payload) {
+        SetDictString(payload, "key", key.key);
+        SetDictString(payload, "code", key.code);
+        SetDictBool(payload, "repeat", key.repeat != 0);
+        SetDictBool(payload, "ctrl", key.ctrlKey != 0);
+        SetDictBool(payload, "shift", key.shiftKey != 0);
+        SetDictBool(payload, "alt", key.altKey != 0);
+        SetDictBool(payload, "meta", key.metaKey != 0);
+    });
     return EM_TRUE;
 }
 
@@ -628,12 +663,11 @@ EM_BOOL OnWheel(int, const EmscriptenWheelEvent *event, void *)
 {
     infernux::InputManager::Instance().ProcessScrollEvent(static_cast<float>(event->deltaX),
                                                           static_cast<float>(-event->deltaY));
-    PyObject *payload = PyDict_New();
-    SetDictNumber(payload, "delta_x", event->deltaX);
-    SetDictNumber(payload, "delta_y", event->deltaY);
-    SetDictInteger(payload, "delta_mode", event->deltaMode);
-    DispatchInput("wheel", payload);
-    Py_XDECREF(payload);
+    QueueInput("wheel", [dx = event->deltaX, dy = event->deltaY, mode = event->deltaMode](PyObject *payload) {
+        SetDictNumber(payload, "delta_x", dx);
+        SetDictNumber(payload, "delta_y", dy);
+        SetDictInteger(payload, "delta_mode", mode);
+    });
     return EM_TRUE;
 }
 
@@ -686,24 +720,23 @@ extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebPointerEvent(int eventKind, int 
     else
         g_pointerPositions[pointerId] = {normalizedX, normalizedY};
 
-    PyObject *payload = PyDict_New();
-    SetDictInteger(payload, "id", pointerId);
-    SetDictInteger(payload, "pointer_type", pointerType);
-    SetDictNumber(payload, "x", xPixels);
-    SetDictNumber(payload, "y", yPixels);
-    SetDictNumber(payload, "normalized_x", normalizedX);
-    SetDictNumber(payload, "normalized_y", normalizedY);
-    SetDictNumber(payload, "movement_x", movementXPixels);
-    SetDictNumber(payload, "movement_y", movementYPixels);
-    SetDictNumber(payload, "pressure", pressure);
-    SetDictNumber(payload, "contact_width", contactWidthPixels);
-    SetDictNumber(payload, "contact_height", contactHeightPixels);
-    SetDictInteger(payload, "button", button);
-    SetDictInteger(payload, "buttons", buttons);
-    SetDictBool(payload, "primary", isPrimary != 0);
     static constexpr const char *eventNames[] = {"pointer_down", "pointer_move", "pointer_up", "pointer_cancel"};
-    DispatchInput(eventKind >= 0 && eventKind < 4 ? eventNames[eventKind] : "pointer_move", payload);
-    Py_DECREF(payload);
+    QueueInput(eventKind >= 0 && eventKind < 4 ? eventNames[eventKind] : "pointer_move", [=](PyObject *payload) {
+        SetDictInteger(payload, "id", pointerId);
+        SetDictInteger(payload, "pointer_type", pointerType);
+        SetDictNumber(payload, "x", xPixels);
+        SetDictNumber(payload, "y", yPixels);
+        SetDictNumber(payload, "normalized_x", normalizedX);
+        SetDictNumber(payload, "normalized_y", normalizedY);
+        SetDictNumber(payload, "movement_x", movementXPixels);
+        SetDictNumber(payload, "movement_y", movementYPixels);
+        SetDictNumber(payload, "pressure", pressure);
+        SetDictNumber(payload, "contact_width", contactWidthPixels);
+        SetDictNumber(payload, "contact_height", contactHeightPixels);
+        SetDictInteger(payload, "button", button);
+        SetDictInteger(payload, "buttons", buttons);
+        SetDictBool(payload, "primary", isPrimary != 0);
+    });
 }
 
 void PollGamepads()
@@ -783,10 +816,9 @@ bool CreateRhiServices()
 extern "C" EMSCRIPTEN_KEEPALIVE void InfernuxWebTextInput(const char *text)
 {
     infernux::InputManager::Instance().ProcessTextInputEvent(text != nullptr ? text : "");
-    PyObject *payload = PyDict_New();
-    SetDictString(payload, "text", text);
-    DispatchInput("text_input", payload);
-    Py_DECREF(payload);
+    QueueInput("text_input", [value = std::string(text ? text : "")](PyObject *payload) {
+        SetDictString(payload, "text", value.c_str());
+    });
 }
 
 bool InitializePython()
@@ -897,11 +929,24 @@ void SubmitRayTexturePages()
     g_worldRayMaterials->FailPageBatch();
 }
 
-void Frame()
+double ServiceFrameWork()
 {
-    g_frameWork.BeginOpportunity();
-    infernux::SceneManager::Instance().BindRuntimeFrameWork(g_frameWork);
-    g_computeQueue->Collect();
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+    const bool pending = g_frameWork.AdvanceLate([] {
+        if (!g_lastForegroundSubmitted)
+            return infernux::FrameGpuAvailability::ForegroundDeferred;
+        g_computeQueue->Collect();
+        return g_computeQueue->GetPendingSubmissionCount() ? infernux::FrameGpuAvailability::BackgroundPending
+                                                           : infernux::FrameGpuAvailability::Ready;
+    });
+    if (pending && !g_acceptancePauseAfterFrame && !g_runtimeFrameFailed && g_frameWork.Remaining(true) <= 0)
+        return 1000.0 * infernux::SceneManager::Instance().PendingRuntimeServiceInterval().value_or(0.0f);
+#endif
+    return 0.0;
+}
+
+double Frame()
+{
     if (g_viewportDirty) {
         g_viewportDirty = false;
         ResizeCanvas();
@@ -964,7 +1009,7 @@ void Frame()
         }
     }
 #endif
-    const bool foregroundSubmitted = [] {
+    g_lastForegroundSubmitted = [] {
         auto *scene = infernux::SceneManager::Instance().GetActiveScene();
         const auto cameras = scene ? scene->GetActiveGameCameras(nullptr) : std::vector<infernux::Camera *>{};
         struct CapturedCamera
@@ -1348,17 +1393,13 @@ void Frame()
         return true;
     }();
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
-    if (foregroundSubmitted)
+    if (g_lastForegroundSubmitted)
         infernux::SceneManager::Instance().EmitRuntimeFrameBarrier(
             infernux::SceneManager::RuntimeFrameBarrier::RenderSubmitted);
-    g_frameWork.AdvanceLate([foregroundSubmitted] {
-        if (!foregroundSubmitted)
-            return infernux::FrameGpuAvailability::ForegroundDeferred;
-        g_computeQueue->Collect();
-        return g_computeQueue->GetPendingSubmissionCount() ? infernux::FrameGpuAvailability::BackgroundPending
-                                                           : infernux::FrameGpuAvailability::Ready;
-    });
-    if (foregroundSubmitted)
+#endif
+    const double delay = ServiceFrameWork();
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+    if (g_lastForegroundSubmitted)
         SubmitRayTexturePages();
     if (pauseAcceptanceAfterRender) {
         auto &sceneManager = infernux::SceneManager::Instance();
@@ -1370,6 +1411,7 @@ void Frame()
     }
 #endif
     infernux::InputManager::Instance().BeginFrame();
+    return delay;
 }
 
 void StartSurface()
@@ -1507,14 +1549,32 @@ extern "C" EMSCRIPTEN_KEEPALIVE void infernux_web_start()
     }
 }
 
-extern "C" EMSCRIPTEN_KEEPALIVE void infernux_web_frame()
+extern "C" EMSCRIPTEN_KEEPALIVE double infernux_web_frame(int present)
 {
     try {
-        Frame();
+        g_frameWork.BeginOpportunity();
+        while (!g_browserEvents.empty()) {
+            auto event = std::move(g_browserEvents.front());
+            g_browserEvents.pop_front();
+            event();
+        }
+        infernux::SceneManager::Instance().BindRuntimeFrameWork(g_frameWork);
+        g_computeQueue->Collect();
+        double delay;
+        if (present)
+            delay = Frame();
+        else {
+            // Resume only admitted work. Input, dt and render events are
+            // sampled once by Frame and retain their original World epoch.
+            g_frameWork.AdvanceEarly();
+            delay = ServiceFrameWork();
+        }
         g_frameWork.EndOpportunity();
+        return delay;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "INFERNUX_WEB_FRAME_FAILED %s\n", error.what());
         InfernuxWebAbortStartup(error.what());
+        return 0.0;
     }
 }
 
