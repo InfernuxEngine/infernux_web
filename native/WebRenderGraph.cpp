@@ -69,6 +69,8 @@ struct WebRenderGraph::Impl
     std::unordered_map<std::string, GraphTemporalHistory> histories;
     raytracing::RayHistoryWorldState rayHistoryWorld;
     std::shared_ptr<RenderGraphWorkStorage> workStorage;
+    std::array<std::shared_ptr<const rhi::BufferResource>, 2> workGeometry;
+    std::shared_ptr<const raytracing::RayWorldMaterialPublication> workMaterials;
     RenderGraphResults results;
     uint64_t historyEpoch = 0;
     uint32_t acceptedSampleIndex = 0;
@@ -218,6 +220,8 @@ struct WebRenderGraph::Impl
 
     void PrepareBuffers()
     {
+        workGeometry = {};
+        workMaterials.reset();
         if (std::all_of(graph->buffers.begin(), graph->buffers.end(),
                         [](const auto &buffer) { return buffer.HasFrameBuffer(); })) {
             workStorage.reset();
@@ -973,7 +977,7 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
                 auto pass = encoder.BeginComputePass();
                 WebGpuComputeCommandContext context;
                 auto commands = s.device.MakeComputeCommandEncoder(context, pass);
-                const auto &instance = *s.workStorage->instances.at(command->workBinding);
+                const auto &instance = *s.workStorage->passInstances.at(source.name);
                 for (const auto &dispatch : instance.GetDispatches())
                     if (!dispatch.RecordOne(commands))
                         throw std::runtime_error("Prepared graph work could not record: " + source.name);
@@ -1026,6 +1030,24 @@ void WebRenderGraph::Record(wgpu::CommandEncoder encoder, const FullscreenViewRe
     }
     s.RecordResolves(encoder, s.finalResolves);
     s.PublishOutput(encoder, Output());
+}
+
+void WebRenderGraph::PrepareWorkReads(
+    const raytracing::RayWorldGeometryBinding &rays,
+    const std::shared_ptr<const raytracing::RayWorldMaterialPublication> &materials)
+{
+    auto &s = *m_impl;
+    if (!s.workStorage)
+        return;
+    const std::array geometry{rays.buffer, rays.meshes};
+    if (!s.workStorage->passInstances.empty() && s.workGeometry == geometry && s.workMaterials == materials)
+        return;
+    auto next = std::make_shared<RenderGraphWorkStorage>(*s.workStorage);
+    if (!BindRenderGraphWorkReads(*s.graph, *next, WorldRayGraphReadPublications(*s.graph, geometry, materials)))
+        throw std::logic_error("Graph compute requires its acquired World read publications");
+    s.workGeometry = geometry;
+    s.workMaterials = materials;
+    s.workStorage = std::move(next);
 }
 
 std::shared_ptr<void> WebRenderGraph::RetainWorkStorage() const

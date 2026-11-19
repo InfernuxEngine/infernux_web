@@ -1272,6 +1272,7 @@ double Frame()
             g_sceneRenderer.RecordPreparation(encoder);
             const auto resources = g_sceneRenderer.FullscreenView();
             state.viewGlobals = resources.globals.buffer;
+            state.graph->PrepareWorkReads(capture.worldRayGeometry, capture.worldRayMaterials);
             std::optional<PresentedCamera> presented;
             const auto record = [&] {
                 state.graph->Record(

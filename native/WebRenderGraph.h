@@ -58,6 +58,8 @@ class WebRenderGraph final
                std::shared_ptr<const rhi::RenderTextureGeneration> output = {}, const glm::vec4 &rect = {0, 0, 1, 1},
                bool sampleParticleDepth = false);
     void UpdateParameters(const std::vector<GraphParameterBlockUpdate> &updates);
+    void PrepareWorkReads(const raytracing::RayWorldGeometryBinding &rays,
+                          const std::shared_ptr<const raytracing::RayWorldMaterialPublication> &materials);
     void Record(wgpu::CommandEncoder encoder, const FullscreenViewResources &view,
                 const raytracing::RayWorldGeometryBinding &rays,
                 const raytracing::RayWorldMaterialPublication *worldRayMaterials,
