@@ -982,6 +982,7 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     globals.viewOptions =
         MakeViewOptions(view.dithering, view.stopNaNs, true, graph.AcceptedRayGeometry(), graph.AcceptedSampleIndex(),
                         resources.acceptedView ? s.preparedJitter - resources.previousJitter : glm::vec2(0.0f));
+    globals.viewOptions.x |= graph.RayViewFlags();
     s.Uniform(s.current->globals, globals);
     s.PrepareLighting(view, {visible, plan.draws});
     const auto &buffers = graph.Description().buffers;
