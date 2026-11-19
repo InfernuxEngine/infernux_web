@@ -323,6 +323,7 @@ def _install_platform_runtime_api(native_module: Any) -> None:
         "Component",
         "Space",
         "PrimitiveType",
+        "PhysicsBackend",
         "LineAlignment",
         "LineTextureMode",
         "LineGradientMode",
