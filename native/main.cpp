@@ -213,6 +213,7 @@ struct CameraGraph
     std::shared_ptr<const infernux::RenderGraphDescription> description;
     std::shared_ptr<const infernux::RenderViewPlan> pendingRayPlan;
     uint64_t pendingRayPlayEpoch = 0;
+    uint64_t pendingRayStepFrame = 0;
     std::shared_ptr<const infernux::raytracing::RayWorldGeometryPublication> rayPublication;
     std::shared_ptr<const infernux::ShaderTargetCode> rayMaterialCode;
     std::shared_ptr<const infernux::raytracing::RayWorldMaterialRequest> rayMaterialRequest;
@@ -232,6 +233,24 @@ struct CameraSubmission
     infernux::raytracing::RayTailCacheBinding tail;
 };
 std::unordered_map<uint64_t, CameraGraph> g_cameraGraphs;
+struct StepScreenSubmission
+{
+    uint64_t world, epoch, frame;
+    infernux::rhi::SubmissionTicket ticket{};
+};
+std::optional<StepScreenSubmission> g_stepScreen;
+
+void FinishScreenStep(const StepScreenSubmission &sample)
+{
+    auto &manager = infernux::SceneManager::Instance();
+    auto *world = manager.FindRuntimeWorld(sample.world);
+    if (world && world->simulation.simulationEpoch == sample.epoch &&
+        world->simulation.runtimeFrameCount == sample.frame) {
+        const infernux::WorldExecutionScope scope(world);
+        manager.FinishStepPresentation(true);
+    }
+}
+
 std::unordered_map<uint64_t, uint64_t> g_mainCameraViews;
 infernux::web::WebGraphServices g_graphServices;
 std::unordered_map<uint64_t, std::shared_ptr<infernux::rhi::RenderTexture>> g_screenTargets;
@@ -1069,8 +1088,15 @@ double Frame()
     }
 #endif
     g_lastForegroundSubmitted = [] {
-        auto *scene = infernux::SceneManager::Instance().GetActiveScene();
+        auto &manager = infernux::SceneManager::Instance();
+        auto *scene = manager.GetActiveScene();
         const auto cameras = scene ? scene->GetActiveGameCameras(nullptr) : std::vector<infernux::Camera *>{};
+        std::optional<StepScreenSubmission> step;
+        const auto *primary = manager.GetPrimaryRuntimeWorld();
+        if (!g_stepScreen && primary && primary->simulation.stepFrameOpen && !primary->simulation.pausedStepPending &&
+            !g_splashActive && !g_webGpuValidationFailed)
+            step = StepScreenSubmission{primary->id, primary->simulation.simulationEpoch,
+                                        primary->simulation.runtimeFrameCount};
         struct CapturedCamera
         {
             infernux::Camera *camera;
@@ -1080,6 +1106,7 @@ double Frame()
             infernux::raytracing::RayWorldGeometryBinding worldRayGeometry;
             std::shared_ptr<const infernux::raytracing::RayWorldMaterialPublication> worldRayMaterials;
             infernux::raytracing::RayTailCacheBinding tail;
+            uint64_t stepFrame = 0;
         };
         std::vector<CapturedCamera> captured;
         std::vector<infernux::RenderViewAccess> accesses;
@@ -1087,6 +1114,7 @@ double Frame()
         captured.reserve(cameras.size());
         accesses.reserve(cameras.size());
         bool selectedScreen = false;
+        size_t requiredStepViews = 0;
         g_mainCameraViews.clear();
         for (auto *camera : cameras) {
             if (g_splashActive || g_webGpuValidationFailed)
@@ -1099,6 +1127,9 @@ double Frame()
             auto plan = previous != g_cameraGraphs.end() ? previous->second.pendingRayPlan : nullptr;
             if (plan && (plan->world->WorldId() != sourceWorld || previous->second.pendingRayPlayEpoch != playEpoch))
                 plan.reset();
+            const auto stepFrame =
+                plan ? previous->second.pendingRayStepFrame
+                     : (step && step->world == sourceWorld && step->epoch == playEpoch ? step->frame : 0);
             if (!plan)
                 plan = g_sceneRenderer.Capture(g_width, g_height, *camera, *g_renderPipeline, *g_fullscreenPipelines);
             // Camera previews deliberately carry epoch zero. Retain the live
@@ -1120,6 +1151,8 @@ double Frame()
             }
             const auto &cameraView = *plan->view;
             selectedScreen |= !cameraView.outputGeneration;
+            if (step && !cameraView.outputGeneration)
+                ++requiredStepViews;
             if (cameraView.isMainCamera)
                 g_mainCameraViews.insert_or_assign(plan->world->WorldId(), cameraView.cameraId);
             else if (!cameraView.outputGeneration)
@@ -1223,6 +1256,7 @@ double Frame()
                 // its outstanding preparation can be submitted.
                 state.pendingRayPlan = rays.pending || materials.pending ? plan : nullptr;
                 state.pendingRayPlayEpoch = state.pendingRayPlan ? playEpoch : 0;
+                state.pendingRayStepFrame = stepFrame;
                 infernux::RenderViewAccess access;
                 access.viewId = graphView.id;
                 access.admitted = false;
@@ -1282,13 +1316,16 @@ double Frame()
                 tail = g_worldRayTailCache->Acquire(plan->world, rays, materials.value, writer, state.rayTailRequest);
             } else
                 state.rayTailRequest.reset();
-            captured.push_back({camera, plan, &state, playEpoch, std::move(rays), std::move(materials.value), std::move(tail)});
+            captured.push_back({camera, plan, &state, playEpoch, std::move(rays), std::move(materials.value),
+                                std::move(tail), stepFrame});
         }
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
         if (!selectedScreen)
             g_playerStartupClock.waiting = false;
 #endif
         const auto schedule = infernux::RenderViewSchedule::Build(accesses);
+        if (step && !selectedScreen)
+            FinishScreenStep(*step);
 
         // Author callbacks can suspend while preparing the graph. Acquire the canvas texture
         // only for the native recording and submission that follow them.
@@ -1429,6 +1466,8 @@ double Frame()
                 g_queue.Submit(1, &commands);
             }
             state.graph->AcceptHistory();
+            if (step && !output && capture.stepFrame == step->frame && capture.playEpoch == step->epoch)
+                --requiredStepViews;
             g_sceneRenderer.AcceptView();
             state.presented = std::move(presented);
             state.pendingRayPlan.reset();
@@ -1481,8 +1520,14 @@ double Frame()
                 ++entry;
         }
         g_screenUIRenderer.PruneUnusedMaterials();
-        wgpu::CommandBuffer commands = encoder.Finish();
-        g_queue.Submit(1, &commands);
+        // Repeating the previous picture during preparation cannot complete a new logical Step.
+        if (step && selectedScreen && requiredStepViews == 0) {
+            step->ticket = g_computeQueue->SubmitGraphics([&] { return encoder.Finish(); }, {});
+            g_stepScreen = *step;
+        } else {
+            wgpu::CommandBuffer commands = encoder.Finish();
+            g_queue.Submit(1, &commands);
+        }
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
         if (g_playerStartupClock.waiting && startupScreenPresented) {
             // Browser WebGPU presents this canvas when the RAF turn returns.
@@ -1664,6 +1709,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE double infernux_web_frame(int present)
         }
         infernux::SceneManager::Instance().BindRuntimeFrameWork(g_frameWork);
         g_computeQueue->Collect();
+        if (g_stepScreen && g_computeQueue->IsComplete(g_stepScreen->ticket)) {
+            FinishScreenStep(*g_stepScreen);
+            g_stepScreen.reset();
+        }
         double delay;
         if (present)
             delay = Frame();
