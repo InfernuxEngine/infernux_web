@@ -245,11 +245,7 @@ struct WebSceneRenderer::Impl
             lightView.previousViewProj = shadow.viewProjection;
             lightView.inverseViewProj = glm::inverse(shadow.viewProjection);
             Uniform(resources.shadowCameras[i], lightView);
-            lighting::ShadowPassParameters parameters;
-            parameters.lightVector = glm::vec4(shadow.lightVector, shadow.lightVectorIsPosition ? 1.0f : 0.0f);
-            parameters.bias = {shadow.depthBiasTexels, shadow.normalBiasTexels, shadow.worldUnitsPerTexel,
-                               shadow.farPlane};
-            Uniform(resources.shadowParameters[i], parameters);
+            Uniform(resources.shadowParameters[i], shadow.PassParameters());
         }
     }
 
