@@ -38,6 +38,11 @@ class WebRenderGraph final
 {
   public:
     using Texture = std::shared_ptr<const rhi::TextureResource>;
+    struct ViewAttachments
+    {
+        Texture depth, shadowAtlas, transparentLayer;
+        uint32_t shadowResolution = 0;
+    };
     using ImportTexture = std::function<Texture(const GraphTextureDesc &)>;
     using RecordRaster =
         std::function<void(wgpu::RenderPassEncoder, const GraphCommandDesc &, const rhi::RasterPassDescription &,
@@ -70,7 +75,7 @@ class WebRenderGraph final
     [[nodiscard]] uint32_t AcceptedRayGeometry() const noexcept;
     [[nodiscard]] const RenderGraphDescription &Description() const noexcept;
     [[nodiscard]] Texture GetTexture(const std::string &name) const;
-    [[nodiscard]] Texture TransparentLayer() const noexcept;
+    [[nodiscard]] const ViewAttachments &GetViewAttachments() const noexcept;
     [[nodiscard]] Texture Output() const;
     [[nodiscard]] const std::vector<uint32_t> &ExecutionOrder() const noexcept;
     [[nodiscard]] RenderViewAccess GetResourceAccess(const std::vector<MaterialTextureRead> &materialReads = {}) const;

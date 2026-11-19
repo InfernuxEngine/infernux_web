@@ -65,7 +65,7 @@ struct WebRenderGraph::Impl
     std::shared_ptr<const RenderGraphDescription> graph;
     std::unordered_map<std::string, Texture> textures;
     std::unordered_map<std::string, Texture> resolved;
-    Texture transparentLayer;
+    ViewAttachments viewAttachments;
     std::unordered_map<std::string, GraphTemporalHistory> histories;
     raytracing::RayHistoryWorldState rayHistoryWorld;
     std::shared_ptr<RenderGraphWorkStorage> workStorage;
@@ -254,7 +254,7 @@ struct WebRenderGraph::Impl
         return cameraClear && cameraClear->name == pass.name ? *cameraClear : pass;
     }
 
-    void CompileSchedule()
+    void CompileSchedule(const GraphTextureDesc *shadowAtlas)
     {
         RenderGraphIdentitySource identity;
         std::unordered_map<std::string, uint32_t> resources;
@@ -302,7 +302,6 @@ struct WebRenderGraph::Impl
         for (const auto &buffer : graph->buffers)
             if (buffer.exportLayout)
                 addInput(buffer.name, liveBufferInputs);
-        const auto *shadowCaster = FindViewShadowCaster(*graph);
         for (size_t index = 0; index < graph->passes.size(); ++index) {
             const auto &source = EffectivePass(index);
             auto &pass = declarations[index];
@@ -333,8 +332,8 @@ struct WebRenderGraph::Impl
                     read(access.resource);
             }
             if (const auto *command = source.PrimaryCommand()) {
-                if (shadowCaster && ReadsViewShadow(*command))
-                    read(shadowCaster->writeDepth);
+                if (shadowAtlas && ReadsViewShadow(*command))
+                    read(shadowAtlas->name);
                 for (const auto &[name, resource] : command->inputBindings)
                     read(resource);
                 if (!command->sourceResource.empty())
@@ -787,6 +786,7 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
     s.cameraClearIndex = SIZE_MAX;
     s.passes.clear();
     s.textures.clear();
+    s.viewAttachments = {};
     s.resolved.clear();
     s.colorResolves.clear();
     s.finalResolves.clear();
@@ -814,16 +814,22 @@ bool WebRenderGraph::Apply(std::shared_ptr<const RenderGraphDescription> graph, 
                 throw std::invalid_argument("Missing imported graph texture: " + description.name);
             texture = s.Allocate(description, view);
         }
+        if (description.IsViewDepth())
+            s.viewAttachments.depth = texture;
         s.textures.emplace(description.name, std::move(texture));
     }
     s.PrepareBuffers();
-    s.CompileSchedule();
-    s.transparentLayer.reset();
+    const auto *shadowAtlas = FindViewShadowAtlas(*s.graph);
+    if (shadowAtlas) {
+        s.viewAttachments.shadowAtlas = s.textures.at(shadowAtlas->name);
+        s.viewAttachments.shadowResolution = shadowAtlas->ResolveExtent(s.width, s.height).first;
+    }
+    s.CompileSchedule(shadowAtlas);
     for (const auto index : s.order) {
         const auto *command = s.graph->passes[index].PrimaryCommand();
         const auto name = command ? command->TransparentLayer() : std::string_view{};
         if (!name.empty()) {
-            s.transparentLayer = s.textures.at(std::string(name));
+            s.viewAttachments.transparentLayer = s.textures.at(std::string(name));
             break;
         }
     }
@@ -1091,9 +1097,9 @@ WebRenderGraph::Texture WebRenderGraph::GetTexture(const std::string &name) cons
 {
     return m_impl->textures.at(name);
 }
-WebRenderGraph::Texture WebRenderGraph::TransparentLayer() const noexcept
+const WebRenderGraph::ViewAttachments &WebRenderGraph::GetViewAttachments() const noexcept
 {
-    return m_impl->transparentLayer;
+    return m_impl->viewAttachments;
 }
 WebRenderGraph::Texture WebRenderGraph::Output() const
 {

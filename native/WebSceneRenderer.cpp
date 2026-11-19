@@ -889,7 +889,8 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     s.height = view.pixelHeight;
     const uint32_t width = s.width, height = s.height;
     auto &resources = *s.current;
-    resources.transparentLayer = graph.TransparentLayer();
+    const auto &attachments = graph.GetViewAttachments();
+    resources.transparentLayer = attachments.transparentLayer;
     const bool newGraph = resources.graph != plan.graph;
     if (newGraph) {
         const bool topologyChanged = !resources.graph || !RenderGraphTopologyEquals(*resources.graph, *plan.graph);
@@ -912,16 +913,9 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     }
     if (resources.useMotion)
         resources.motion.BeginFrame();
-    s.shadowResolution = 0;
-    s.depth.reset();
-    resources.shadow.reset();
-    for (const auto &texture : graph.Description().textures)
-        if (texture.IsViewDepth())
-            s.depth = graph.GetTexture(texture.name);
-    if (const auto *caster = FindViewShadowCaster(graph.Description())) {
-        resources.shadow = graph.GetTexture(caster->writeDepth);
-        s.shadowResolution = ResolveGraphPassExtent(*plan.graph, *caster, width, height).first;
-    }
+    s.depth = attachments.depth;
+    s.shadowResolution = attachments.shadowResolution;
+    resources.shadow = attachments.shadowAtlas;
     if (!resources.shadow) {
         if (!s.defaultShadow)
             s.defaultShadow = s.Attachment(1, 1, 1, true);
