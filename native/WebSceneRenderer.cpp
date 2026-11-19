@@ -6,6 +6,7 @@
 #include "WebTextureUpload.h"
 #include <function/renderer/RendererSelection.h>
 #include <function/renderer/lighting/ForwardPlusLightGrid.h>
+#include <function/renderer/lighting/ViewLighting.h>
 #include <function/renderer/shader/BuiltinSceneProgram.h>
 
 #include <core/math/DepthConvention.h>
@@ -119,7 +120,6 @@ struct WebSceneRenderer::Impl
     std::shared_ptr<const RenderViewData> view;
     rhi::RenderTextureRegistry renderTextures;
     uint32_t outputWidth = 1, outputHeight = 1;
-    SceneLightCollector lights;
     std::shared_ptr<const lighting::ForwardPlusGridPipeline> gridProgram;
     Buffer dummy;
     std::vector<glm::mat4> modelValues, boneValues;
@@ -162,6 +162,8 @@ struct WebSceneRenderer::Impl
     struct ViewResources
     {
         Buffer camera, globals, lighting, canonicalLights, models, skins, bones, instances;
+        lighting::ViewLighting viewLighting;
+        uint64_t canonicalGeneration = 0;
         std::shared_ptr<const rhi::BufferResource> surfaceRecords;
         std::vector<Buffer> shadowCameras, shadowParameters;
         Texture shadow;
@@ -215,6 +217,40 @@ struct WebSceneRenderer::Impl
         }
         device->Release(viewLayout);
         device->Release(partitionViewLayout);
+    }
+
+    void PrepareLighting(const RenderViewData &view,
+                         std::initializer_list<lighting::ViewLighting::ReceiverList> receivers)
+    {
+        auto &resources = *current;
+        if (!resources.viewLighting.Prepare(frame->Lighting(), view, shadowsEnabled ? shadowResolution : 0, receivers))
+            return;
+
+        const auto &lights = resources.viewLighting.Lights();
+        Uniform(resources.lighting, lights.GetShaderLightingUBO());
+        const auto &snapshot = lights.GetCanonicalLightSnapshot();
+        if (snapshot.generation != resources.canonicalGeneration) {
+            const auto upload = lighting::BuildCanonicalLightUpload(snapshot);
+            Upload(resources.canonicalLights, upload.bytes.data(), upload.bytes.size(), rhi::BufferUsageFlags::Storage);
+            resources.canonicalGeneration = snapshot.generation;
+        }
+        const auto &shadows = lights.GetShadowFrame();
+        resources.shadowCameras.resize(shadows.views.size());
+        resources.shadowParameters.resize(shadows.views.size());
+        for (size_t i = 0; i < shadows.views.size(); ++i) {
+            const auto &shadow = shadows.views[i];
+            UniformBufferObject lightView{};
+            lightView.model = lightView.view = glm::mat4(1);
+            lightView.proj = shadow.viewProjection;
+            lightView.previousViewProj = shadow.viewProjection;
+            lightView.inverseViewProj = glm::inverse(shadow.viewProjection);
+            Uniform(resources.shadowCameras[i], lightView);
+            lighting::ShadowPassParameters parameters;
+            parameters.lightVector = glm::vec4(shadow.lightVector, shadow.lightVectorIsPosition ? 1.0f : 0.0f);
+            parameters.bias = {shadow.depthBiasTexels, shadow.normalBiasTexels, shadow.worldUnitsPerTexel,
+                               shadow.farPlane};
+            Uniform(resources.shadowParameters[i], parameters);
+        }
     }
 
     void PrepareFullscreenView()
@@ -959,13 +995,7 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
         MakeViewOptions(view.dithering, view.stopNaNs, true, graph.AcceptedRayGeometry(), graph.AcceptedSampleIndex(),
                         resources.acceptedView ? s.preparedJitter - resources.previousJitter : glm::vec2(0.0f));
     s.Uniform(s.current->globals, globals);
-    s.lights.CollectLights(*s.frame->Lighting(), view.position);
-    s.lights.ComputeShadowVP(*s.frame->Lighting(), view, s.shadowsEnabled ? s.shadowResolution : 0);
-    s.lights.BuildShaderLightingUBO();
-    s.Uniform(s.current->lighting, s.lights.GetShaderLightingUBO());
-    const auto canonical = lighting::BuildCanonicalLightUpload(s.lights.GetCanonicalLightSnapshot());
-    s.Upload(s.current->canonicalLights, canonical.bytes.data(), canonical.bytes.size(),
-             rhi::BufferUsageFlags::Storage);
+    s.PrepareLighting(view, {visible, plan.draws});
     const auto &buffers = graph.Description().buffers;
     if (std::any_of(buffers.begin(), buffers.end(),
                     [](const auto &buffer) { return buffer.frameBuffer == GraphFrameBuffer::WorldSurfaces; })) {
@@ -986,7 +1016,8 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
             if (!s.current->grid->Initialize(s.gridProgram, 1))
                 throw std::runtime_error("Forward+ view initialization failed");
         }
-        if (!s.current->grid->PrepareFrame(0, width, height, canonical.header.countsAndGeneration.y,
+        const auto localCount = resources.viewLighting.Lights().GetCanonicalLightSnapshot().localLights.size();
+        if (!s.current->grid->PrepareFrame(0, width, height, static_cast<uint32_t>(localCount),
                                            CanonicalLightAffectsGeometry, s.current->canonicalLights->GetBuffer()))
             throw std::runtime_error("Forward+ view preparation failed");
         for (const auto &retired : s.current->grid->TakeRetiredResources()) {
@@ -997,22 +1028,6 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
         }
     }
     s.PrepareFullscreenView();
-    const auto &shadows = s.lights.GetShadowFrame();
-    s.current->shadowCameras.resize(shadows.views.size());
-    s.current->shadowParameters.resize(shadows.views.size());
-    for (size_t i = 0; i < shadows.views.size(); ++i) {
-        const auto &shadow = shadows.views[i];
-        UniformBufferObject lightView{};
-        lightView.model = lightView.view = glm::mat4(1);
-        lightView.proj = shadow.viewProjection;
-        lightView.previousViewProj = shadow.viewProjection;
-        lightView.inverseViewProj = glm::inverse(shadow.viewProjection);
-        s.Uniform(s.current->shadowCameras[i], lightView);
-        lighting::ShadowPassParameters parameters;
-        parameters.lightVector = glm::vec4(shadow.lightVector, shadow.lightVectorIsPosition ? 1.0f : 0.0f);
-        parameters.bias = {shadow.depthBiasTexels, shadow.normalBiasTexels, shadow.worldUnitsPerTexel, shadow.farPlane};
-        s.Uniform(s.current->shadowParameters[i], parameters);
-    }
 }
 
 void WebSceneRenderer::AcceptView()
@@ -1091,7 +1106,7 @@ void WebSceneRenderer::Record(wgpu::RenderPassEncoder pass, const GraphCommandDe
     WebGpuGraphicsCommandContext context;
     const auto commands = s.device->MakeGraphicsCommandEncoder(context, pass);
     if (shadow) {
-        const auto &shadows = s.lights.GetShadowFrame();
+        const auto &shadows = s.current->viewLighting.Lights().GetShadowFrame();
         for (uint32_t index = 0; index < shadows.views.size(); ++index) {
             const auto &light = shadows.views[index];
             const auto &rect = light.atlas;
