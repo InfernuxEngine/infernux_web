@@ -918,12 +918,10 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     for (const auto &texture : graph.Description().textures)
         if (texture.IsViewDepth())
             s.depth = graph.GetTexture(texture.name);
-    for (const auto &pass : graph.Description().passes)
-        for (const auto &command : pass.commands)
-            if (command.type == GraphCommandType::DrawShadowCasters) {
-                s.current->shadow = graph.GetTexture(pass.writeDepth);
-                s.shadowResolution = ResolveGraphPassExtent(*plan.graph, pass, width, height).first;
-            }
+    if (const auto *caster = FindViewShadowCaster(graph.Description())) {
+        resources.shadow = graph.GetTexture(caster->writeDepth);
+        s.shadowResolution = ResolveGraphPassExtent(*plan.graph, *caster, width, height).first;
+    }
     if (!resources.shadow) {
         if (!s.defaultShadow)
             s.defaultShadow = s.Attachment(1, 1, 1, true);

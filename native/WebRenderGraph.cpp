@@ -302,7 +302,7 @@ struct WebRenderGraph::Impl
         for (const auto &buffer : graph->buffers)
             if (buffer.exportLayout)
                 addInput(buffer.name, liveBufferInputs);
-        const auto shadow = ResolveGraphShadowTexture(*graph);
+        const auto *shadowCaster = FindViewShadowCaster(*graph);
         for (size_t index = 0; index < graph->passes.size(); ++index) {
             const auto &source = EffectivePass(index);
             auto &pass = declarations[index];
@@ -333,8 +333,8 @@ struct WebRenderGraph::Impl
                     read(access.resource);
             }
             if (const auto *command = source.PrimaryCommand()) {
-                if (!shadow.empty() && command->fullscreenProgram && command->fullscreenProgram->UsesViewBinding(0))
-                    read(shadow);
+                if (shadowCaster && ReadsViewShadow(*command))
+                    read(shadowCaster->writeDepth);
                 for (const auto &[name, resource] : command->inputBindings)
                     read(resource);
                 if (!command->sourceResource.empty())
