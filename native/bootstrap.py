@@ -362,6 +362,8 @@ def _install_platform_runtime_api(native_module: Any) -> None:
         "WaitWhile": coroutine_module.WaitWhile,
         "batch_read": batch_module.batch_read,
         "batch_write": batch_module.batch_write,
+        "create_batch_handle": batch_module.create_batch_handle,
+        "create_component_batch_handle": batch_module.create_component_batch_handle,
         "Instantiate": instantiate_module.Instantiate,
         "Destroy": instantiate_module.Destroy,
         **core_exports,
