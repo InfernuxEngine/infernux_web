@@ -15,6 +15,7 @@
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
 #include <function/resources/AssetRegistry/AssetRegistry.h>
 #include <function/scene/Camera.h>
+#include <function/scene/GameObject.h>
 #include <function/scene/Scene.h>
 #include <function/scene/SceneManager.h>
 #include <function/scene/physics/PhysicsWorld.h>
@@ -72,6 +73,13 @@ EM_JS(double, InfernuxWebAcceptancePauseFrame, (), {
 
 EM_JS(int, InfernuxWebForceFallbackAdapter, (), {
     return new URLSearchParams(globalThis.location.search).get("infernuxWebGpuAdapter") === "fallback" ? 1 : 0;
+});
+
+EM_JS(int, InfernuxWebHasVisibleCanvas, (), {
+    const canvas = document.getElementById("canvas");
+    if (document.hidden || !canvas) return 0;
+    const bounds = canvas.getBoundingClientRect();
+    return bounds.width > 0 && bounds.height > 0 && getComputedStyle(canvas).visibility !== "hidden" ? 1 : 0;
 });
 
 EM_JS(int, InfernuxWebFixedCanvasWidth, (), {
@@ -204,6 +212,7 @@ struct CameraGraph
     std::shared_ptr<const infernux::RenderGraphDescription> source;
     std::shared_ptr<const infernux::RenderGraphDescription> description;
     std::shared_ptr<const infernux::RenderViewPlan> pendingRayPlan;
+    uint64_t pendingRayPlayEpoch = 0;
     std::shared_ptr<const infernux::raytracing::RayWorldGeometryPublication> rayPublication;
     std::shared_ptr<const infernux::ShaderTargetCode> rayMaterialCode;
     std::shared_ptr<const infernux::raytracing::RayWorldMaterialRequest> rayMaterialRequest;
@@ -264,6 +273,51 @@ std::deque<std::function<void()>> g_browserEvents;
 double g_acceptanceFixedDeltaSeconds = 0.0;
 uint64_t g_acceptancePauseAfterFrame = 0;
 bool g_acceptancePaused = false;
+
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+struct PlayerStartupClock
+{
+    uint64_t world = 0, epoch = 0;
+    bool waiting = false;
+    double presentedAtMilliseconds = 0.0;
+} g_playerStartupClock;
+
+std::optional<float> PreparePlayerStartupClock(bool explicitDelta, double sampledAtMilliseconds)
+{
+    auto &manager = infernux::SceneManager::Instance();
+    auto &world = manager.CurrentWorld();
+    const auto &simulation = world.simulation;
+    auto &clock = g_playerStartupClock;
+    if (clock.world != world.id || clock.epoch != simulation.simulationEpoch)
+        clock = {world.id, simulation.simulationEpoch,
+                 simulation.isPlaying && simulation.frameTime.unscaledTime == 0.0 &&
+                     simulation.fixedStepIndex == 0};
+    if (!clock.waiting && !clock.presentedAtMilliseconds)
+        return std::nullopt;
+    const auto &handle = world.handle;
+    if (explicitDelta || !simulation.isPlaying || simulation.isPaused || simulation.fixedStepIndex != 0 ||
+        !InfernuxWebHasVisibleCanvas() || (handle && !handle->displayInGame)) {
+        clock.waiting = false;
+        clock.presentedAtMilliseconds = 0.0;
+        return std::nullopt;
+    }
+    if (clock.presentedAtMilliseconds) {
+        const float delta = float((sampledAtMilliseconds - clock.presentedAtMilliseconds) / 1000.0);
+        clock.presentedAtMilliseconds = 0.0;
+        return std::max(0.0f, delta);
+    }
+    const infernux::WorldExecutionScope scope(&world);
+    const auto *scene = world.scenes.active;
+    const auto cameras = scene ? scene->GetActiveGameCameras(nullptr) : std::vector<infernux::Camera *>{};
+    if (!std::any_of(cameras.begin(), cameras.end(), [](const auto *camera) {
+            return !camera->GetRenderToTexture() && camera->GetPixelWidth() && camera->GetPixelHeight();
+        })) {
+        clock.waiting = false;
+        return std::nullopt;
+    }
+    return 0.0f;
+}
+#endif
 
 bool ConfigureAcceptanceClock()
 {
@@ -998,7 +1052,9 @@ double Frame()
         // SceneManager applies the project's maximum delta and time scale.
         // A second browser-specific cap would change authored simulation time.
         const float delta = static_cast<float>(deltaSeconds);
-        sceneManager.ServiceRuntimeFrames(g_frameWork, delta, acceptanceClockEnabled);
+        const auto startupDelta = PreparePlayerStartupClock(acceptanceClockEnabled, frameTimeMilliseconds);
+        sceneManager.ServiceRuntimeFrames(g_frameWork, delta, acceptanceClockEnabled,
+                                          startupDelta ? g_playerStartupClock.world : 0, startupDelta.value_or(0.0f));
         if (acceptanceClockEnabled && sceneManager.IsPlaying()) {
             const uint64_t frame = sceneManager.GetRuntimeFrameCount();
             if (frame > g_acceptancePauseAfterFrame) {
@@ -1020,6 +1076,7 @@ double Frame()
             infernux::Camera *camera;
             std::shared_ptr<const infernux::RenderViewPlan> plan;
             CameraGraph *state;
+            uint64_t playEpoch;
             infernux::raytracing::RayWorldGeometryBinding worldRayGeometry;
             std::shared_ptr<const infernux::raytracing::RayWorldMaterialPublication> worldRayMaterials;
             infernux::raytracing::RayTailCacheBinding tail;
@@ -1029,14 +1086,28 @@ double Frame()
         std::unordered_map<uint64_t, infernux::rhi::SampleCount> screenSamples;
         captured.reserve(cameras.size());
         accesses.reserve(cameras.size());
+        bool selectedScreen = false;
         g_mainCameraViews.clear();
         for (auto *camera : cameras) {
             if (g_splashActive || g_webGpuValidationFailed)
                 break;
             const auto previous = g_cameraGraphs.find(camera->GetComponentID());
+            const auto *object = camera->GetGameObject();
+            const auto *owner = object && object->GetScene() ? object->GetScene()->GetRuntimeWorld() : nullptr;
+            const uint64_t sourceWorld = owner ? owner->id : 0;
+            uint64_t playEpoch = owner ? owner->simulation.simulationEpoch : 0;
             auto plan = previous != g_cameraGraphs.end() ? previous->second.pendingRayPlan : nullptr;
+            if (plan && (plan->world->WorldId() != sourceWorld || previous->second.pendingRayPlayEpoch != playEpoch))
+                plan.reset();
             if (!plan)
                 plan = g_sceneRenderer.Capture(g_width, g_height, *camera, *g_renderPipeline, *g_fullscreenPipelines);
+            // Camera previews deliberately carry epoch zero. Retain the live
+            // camera owner's Play identity alongside this exact captured plan.
+            const auto *currentOwner = infernux::SceneManager::Instance().FindRuntimeWorld(sourceWorld);
+            if (plan->world->WorldId() != sourceWorld || !currentOwner || !currentOwner->simulation.isPlaying ||
+                currentOwner->simulation.simulationEpoch != playEpoch ||
+                (currentOwner->handle && currentOwner->handle->destroyRequested))
+                playEpoch = 0;
             if (plan->state == infernux::RenderViewPlanState::Skipped)
                 continue;
             if (!plan->graph)
@@ -1048,6 +1119,7 @@ double Frame()
                     *g_rhi, g_fullscreenHost, g_computeHost.get(), g_fullscreenPipelines);
             }
             const auto &cameraView = *plan->view;
+            selectedScreen |= !cameraView.outputGeneration;
             if (cameraView.isMainCamera)
                 g_mainCameraViews.insert_or_assign(plan->world->WorldId(), cameraView.cameraId);
             else if (!cameraView.outputGeneration)
@@ -1150,6 +1222,7 @@ double Frame()
                 // Keep geometry and materials on the same captured World until
                 // its outstanding preparation can be submitted.
                 state.pendingRayPlan = rays.pending || materials.pending ? plan : nullptr;
+                state.pendingRayPlayEpoch = state.pendingRayPlan ? playEpoch : 0;
                 infernux::RenderViewAccess access;
                 access.viewId = graphView.id;
                 access.admitted = false;
@@ -1167,7 +1240,7 @@ double Frame()
                         infernux::ResolveGraphTextureAttachment(*texture.renderTextureGeneration, texture.attachment));
                 }
                 accesses.push_back(std::move(access));
-                captured.push_back({camera, plan, &state, {}, {}});
+                captured.push_back({camera, plan, &state, playEpoch, {}, {}});
                 continue;
             }
             const bool sampleParticleDepth =
@@ -1192,6 +1265,12 @@ double Frame()
             state.graph->UpdateParameters(plan->parameters);
             auto access =
                 state.graph->GetResourceAccess(g_sceneRenderer.CollectMaterialTextureReads(*plan, *state.graph));
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+            // A first picture may require a Fixed-produced buffer. Do not
+            // hold that World's clock while its own numerical work is needed.
+            if (!cameraView.outputGeneration && !access.admitted && plan->world->WorldId() == g_playerStartupClock.world)
+                g_playerStartupClock.waiting = false;
+#endif
             accesses.push_back(std::move(access));
             infernux::raytracing::RayTailCacheBinding tail;
             if (state.rayTailUse != infernux::GraphRayTailUse::None) {
@@ -1203,8 +1282,12 @@ double Frame()
                 tail = g_worldRayTailCache->Acquire(plan->world, rays, materials.value, writer, state.rayTailRequest);
             } else
                 state.rayTailRequest.reset();
-            captured.push_back({camera, plan, &state, std::move(rays), std::move(materials.value), std::move(tail)});
+            captured.push_back({camera, plan, &state, playEpoch, std::move(rays), std::move(materials.value), std::move(tail)});
         }
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+        if (!selectedScreen)
+            g_playerStartupClock.waiting = false;
+#endif
         const auto schedule = infernux::RenderViewSchedule::Build(accesses);
 
         // Author callbacks can suspend while preparing the graph. Acquire the canvas texture
@@ -1218,6 +1301,7 @@ double Frame()
         auto encoder = g_device.CreateCommandEncoder();
         if (!g_splashActive && g_particleRuntimeReady && !g_particleRuntime.RecordCompute(encoder))
             throw std::runtime_error(g_particleRuntime.LastError());
+        bool startupScreenPresented = false;
         const auto present = [&](const PresentedCamera &sample, bool clear) {
             auto &copy = g_screenCopies[sample.displayEncoded];
             if (!copy) {
@@ -1253,6 +1337,10 @@ double Frame()
             g_presentRenderer.DrawProgram(commands, copy->pipeline, &input, copy->parameters, nullptr,
                                           sample.resources);
             pass.End();
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+            startupScreenPresented |= sample.world == g_playerStartupClock.world &&
+                                      sample.epoch == g_playerStartupClock.epoch;
+#endif
         };
         bool rendered = false;
         g_presentRenderer.ResetPool();
@@ -1312,7 +1400,7 @@ double Frame()
                                                 resources,
                                                 infernux::RasterViewportRect(cameraView.rect, g_width, g_height),
                                                 plan->world->WorldId(),
-                                                plan->world->SimulationEpoch(),
+                                                capture.playEpoch,
                                                 g_width,
                                                 g_height,
                                                 state.description->outputDisplayEncoded};
@@ -1344,6 +1432,7 @@ double Frame()
             g_sceneRenderer.AcceptView();
             state.presented = std::move(presented);
             state.pendingRayPlan.reset();
+            state.pendingRayPlayEpoch = 0;
             encoder = g_device.CreateCommandEncoder();
         }
         if (rendered)
@@ -1358,7 +1447,7 @@ double Frame()
                 const auto &sample = capture.state->presented;
                 if (capture.plan->view->outputGeneration || !sample || sample->width != g_width ||
                     sample->height != g_height || sample->world != capture.plan->world->WorldId() ||
-                    sample->epoch != capture.plan->world->SimulationEpoch())
+                    sample->epoch != capture.playEpoch)
                     continue;
                 present(*sample, !rendered);
                 rendered = true;
@@ -1394,6 +1483,15 @@ double Frame()
         g_screenUIRenderer.PruneUnusedMaterials();
         wgpu::CommandBuffer commands = encoder.Finish();
         g_queue.Submit(1, &commands);
+#if defined(INFERNUX_WEB_ENGINE_RUNTIME)
+        if (g_playerStartupClock.waiting && startupScreenPresented) {
+            // Browser WebGPU presents this canvas when the RAF turn returns.
+            // Anchor after its actual screen submission, never on splash,
+            // clear-only, texture-only, or an unrelated World's picture.
+            g_playerStartupClock.waiting = false;
+            g_playerStartupClock.presentedAtMilliseconds = emscripten_get_now();
+        }
+#endif
         if (g_particleRuntimeReady)
             g_particleRuntime.NotifySubmission();
         return true;
