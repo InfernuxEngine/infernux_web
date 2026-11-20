@@ -136,6 +136,7 @@ struct WebSceneRenderer::Impl
     struct Geometry
     {
         std::shared_ptr<const void> owner;
+        const std::vector<Vertex> *sourceVertices = nullptr;
         const std::vector<uint32_t> *sourceIndices = nullptr;
         uint64_t revision = 0, lastFrame = 0;
         size_t vertexCount = 0, indexCount = 0;
@@ -144,6 +145,9 @@ struct WebSceneRenderer::Impl
         Buffer vertices, indices;
     };
     std::unordered_map<const std::vector<Vertex> *, Geometry> geometry;
+    // Private inline snapshots can rotate addresses as immutable RenderWorld
+    // frames are recycled. Their renderer lifetime is the persistent identity.
+    std::unordered_map<RenderDrawIdentity, Geometry, RenderDrawIdentityHash> ownedGeometry;
     struct Material
     {
         std::shared_ptr<const ShaderProgramArtifact> artifact;
@@ -412,16 +416,28 @@ struct WebSceneRenderer::Impl
     }
     Geometry &ResolveGeometry(const DrawCall &draw)
     {
-        auto [iterator, inserted] = geometry.try_emplace(draw.meshVertices);
-        auto &result = iterator->second;
-        if (inserted || result.owner != draw.meshDataOwner || result.revision != draw.meshRuntimeVersion ||
+        const bool privateInline = draw.meshDataOwner && draw.meshAssetGuid.empty() && draw.identity.IsValid();
+        auto &result = privateInline ? ownedGeometry[draw.identity] : geometry[draw.meshVertices];
+        // Shared engine primitives have one geometry publication, independent
+        // of the renderer-local inline version (as on the native mesh path).
+        const uint64_t revision = IsBuiltinMeshGuid(draw.meshAssetGuid) ? uint64_t{1} : draw.meshRuntimeVersion;
+        const bool changed = !result.indices || result.owner != draw.meshDataOwner || result.revision != revision ||
+            result.sourceVertices != draw.meshVertices ||
             result.sourceIndices != draw.meshIndices || result.sourceFormat != draw.meshIndexFormat ||
             result.vertexCount != draw.meshVertices->size() || result.indexCount != draw.meshIndices->size() ||
-            (draw.forceBufferUpdate && result.lastFrame != frameIndex)) {
-            result = {};
+            (draw.forceBufferUpdate && result.lastFrame != frameIndex);
+        if (changed) {
+            // Earlier draws captured during this Prepare must retain their
+            // bytes. Otherwise queue-ordered writes can reuse the allocation:
+            // earlier submitted WebGPU commands retain the old native owner.
+            if (result.vertices && result.vertices.use_count() > 1)
+                result.vertices.reset();
+            if (result.indices && result.indices.use_count() > 1)
+                result.indices.reset();
             result.owner = draw.meshDataOwner;
+            result.sourceVertices = draw.meshVertices;
             result.sourceIndices = draw.meshIndices;
-            result.revision = draw.meshRuntimeVersion;
+            result.revision = revision;
             result.sourceFormat = draw.meshIndexFormat;
             result.vertexCount = draw.meshVertices->size();
             result.indexCount = draw.meshIndices->size();
@@ -436,7 +452,7 @@ struct WebSceneRenderer::Impl
                 Upload(result.indices, packed.uint32Indices.data(), packed.uint32Indices.size() * sizeof(uint32_t),
                        rhi::BufferUsageFlags::Index);
         }
-        if (!draw.meshVertexBuffer && !result.vertices)
+        if (!draw.meshVertexBuffer && (changed || !result.vertices))
             Upload(result.vertices, draw.meshVertices->data(), result.vertexCount * sizeof(Vertex),
                    rhi::BufferUsageFlags::Vertex);
         result.lastFrame = frameIndex;
@@ -748,6 +764,7 @@ void WebSceneRenderer::StageFrame(const EngineGlobalsUBO &frame)
             it = it->second.lastFrame + 1 < s.frameIndex ? values.erase(it) : std::next(it);
     };
     retireUnused(s.geometry);
+    retireUnused(s.ownedGeometry);
     for (auto &[id, view] : s.views)
         retireUnused(view.materials);
     s.current = nullptr;

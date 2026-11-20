@@ -120,6 +120,7 @@ EM_JS(void, InfernuxWebStartRuntime, (), {
         readers.length = 0;
     };
     const draw = () => {
+        if (Module.infernuxRuntimeStopped) return;
         clearTimeout(timer);
         drawDue = true;
         if (!busy) run();
@@ -127,12 +128,14 @@ EM_JS(void, InfernuxWebStartRuntime, (), {
     // A due presentation wins over a continuation. A suspended native call
     // still owns the World until it returns, including during GPU/IO waits.
     const run = async () => {
+        if (Module.infernuxRuntimeStopped) return;
         const present = drawDue;
         drawDue = false;
         busy = true;
         try {
             const delay = await Module.ccall("infernux_web_frame", "number", ["number"], [+present], {async: true});
             release();
+            if (Module.infernuxRuntimeStopped) return;
             if (present) requestAnimationFrame(draw);
             if (drawDue) run();
             else if (delay > 0 && !document.hidden)
@@ -143,6 +146,14 @@ EM_JS(void, InfernuxWebStartRuntime, (), {
         .then(() => Module.ccall("infernux_web_start", null, [], [], {async: true}))
         .then(() => { release(); requestAnimationFrame(draw); })
         .catch(fail);
+});
+
+EM_JS(void, InfernuxWebStopRuntime, (), {
+    Module.infernuxRuntimeStopped = true;
+    Module.infernuxCaptures?.pending.clear();
+    for (const row of Module.infernuxCaptures?.records.values() || []) {
+        if (["queued", "capturing"].includes(row.status)) row.status = "cancelled";
+    }
 });
 // clang-format on
 
@@ -1055,6 +1066,13 @@ double Frame()
             PrintPythonError("frame");
             g_runtimeFrameFailed = true;
         } else {
+            if (result == Py_None) {
+                Py_DECREF(result);
+                InfernuxWebEndTextInput();
+                infernux::AudioEngine::Instance().Shutdown();
+                InfernuxWebStopRuntime();
+                return 0.0;
+            }
             const int splashActive = PyObject_IsTrue(result);
             if (splashActive < 0) {
                 PrintPythonError("frame-result");
@@ -1528,6 +1546,7 @@ double Frame()
             wgpu::CommandBuffer commands = encoder.Finish();
             g_queue.Submit(1, &commands);
         }
+        InfernuxWebPublishCaptureFrame(rendered, g_shaderFrameIndex - 1, g_rhi->GetDeviceId());
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
         if (g_playerStartupClock.waiting && startupScreenPresented) {
             // Browser WebGPU presents this canvas when the RAF turn returns.

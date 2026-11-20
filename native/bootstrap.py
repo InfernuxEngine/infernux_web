@@ -1275,12 +1275,24 @@ def _complete_pending_audio_activation() -> None:
     print("INFERNUX_WEB_AUDIO_USER_ACTIVATED_DEFERRED")
 
 
-def infernux_web_tick(delta_time: float) -> bool:
+def infernux_web_tick(delta_time: float) -> bool | None:
     """Advance the Python side once per browser animation frame."""
 
     global _frame_count, _web_splash
     if _player_session is None:
         return False
+    if _player_host._runtime_is_closing():
+        from infernux.application import Application
+
+        exit_code = Application._requested_exit_code()
+        _player_host.shutdown(before_resource_release=(
+            _player_plugin_manager.shutdown if _player_plugin_manager is not None else None
+        ))
+        if _web_splash is not None:
+            _web_splash.close()
+            _web_splash = None
+        print(f"INFERNUX_WEB_PLAYER_STOPPED exit_code={exit_code}")
+        return None
     if _web_splash is not None:
         if _web_splash.update(max(0.0, min(float(delta_time), 0.25)), _screen_width, _screen_height):
             return True

@@ -41,6 +41,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <limits>
@@ -49,11 +50,126 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace
 {
+
+// clang-format off
+EM_JS(int, RequestCanvasCapture, (const char *path), {
+    const captures = Module.infernuxCaptures ||= {next: 1, records: new Map(), pending: new Set(), encoding: 0};
+    if (captures.records.size >= 256) {
+        for (const [id, row] of captures.records) {
+            if (["completed", "failed", "cancelled"].includes(row.status)) captures.records.delete(id);
+            if (captures.records.size < 256) break;
+        }
+    }
+    if (captures.records.size >= 256) return 0;
+    const id = captures.next++;
+    captures.records.set(id, {capture_id: id, source: "game", pixel_origin: "webgpu_canvas",
+        status: "queued", output_path: UTF8ToString(path), error: ""});
+    captures.pending.add(id);
+    return id;
+});
+
+EM_JS(char *, QueryCanvasCapture, (int id), {
+    const row = Module.infernuxCaptures?.records.get(id);
+    const text = JSON.stringify(row || {capture_id: id, status: "failed", error: "Unknown capture id"});
+    const result = _malloc(lengthBytesUTF8(text) + 1);
+    stringToUTF8(text, result, lengthBytesUTF8(text) + 1);
+    return result;
+});
+
+EM_JS(int, CancelCanvasCapture, (int id), {
+    const row = Module.infernuxCaptures?.records.get(id);
+    if (!row || !["queued", "capturing"].includes(row.status)) return 0;
+    row.status = "cancelled";
+    Module.infernuxCaptures.pending.delete(id);
+    return 1;
+});
+
+EM_JS(void, PublishCanvasCaptures, (int gameRendered, double frame, double device), {
+    const captures = Module.infernuxCaptures;
+    if (!gameRendered || !captures?.pending.size || captures.encoding >= 4) return;
+    const canvas = Module.canvas || document.getElementById("canvas");
+    for (const id of captures.pending) {
+        if (captures.encoding >= 4) break;
+        captures.pending.delete(id);
+        const row = captures.records.get(id);
+        ++captures.encoding;
+        row.status = "capturing";
+        row.engine_frame = frame;
+        row.device_id = device;
+        row.width = canvas.width;
+        row.height = canvas.height;
+        try {
+            // toBlob snapshots the just-submitted WebGPU drawing buffer here,
+            // before the browser ends this turn and clears its canvas image.
+            canvas.toBlob(async blob => {
+                try {
+                    if (row.status !== "capturing") return;
+                    if (!blob) throw new Error("WebGPU canvas PNG encoding failed");
+                    const bytes = new Uint8Array(await blob.arrayBuffer());
+                    if (row.status !== "capturing") return;
+                    FS.writeFile(row.output_path, bytes);
+                    row.status = "completed";
+                } catch (error) {
+                    if (row.status === "capturing") {
+                        row.error = String(error);
+                        row.status = "failed";
+                    }
+                } finally {
+                    --captures.encoding;
+                }
+            }, "image/png");
+        } catch (error) {
+            --captures.encoding;
+            row.error = String(error);
+            row.status = "failed";
+        }
+    }
+});
+// clang-format on
+
+PyObject *RequestCapture(PyObject *, PyObject *arguments)
+{
+    const char *source;
+    const char *path;
+    unsigned long long camera = 0;
+    if (!PyArg_ParseTuple(arguments, "ss|K:request_capture", &source, &path, &camera))
+        return nullptr;
+    if (std::string_view(source) != "game" || camera != 0) {
+        PyErr_SetString(PyExc_ValueError, "Web Player capture supports the composited Game canvas only");
+        return nullptr;
+    }
+    const int id = RequestCanvasCapture(path);
+    if (!id) {
+        PyErr_SetString(PyExc_RuntimeError, "Web Player capture request limit reached");
+        return nullptr;
+    }
+    return PyLong_FromLong(id);
+}
+
+PyObject *QueryCapture(PyObject *, PyObject *value)
+{
+    const long id = PyLong_AsLong(value);
+    if (PyErr_Occurred()) return nullptr;
+    char *json = QueryCanvasCapture(static_cast<int>(id));
+    PyObject *module = PyImport_ImportModule("json");
+    PyObject *result = module ? PyObject_CallMethod(module, "loads", "s", json) : nullptr;
+    std::free(json);
+    Py_XDECREF(module);
+    return result;
+}
+
+PyObject *CancelCapture(PyObject *, PyObject *value)
+{
+    const long id = PyLong_AsLong(value);
+    if (PyErr_Occurred()) return nullptr;
+    return PyBool_FromLong(CancelCanvasCapture(static_cast<int>(id)));
+}
 
 infernux::web::WebParticleRuntime *g_particleRuntime = nullptr;
 infernux::web::WebScreenUIRenderer *g_screenUIRenderer = nullptr;
@@ -886,6 +1002,9 @@ PyObject *ScreenUIReleaseTexture(PyObject *, PyObject *arguments)
 }
 
 PyMethodDef kMethods[] = {
+    {"request_capture", RequestCapture, METH_VARARGS, "Capture the next submitted Game canvas as PNG."},
+    {"query_capture", QueryCapture, METH_O, "Poll PNG publication in the Player filesystem."},
+    {"cancel_capture", CancelCapture, METH_O, "Cancel an unfinished Game capture."},
 #if defined(INFERNUX_WEB_ENGINE_RUNTIME)
     {"_create_render_texture", CreateRenderTexture, METH_O, "Create a target through the shared RHI registry."},
     {"_load_render_texture", LoadRenderTexture, METH_O, "Acquire the shared imported target owner."},
@@ -955,6 +1074,11 @@ PyMODINIT_FUNC PyInit__InfernuxWebHost()
 void InfernuxWebSetParticleRuntime(infernux::web::WebParticleRuntime *runtime) noexcept
 {
     g_particleRuntime = runtime;
+}
+
+void InfernuxWebPublishCaptureFrame(bool gameRendered, uint64_t frame, uint64_t device)
+{
+    PublishCanvasCaptures(gameRendered, static_cast<double>(frame), static_cast<double>(device));
 }
 
 void InfernuxWebSetScreenUIRenderer(infernux::web::WebScreenUIRenderer *renderer) noexcept

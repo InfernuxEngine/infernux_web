@@ -3,6 +3,7 @@
 #include <Python.h>
 
 #include <function/renderer/GraphEvents.h>
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -37,3 +38,4 @@ void InfernuxWebSetGraphServices(infernux::web::WebGraphServices *services) noex
 void InfernuxWebSetComputeHost(infernux::rhi::ComputeHost *host) noexcept;
 void InfernuxWebSetFrameWork(infernux::FrameWorkOwner *owner) noexcept;
 void InfernuxWebEndTextInput() noexcept;
+void InfernuxWebPublishCaptureFrame(bool gameRendered, uint64_t frame, uint64_t device);
