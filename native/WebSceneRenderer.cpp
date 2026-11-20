@@ -167,6 +167,9 @@ struct WebSceneRenderer::Impl
     {
         Buffer camera, globals, lighting, canonicalLights, models, skins, bones, instances;
         lighting::ViewLighting viewLighting;
+        std::optional<RenderEnvironmentPanorama> environmentSource;
+        Texture environmentPanorama;
+        bool environmentPending = false;
         uint64_t canonicalGeneration = 0;
         std::shared_ptr<const rhi::BufferResource> surfaceRecords;
         std::vector<Buffer> shadowCameras, shadowParameters;
@@ -223,15 +226,45 @@ struct WebSceneRenderer::Impl
         device->Release(partitionViewLayout);
     }
 
-    void PrepareLighting(const RenderViewData &view,
+    void PrepareLighting(const RenderViewData &view, WebRenderGraph &graph,
                          std::initializer_list<lighting::ViewLighting::ReceiverList> receivers)
     {
         auto &resources = *current;
-        if (!resources.viewLighting.Prepare(frame->Lighting(), view, shadowsEnabled ? shadowResolution : 0, receivers))
+        const auto &source = frame->Lighting();
+        const auto &panorama = source->environmentPanorama;
+        if (resources.environmentSource != panorama) {
+            resources.environmentSource = panorama;
+            resources.environmentPanorama.reset();
+            resources.environmentPending = panorama.has_value();
+        }
+        bool environmentReady = false;
+        if (resources.environmentPending) {
+            const MaterialTextureSampler sampler;
+            const auto &guid = panorama->textureGuid;
+            auto &entry = textures[guid + '\x1e' + SamplerIdentity(sampler)];
+            const auto status = PollTexture(entry, guid, sampler);
+            resources.environmentPending = status == WebTextureAssetLoad::Result::Pending;
+            if ((status == WebTextureAssetLoad::Result::Ready || status == WebTextureAssetLoad::Result::Settled) &&
+                AssetRegistry::Instance().GetAssetContentGeneration(guid) == panorama->contentGeneration) {
+                resources.environmentPanorama = entry.image;
+                environmentReady = resources.environmentPanorama != nullptr;
+                if (environmentReady)
+                    graph.InvalidateHistory();
+            }
+        }
+        const bool lightingChanged =
+            resources.viewLighting.Prepare(source, view, shadowsEnabled ? shadowResolution : 0, receivers);
+        if (!lightingChanged && !environmentReady)
             return;
 
         const auto &lights = resources.viewLighting.Lights();
-        Uniform(resources.lighting, lights.GetShaderLightingUBO());
+        auto lighting = lights.GetShaderLightingUBO();
+        const auto &image = resources.environmentPanorama ? resources.environmentPanorama : black;
+        resources.fullscreenBindings.textures[kEnvironmentPanoramaViewBinding] = {
+            kEnvironmentPanoramaViewBinding, rhi::BindingType::SampledTexture, image->GetView()};
+        if (resources.environmentPanorama)
+            lighting.environmentPanorama = panorama->radianceAndRotation;
+        Uniform(resources.lighting, lighting);
         const auto &snapshot = lights.GetCanonicalLightSnapshot();
         if (snapshot.generation != resources.canonicalGeneration) {
             const auto upload = lighting::BuildCanonicalLightUpload(snapshot);
@@ -1002,7 +1035,7 @@ void WebSceneRenderer::Prepare(const RenderViewPlan &plan, WebRenderGraph &graph
     globals.viewOptions.x |= graph.RayViewFlags();
     globals.rasterJitterPixels = s.preparedJitter * glm::vec2(width, height) * 0.5f;
     s.Uniform(s.current->globals, globals);
-    s.PrepareLighting(view, {visible, plan.draws});
+    s.PrepareLighting(view, graph, {visible, plan.draws});
     const auto &buffers = graph.Description().buffers;
     if (std::any_of(buffers.begin(), buffers.end(),
                     [](const auto &buffer) { return buffer.frameBuffer == GraphFrameBuffer::WorldSurfaces; })) {
