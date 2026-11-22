@@ -398,13 +398,14 @@ if(INFERNUX_WEB_BUILD_NATIVE_MODULE_PROBE OR
     file(GLOB _web_scene_runtime_sources CONFIGURE_DEPENDS
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/scene/*.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/scene/physics/*.cpp"
+        "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/scene/physics/inxphygpu/*.cpp"
     )
     list(FILTER _web_scene_runtime_sources EXCLUDE REGEX "EditorCameraController\\.cpp$")
     list(FILTER _web_scene_runtime_sources EXCLUDE REGEX "SceneRenderBridge\\.cpp$")
     add_library(InfernuxWebSceneRuntimeProbe OBJECT EXCLUDE_FROM_ALL
         ${_web_scene_runtime_sources}
     )
-    infernux_cook_jolt_gpu_programs(InfernuxWebSceneRuntimeProbe wgsl)
+    infernux_cook_inxphygpu_programs(InfernuxWebSceneRuntimeProbe wgsl)
     file(GLOB_RECURSE _web_resource_runtime_sources CONFIGURE_DEPENDS
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/core/*.cpp"
         "${INFERNUX_ENGINE_SOURCE_ROOT}/cpp/infernux/function/resources/*.cpp"
