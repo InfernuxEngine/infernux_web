@@ -1783,24 +1783,17 @@ int main()
             wgpu::DeviceDescriptor descriptor;
             wgpu::Limits adapterLimits;
             wgpu::Limits requiredLimits;
-            // Ask for the strongest storage-buffer contract the adapter can
-            // provide up to the complete particle ABI. WebGPU otherwise gives
-            // the device only its baseline default (commonly eight), even when
-            // the adapter exposes more. Individual pipelines still validate
-            // against the negotiated limit; content that needs twelve does not
-            // silently acquire a different implementation on a smaller device.
-            constexpr uint32_t kCompleteParticleStorageBufferLimit = 12;
+            // Enable the adapter's storage-buffer capacity for all compute
+            // pipelines, including physics and particles.
             if (g_adapter.GetLimits(&adapterLimits)) {
                 std::printf("INFERNUX_WEBGPU_ADAPTER_LIMITS bind_groups=%u storage_buffers=%u bindings=%u\n",
                             adapterLimits.maxBindGroups, adapterLimits.maxStorageBuffersPerShaderStage,
                             adapterLimits.maxBindingsPerBindGroup);
-                g_webGpuStorageBufferLimit =
-                    std::min(kCompleteParticleStorageBufferLimit, adapterLimits.maxStorageBuffersPerShaderStage);
+                g_webGpuStorageBufferLimit = adapterLimits.maxStorageBuffersPerShaderStage;
                 requiredLimits.maxStorageBuffersPerShaderStage = g_webGpuStorageBufferLimit;
                 requiredLimits.maxColorAttachmentBytesPerSample = adapterLimits.maxColorAttachmentBytesPerSample;
                 descriptor.requiredLimits = &requiredLimits;
-                std::printf("INFERNUX_WEBGPU_STORAGE_LIMIT negotiated=%u complete_particle=%u\n",
-                            g_webGpuStorageBufferLimit, kCompleteParticleStorageBufferLimit);
+                std::printf("INFERNUX_WEBGPU_STORAGE_LIMIT negotiated=%u\n", g_webGpuStorageBufferLimit);
             }
             descriptor.SetUncapturedErrorCallback(
                 [](const wgpu::Device &, wgpu::ErrorType type, wgpu::StringView errorMessage) {
